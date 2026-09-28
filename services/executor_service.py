@@ -4,6 +4,9 @@ This service enables running Hummingbot executors directly via API
 without Docker containers or full strategy setup.
 """
 import asyncio
+import contextvars
+
+_placing_order_id = contextvars.ContextVar("placing_order_id", default=None)
 import json
 import logging
 import time
@@ -70,13 +73,53 @@ from utils.executor_checkpoint import (
     merge_exchange_open_pages,
     parse_exchange_open_page,
     remember_order_now,
+    remember_open_before_send,
+    claim_quant,
+    release_quant,
     prune_order_ledger,
+    ledger_order_ids,
+    ledger_executor_ids,
+    recorded_price_blocks,
+    send_blocked,
+    finished_list_request,
+    gate_delete_request,
+    must_keep_executor,
+    pick_owner,
     saved_order_ids,
+    checkpoint_plus,
+    checkpoint_keeping_holds,
+    owed_records,
+    buy_blocked,
+    recover_folder_debt,
+    four_proofs,
+    history_covers_ts,
+    gate_base_is_zero,
+    raw_list_page,
 )
 from utils.executor_log_capture import ExecutorLogCapture, current_executor_id
 from utils.trading_pair import InvalidTradingPair, split_trading_pair
 
 logger = logging.getLogger(__name__)
+
+
+def _parsed_hold_matches(parsed: Optional[Dict[str, Any]], order_id: str, price: Any) -> bool:
+    """Exact hold or saved order. A substring of the raw column is not a hold."""
+    if not parsed or not order_id:
+        return False
+    for hold in parsed.get("holds") or []:
+        if str(hold.get("order_id") or "") != str(order_id):
+            continue
+        if price in (None, ""):
+            return True
+        return str(hold.get("price")) == str(price)
+    if str(order_id) not in {str(item) for item in saved_order_ids(parsed)}:
+        return False
+    if price in (None, ""):
+        return True
+    for item in (parsed.get("retained_orders") or []):
+        if str(item.get("order_id") or "") == str(order_id):
+            return str(item.get("price")) == str(price)
+    return False
 
 
 def _json_default(obj):
@@ -313,10 +356,30 @@ class ExecutorService:
         if not self.db_manager:
             logger.debug("No database manager available, skipping orphaned executor cleanup")
             return
+        if ledger_executor_ids() is None or buy_blocked():
+            logger.warning("order ledger was not read; not marking SYSTEM_CLEANUP")
+            return
+        fresh = await self._fresh_pair_reads()
+        if fresh is None:
+            logger.warning("open and finished lists were not read; not marking SYSTEM_CLEANUP")
+            return
 
         try:
             # Get list of currently active executor IDs in memory
             active_executor_ids = list(self._active_executors.keys())
+            active_executor_ids.extend(self._executors_with_unproven_orders())
+            active_executor_ids.extend(self.__dict__.get("_kept_ids", set()))
+            rows = await self._running_rows()
+            if rows is None:
+                return
+            for row in rows:
+                key = (row.get("account_name"), row.get("connector_name"), row.get("trading_pair"))
+                slot = fresh.get(key) or {}
+                if not slot.get("opens_read") or not slot.get("finished_read"):
+                    active_executor_ids.append(row["executor_id"])
+                    continue
+                if not self._row_proofs_released(row, slot):
+                    active_executor_ids.append(row["executor_id"])
 
             async with self.db_manager.get_session_context() as session:
                 repo = ExecutorRepository(session)
@@ -352,17 +415,23 @@ class ExecutorService:
         except Exception as e:
             logger.error(f"Error checkpointing executors on shutdown: {e}", exc_info=True)
 
-        # Stop all active executors
+        # A cancel that is not proven is not a stop. Do not drop the row or call stock stop.
         for executor_id in list(self._active_executors.keys()):
+            if not self._executor_proofs_released(executor_id):
+                continue
             try:
                 executor = self._active_executors.get(executor_id)
                 if executor:
                     executor.stop()
             except Exception as e:
                 logger.error(f"Error stopping executor {executor_id}: {e}")
+            self._active_executors.pop(executor_id, None)
+            self._executor_metadata.pop(executor_id, None)
 
-        # Clear active executors
-        self._active_executors.clear()
+        if self._active_executors:
+            logger.warning("order cancel is not proven; not clearing executors or trading interfaces")
+            return
+
         self._executor_metadata.clear()
 
         # Cleanup trading interfaces
@@ -378,13 +447,16 @@ class ExecutorService:
             try:
                 # Update timestamps for all trading interfaces via TradingService
                 self._trading_service.update_all_timestamps()
+                await self._sweep_unproven_orders()
 
                 # Check for completed executors. Iterate a snapshot: the rent recording
                 # below awaits, and create_executor runs in a request task that can add to
                 # or remove from _active_executors while this loop is suspended.
                 completed_ids = []
                 for executor_id, executor in list(self._active_executors.items()):
-                    if executor.is_closed:
+                    if getattr(executor, "is_closed", False):
+                        if not self._executor_proofs_released(executor_id):
+                            continue
                         completed_ids.append(executor_id)
                     elif (
                         self._executor_metadata.get(executor_id, {}).get("executor_type") == "lp_executor"
@@ -924,6 +996,7 @@ class ExecutorService:
             return result
 
         executor.place_order = place_wrapped
+        self._install_open_shell(executor_id, executor)
         for name, marker in (
             ("process_order_filled_event", "filled"),
             ("process_order_completed_event", "filled"),
@@ -931,10 +1004,925 @@ class ExecutorService:
             ("process_order_failed_event", "gone"),
         ):
             original = getattr(executor, name, None)
-            if original is None:
+            if original is None or marker == "gone":
                 continue
             setattr(executor, name, self._event_wrapper(executor_id, executor, original, marker))
         executor._checkpoint_hooked = True
+
+    def _ledger_ids_without_column(self):
+        return ledger_order_ids()
+
+    def _executors_with_unproven_orders(self) -> list:
+        found = ledger_executor_ids()
+        if found is None:
+            return ["__ledger_unread__"]
+        return found
+
+    async def _finished_pass(self, connector, pair: str) -> dict:
+        venue = open_list_venue(type(connector).__name__ if connector is not None else "")
+        request = finished_list_request(venue or "", pair)
+        if request is None or connector is None or not hasattr(connector, "_api_get"):
+            return {"read": False, "done": False, "orders": []}
+        try:
+            body = await connector._api_get(
+                path_url=request["path"],
+                params=request["params"],
+                is_auth_required=True,
+            )
+        except Exception:
+            return {"read": False, "done": False, "orders": []}
+        page = parse_exchange_open_page(body, venue, pair)
+        return {
+            "read": bool(page.get("read")),
+            "done": bool(page.get("done")),
+            "orders": page.get("orders") or [],
+        }
+
+    async def _gate_symbol(self, connector, pair: str):
+        method = getattr(connector, "exchange_symbol_associated_to_pair", None)
+        if method is None:
+            return pair
+        try:
+            symbol = await method(pair)
+        except Exception:
+            return None
+        return symbol or None
+
+    async def _fresh_raw_lists(self, connector, pair: str, ts: Any = None) -> Dict[str, Any]:
+        """This tick's lists. A cached slot with read=True is not a proof."""
+        empty = {
+            "opens_read": False,
+            "opens_done": False,
+            "finished_read": False,
+            "finished_done": False,
+            "covers_ts": False,
+            "opens": [],
+            "finished": [],
+        }
+        venue = open_list_venue(type(connector).__name__ if connector is not None else "")
+        if venue != "gate" or connector is None or not hasattr(connector, "_api_get"):
+            return empty
+        symbol = await self._gate_symbol(connector, pair)
+        if not symbol:
+            return empty
+        open_request = exchange_open_request(venue, symbol)
+        finished_request = finished_list_request(venue, symbol, ts=ts)
+        if open_request is None or finished_request is None:
+            return empty
+        opens = []
+        opens_done = False
+        page = 1
+        try:
+            for _ in range(1000):
+                open_request = exchange_open_request(venue, symbol, page=page)
+                if open_request is None:
+                    return empty
+                open_body = await connector._api_get(
+                    path_url=open_request["path"],
+                    params=open_request["params"],
+                    is_auth_required=True,
+                )
+                parsed = raw_list_page(open_body, symbol)
+                if not parsed.get("read"):
+                    return empty
+                opens.extend(parsed.get("orders") or [])
+                if parsed.get("done"):
+                    opens_done = True
+                    break
+                page += 1
+            else:
+                return empty
+            finished_body = await connector._api_get(
+                path_url=finished_request["path"],
+                params=finished_request["params"],
+                is_auth_required=True,
+            )
+        except Exception:
+            return empty
+        finished = raw_list_page(finished_body, symbol)
+        return {
+            "opens_read": True,
+            "opens_done": opens_done,
+            "finished_read": bool(finished.get("read")),
+            "finished_done": bool(finished.get("done")),
+            "covers_ts": history_covers_ts(finished_request, ts, finished),
+            "opens": opens,
+            "finished": finished.get("orders") or [],
+            "symbol": symbol,
+            "finished_request": finished_request,
+        }
+
+    def _sweep_targets(self) -> List[Dict[str, Any]]:
+        targets = []
+        seen = set()
+        for row in self._owner_rows():
+            key = (row.get("account"), row.get("connector"), row.get("pair"))
+            if not all(key) or key in seen:
+                continue
+            seen.add(key)
+            targets.append({"account": key[0], "connector": key[1], "pair": key[2]})
+        for item in owed_records() or []:
+            key = (item.get("account_name"), item.get("connector"), item.get("trading_pair"))
+            if not all(key) or key in seen:
+                continue
+            seen.add(key)
+            targets.append({"account": key[0], "connector": key[1], "pair": key[2]})
+        return targets
+
+    def _connector_for(self, account: str, connector_name: str):
+        for executor_id, executor in self._active_executors.items():
+            meta = self._executor_metadata.get(executor_id) or {}
+            if meta.get("account_name") != account or meta.get("connector_name") != connector_name:
+                continue
+            found = (getattr(executor, "connectors", None) or {}).get(connector_name)
+            if found is not None:
+                return found
+        interface = self._trading_interfaces.get(account)
+        connectors = getattr(interface, "connectors", None) or {}
+        if isinstance(connectors, dict):
+            return connectors.get(connector_name)
+        return None
+
+    def _client_in_book(self, connector, client_id: str, name: str) -> bool:
+        if connector is None:
+            return True
+        if name == "in_flight":
+            book = getattr(connector, "in_flight_orders", None)
+        else:
+            tracker = getattr(connector, "_order_tracker", None)
+            book = getattr(tracker, "lost_orders", None) if tracker is not None else None
+        if not isinstance(book, dict):
+            return True
+        return str(client_id) in {str(key) for key in book}
+
+    def _proof_for_raw(self, client_id: str, fresh: Dict[str, Any], connector, ts: Any) -> bool:
+        opens = fresh.get("opens") or []
+        finished = fresh.get("finished") or []
+        in_opens = any(str(row.get("text") or "") == str(client_id) for row in opens)
+        status = next((row for row in finished if str(row.get("text") or "") == str(client_id)), {})
+        return four_proofs(
+            status,
+            in_opens=in_opens,
+            in_flight=self._client_in_book(connector, client_id, "in_flight"),
+            in_lost=self._client_in_book(connector, client_id, "lost"),
+            history_read=bool(fresh.get("opens_read") and fresh.get("covers_ts") and not in_opens),
+        ) and gate_base_is_zero(status)
+
+    def _raw_prefix_without_hold(self, pair: str, prefix: Optional[str]) -> bool:
+        """A client id only inside the raw text is not a committed hold and not an empty book."""
+        if not prefix:
+            return False
+        for row in getattr(self, "_hold_rows", None) or []:
+            if row.get("trading_pair") != pair:
+                continue
+            text = row.get("checkpoint") or ""
+            parsed = parse_checkpoint(text)
+            held = {
+                str(item.get("order_id"))
+                for item in (parsed or {}).get("holds") or []
+                if item.get("order_id")
+            }
+            held.update(str(item) for item in saved_order_ids(parsed))
+            if str(prefix) in text and not any(item.startswith(str(prefix)) for item in held):
+                return True
+        return False
+
+    async def _commit_price_hold(self, executor_id: str, order_id: str, price: Any, extra: Optional[Dict[str, Any]] = None) -> bool:
+        if not order_id or not self.db_manager:
+            return False
+        addition = {"order_id": order_id}
+        if price not in (None, ""):
+            addition["price"] = str(price)
+        if extra:
+            addition.update(extra)
+            addition.pop("level_id", None)
+            if price in (None, ""):
+                addition.pop("price", None)
+        try:
+            async with self.db_manager.get_session_context() as session:
+                repo = ExecutorRepository(session)
+                row = await repo.get_executor_by_id(executor_id)
+                seen = row.checkpoint if row is not None else None
+                body = checkpoint_plus(seen, addition)
+                if body is None:
+                    return False
+                if _parsed_hold_matches(parse_checkpoint(seen), order_id, price):
+                    return True
+                changed = await repo.replace_checkpoint_if_unchanged(executor_id, seen, body)
+                if not changed:
+                    return False
+                fresh = await repo.get_executor_by_id(executor_id)
+                stored = fresh.checkpoint if fresh is not None else None
+                return _parsed_hold_matches(parse_checkpoint(stored), order_id, price)
+        except Exception:
+            logger.exception("price hold was not committed")
+            return False
+
+    async def _sweep_unproven_orders(self) -> None:
+        """One control-loop tick. Membership in memory is not a cancel."""
+        recover_folder_debt()
+        self.__dict__["_released_order_ids"] = set()
+        self.__dict__["_sweep_failed"] = False
+        self._hold_rows = await self._checkpoint_rows()
+        if self._hold_rows is None:
+            self.__dict__["_sweep_failed"] = True
+        for target in self._sweep_targets():
+            connector = self._connector_for(target["account"], target["connector"])
+            if connector is None:
+                self.__dict__["_sweep_failed"] = True
+                continue
+            ts = self._oldest_ts(target)
+            fresh = await self._fresh_raw_lists(connector, target["pair"], ts)
+            self.__dict__.setdefault("_fresh_reads", {})[
+                (target["account"], target["connector"], target["pair"])
+            ] = fresh
+            if not fresh.get("opens_read") or not fresh.get("finished_read") or not fresh.get("opens_done"):
+                self.__dict__["_sweep_failed"] = True
+                continue
+            await self._delete_owned_texts(connector, target, fresh)
+        self.__dict__["_sweep_seen"] = not self.__dict__.get("_sweep_failed")
+
+    def _oldest_ts(self, target: Dict[str, Any]):
+        found = []
+        for item in owed_records() or []:
+            if item.get("trading_pair") == target["pair"] and item.get("ts") is not None:
+                found.append(item.get("ts"))
+        try:
+            from utils.executor_checkpoint import _read_ledger
+            for row in _read_ledger():
+                if row.get("ts") is not None:
+                    found.append(row.get("ts"))
+        except Exception:
+            return None
+        return min(found) if found else None
+
+    async def _delete_owned_texts(self, connector, target: Dict[str, Any], fresh: Dict[str, Any]) -> None:
+        if not fresh.get("opens_read"):
+            return
+        prefix = getattr(connector, "client_order_id_prefix", None)
+        journal = ledger_order_ids()
+        column = await self._column_order_ids(target["pair"])
+        if column is None:
+            column = set()
+        owed_ids = {
+            str(item.get("order_id"))
+            for item in (owed_records() or [])
+            if item.get("order_id") and item.get("trading_pair") == target["pair"]
+            and item.get("account_name") == target["account"]
+            and item.get("connector") == target["connector"]
+        }
+        for raw in list(fresh.get("opens") or []) + list(fresh.get("finished") or []):
+            text = str(raw.get("text") or "")
+            if not text:
+                continue
+            if raw.get("currency_pair") != fresh.get("symbol"):
+                continue
+            owned_by_prefix = bool(prefix) and text.startswith(str(prefix))
+            in_journal = journal is not None and text in journal
+            in_column = text in column
+            in_owed = text in owed_ids
+            if not owned_by_prefix and not in_journal and not in_column and not in_owed:
+                continue
+            owner = self._owner_for_client(text, target["account"], target["connector"], target["pair"])
+            if not owner:
+                continue
+            self.__dict__.setdefault("_seen_client_ids", set()).add(text)
+            price = raw.get("price")
+            if not in_column and not await self._commit_price_hold(owner, text, price):
+                continue
+            if price in (None, ""):
+                if raw in (fresh.get("opens") or []):
+                    await self._delete_exchange_row(connector, raw)
+                continue
+            if self._proof_for_raw(text, fresh, connector, self._oldest_ts(target)):
+                self.__dict__.setdefault("_released_order_ids", set()).add(text)
+                continue
+            if raw in (fresh.get("opens") or []):
+                await self._delete_exchange_row(connector, raw)
+
+    async def _running_rows(self):
+        if not self.db_manager:
+            return None
+        try:
+            async with self.db_manager.get_session_context() as session:
+                return await ExecutorRepository(session).get_running_for_resume()
+        except Exception:
+            return None
+
+    async def _checkpoint_rows(self):
+        if not self.db_manager:
+            return []
+        try:
+            async with self.db_manager.get_session_context() as session:
+                return await ExecutorRepository(session).get_checkpoint_rows()
+        except Exception:
+            return None
+
+    async def _column_order_ids(self, pair: str):
+        rows = getattr(self, "_hold_rows", None)
+        if rows is None:
+            rows = await self._checkpoint_rows()
+        if rows is None:
+            return None
+        found = set()
+        for row in rows:
+            if row.get("trading_pair") != pair:
+                continue
+            text = row.get("checkpoint") or ""
+            parsed = parse_checkpoint(text)
+            if text and parsed is None:
+                return None
+            found.update(saved_order_ids(parsed))
+            for hold in (parsed or {}).get("holds") or []:
+                if hold.get("order_id"):
+                    found.add(hold["order_id"])
+        return found
+
+    async def _fresh_pair_reads(self):
+        rows = await self._running_rows()
+        if rows is None:
+            return None
+        fresh = {}
+        for row in rows:
+            key = (row.get("account_name"), row.get("connector_name"), row.get("trading_pair"))
+            if key in fresh or not all(key):
+                continue
+            connector = self._connector_for(key[0], key[1])
+            if connector is None:
+                fresh[key] = {"opens_read": False, "finished_read": False}
+                continue
+            slot = await self._fresh_raw_lists(connector, key[2], self._oldest_ts({
+                "account": key[0], "connector": key[1], "pair": key[2],
+            }))
+            fresh[key] = slot
+        return fresh
+
+    def _row_proofs_released(self, row: Dict[str, Any], slot: Dict[str, Any]) -> bool:
+        parsed = parse_checkpoint(row.get("checkpoint"))
+        ids = set(saved_order_ids(parsed))
+        for hold in (parsed or {}).get("holds") or []:
+            if hold.get("order_id"):
+                ids.add(hold["order_id"])
+        if not ids:
+            return False
+        connector = self._connector_for(row.get("account_name"), row.get("connector_name"))
+        return all(self._proof_for_raw(order_id, slot, connector, None) for order_id in ids)
+
+    def _column_ids_for_executor(self, executor_id: str):
+        rows = getattr(self, "_hold_rows", None)
+        if rows is None:
+            return None
+        found = set()
+        seen = False
+        for row in rows:
+            if row.get("executor_id") != executor_id:
+                continue
+            seen = True
+            text = row.get("checkpoint") or ""
+            parsed = parse_checkpoint(text)
+            if text and parsed is None:
+                return None
+            found.update(saved_order_ids(parsed))
+            for hold in (parsed or {}).get("holds") or []:
+                if hold.get("order_id"):
+                    found.add(str(hold["order_id"]))
+        return found if seen or rows is not None else None
+
+    def _executor_proofs_released(self, executor_id: str) -> bool:
+        if buy_blocked() or ledger_executor_ids() is None or not self.__dict__.get("_sweep_seen"):
+            return False
+        if self.__dict__.get("_sweep_failed"):
+            return False
+        column_ids = self._column_ids_for_executor(executor_id)
+        if column_ids is None:
+            return False
+        try:
+            from utils.executor_checkpoint import _read_ledger
+            rows = _read_ledger()
+        except Exception:
+            return False
+        ids = {
+            str(row.get("order_id"))
+            for row in rows
+            if row.get("executor_id") == executor_id and row.get("order_id")
+        }
+        ids.update(column_ids)
+        if not ids:
+            return False
+        released = self.__dict__.get("_released_order_ids", set())
+        return all(order_id in released for order_id in ids)
+
+    async def _cancel_owned_rows(self, connector, row: Dict[str, Any]) -> None:
+        venue = open_list_venue(type(connector).__name__ if connector is not None else "")
+        request = exchange_open_request(venue or "", row.get("trading_pair") or "")
+        if request is None or connector is None or not hasattr(connector, "_api_get"):
+            return
+        try:
+            body = await connector._api_get(
+                path_url=request["path"],
+                params=request["params"],
+                is_auth_required=True,
+            )
+        except Exception:
+            return
+        owned = set(ledger_order_ids() or [])
+        checkpoint = row.get("checkpoint") or ""
+        if not isinstance(body, list):
+            return
+        for raw in body:
+            if not isinstance(raw, dict):
+                continue
+            text = str(raw.get("text") or "")
+            if text and (text in owned or text in checkpoint):
+                await self._delete_exchange_row(connector, raw)
+
+    async def _delete_exchange_row(self, connector, raw: dict) -> bool:
+        request = gate_delete_request(raw)
+        if request is None or connector is None or not hasattr(connector, "_api_delete"):
+            return False
+        await connector._api_delete(
+            path_url=request["path"],
+            params=request["params"],
+            is_auth_required=True,
+        )
+        return True
+
+    async def _column_prices(self, pair: str):
+        if not self.db_manager:
+            return None
+        try:
+            async with self.db_manager.get_session_context() as session:
+                rows = await ExecutorRepository(session).get_checkpoint_rows()
+        except Exception:
+            return None
+        prices = []
+        for row in rows:
+            if row.get("trading_pair") != pair:
+                continue
+            parsed = parse_checkpoint(row.get("checkpoint"))
+            if row.get("checkpoint") and parsed is None:
+                return None
+            for hold in (parsed or {}).get("holds") or []:
+                prices.append(hold.get("price"))
+            for saved in (parsed or {}).get("retained_orders") or []:
+                prices.append(saved.get("price"))
+            for level in (parsed or {}).get("levels") or []:
+                for key in ("open_order", "close_order"):
+                    saved_price = (level.get(key) or {}).get("price")
+                    if saved_price:
+                        prices.append(saved_price)
+        return prices
+
+    def _owner_rows(self) -> List[Dict[str, Any]]:
+        """Each row keeps its own account. The caller's account is not stamped on the others."""
+        rows = []
+        seen = set()
+        for executor_id, executor in self._active_executors.items():
+            meta = self._executor_metadata.get(executor_id) or {}
+            config = getattr(executor, "config", None)
+            row = {
+                "executor_id": executor_id,
+                "account": meta.get("account_name"),
+                "connector": meta.get("connector_name") or getattr(config, "connector_name", None),
+                "pair": meta.get("trading_pair") or getattr(config, "trading_pair", None),
+            }
+            rows.append(row)
+            seen.add(executor_id)
+        for source in list(getattr(self, "_resume_rows", []) or []) + list(getattr(self, "_hold_rows", []) or []):
+            executor_id = source.get("executor_id")
+            if not executor_id or executor_id in seen:
+                continue
+            rows.append({
+                "executor_id": executor_id,
+                "account": source.get("account_name"),
+                "connector": source.get("connector_name"),
+                "pair": source.get("trading_pair"),
+            })
+            seen.add(executor_id)
+        owed = owed_records() or []
+        for item in owed:
+            executor_id = item.get("executor_id")
+            if not executor_id or executor_id in seen:
+                continue
+            rows.append({
+                "executor_id": executor_id,
+                "account": item.get("account_name"),
+                "connector": item.get("connector"),
+                "pair": item.get("trading_pair"),
+            })
+        return rows
+
+    def _owner_for_client(self, client_id: str, account: str, connector: str, pair: str):
+        owed = owed_records()
+        if owed is not None:
+            for item in owed:
+                if str(item.get("order_id") or "") != str(client_id):
+                    continue
+                if (
+                    item.get("account_name") != account
+                    or item.get("connector") != connector
+                    or item.get("trading_pair") != pair
+                ):
+                    return None
+                return item.get("executor_id")
+        return pick_owner(self._owner_rows(), account, connector, pair)
+
+    def _owner_for_pair(self, account: str, connector: str, pair: str):
+        return pick_owner(self._owner_rows(), account, connector, pair)
+
+    def _text_is_owned(self, text: str, connector, column_ids) -> bool:
+        if not text:
+            return False
+        prefix = getattr(connector, "client_order_id_prefix", None)
+        journal = ledger_order_ids()
+        column = set() if column_ids is None else {str(item) for item in column_ids}
+        owed_ids = {str(item.get("order_id")) for item in (owed_records() or []) if item.get("order_id")}
+        if prefix and text.startswith(str(prefix)):
+            return True
+        if journal is not None and text in journal:
+            return True
+        return text in column or text in owed_ids
+
+    def _owned_row_lacks_price(self, connector, fresh: Dict[str, Any], column_ids) -> bool:
+        rows = list(fresh.get("opens") or []) + list(fresh.get("finished") or [])
+        for raw in rows:
+            text = str(raw.get("text") or "")
+            if self._text_is_owned(text, connector, column_ids) and raw.get("price") in (None, ""):
+                return True
+        return False
+
+    def _has_owned_text(self, connector, fresh: Dict[str, Any], column_ids) -> bool:
+        rows = list(fresh.get("opens") or []) + list(fresh.get("finished") or [])
+        return any(self._text_is_owned(str(raw.get("text") or ""), connector, column_ids) for raw in rows)
+
+    def _column_hold_lacks_price(self, pair: str) -> bool:
+        rows = getattr(self, "_hold_rows", None)
+        if rows is None:
+            return True
+        for row in rows:
+            if row.get("trading_pair") != pair:
+                continue
+            parsed = parse_checkpoint(row.get("checkpoint"))
+            if row.get("checkpoint") and parsed is None:
+                return True
+            for hold in (parsed or {}).get("holds") or []:
+                if hold.get("order_id") and hold.get("price") in (None, ""):
+                    return True
+        return False
+
+    def _remember_seen_texts(self, connector, fresh: Dict[str, Any], column_ids) -> None:
+        seen = self.__dict__.setdefault("_seen_client_ids", set())
+        for raw in list(fresh.get("opens") or []) + list(fresh.get("finished") or []):
+            text = str(raw.get("text") or "")
+            if self._text_is_owned(text, connector, column_ids):
+                seen.add(text)
+
+    def _seen_prefix_unrecorded(self, connector, fresh: Dict[str, Any], column_ids) -> bool:
+        """A prefix we already saw, with no hold and no fresh row, is not an empty book."""
+        journal = ledger_order_ids() or set()
+        column = set() if column_ids is None else {str(item) for item in column_ids}
+        visible = {
+            str(raw.get("text") or "")
+            for raw in list(fresh.get("opens") or []) + list(fresh.get("finished") or [])
+        }
+        for text in self.__dict__.get("_seen_client_ids", set()):
+            if text in journal or text in column or text in visible:
+                continue
+            return True
+        return False
+
+    async def _claim_visible_texts(self, executor_id, connector, pair, fresh, column_ids) -> bool:
+        """Commit a hold and cancel opens before any new buy. False means do not send."""
+        account = (self._executor_metadata.get(executor_id) or {}).get("account_name")
+        connector_name = (self._executor_metadata.get(executor_id) or {}).get("connector_name")
+        claimed = self.__dict__.setdefault("_claimed_prices", [])
+        seen = set(column_ids or [])
+        for raw in list(fresh.get("opens") or []) + list(fresh.get("finished") or []):
+            text = str(raw.get("text") or "")
+            if not self._text_is_owned(text, connector, column_ids):
+                continue
+            if raw.get("currency_pair") != fresh.get("symbol"):
+                continue
+            self.__dict__.setdefault("_seen_client_ids", set()).add(text)
+            price = raw.get("price")
+            if text not in seen:
+                owner = self._owner_for_client(text, account, connector_name, pair)
+                if not owner:
+                    return False
+                hold = {"order_id": text}
+                if price not in (None, ""):
+                    hold["price"] = str(price)
+                moment = None
+                for key in ("create_time", "update_time", "ts"):
+                    if raw.get(key) not in (None, ""):
+                        moment = raw.get(key)
+                        break
+                if moment is not None:
+                    hold["ts"] = moment
+                if not await self._commit_price_hold(owner, text, price, extra=hold):
+                    return False
+                seen.add(text)
+            if price not in (None, ""):
+                claimed.append(str(price))
+            if raw in (fresh.get("opens") or []):
+                try:
+                    deleted = await self._delete_exchange_row(connector, raw)
+                except Exception:
+                    return False
+                if not deleted:
+                    return False
+            if price in (None, ""):
+                return False
+        return True
+
+    def _known_acceptance_times(self, pair: str, fresh: Dict[str, Any]) -> List[float]:
+        found = []
+
+        def add(value):
+            if value in (None, ""):
+                return
+            try:
+                moment = float(value)
+            except (TypeError, ValueError):
+                return
+            if moment > 1_000_000_000_000:
+                moment = moment / 1000
+            found.append(moment)
+
+        for item in owed_records() or []:
+            if item.get("trading_pair") in (None, pair):
+                add(item.get("ts"))
+        try:
+            from utils.executor_checkpoint import _read_ledger
+            for row in _read_ledger():
+                add(row.get("ts"))
+        except Exception:
+            return []
+        for row in getattr(self, "_hold_rows", None) or []:
+            if row.get("trading_pair") not in (None, pair):
+                continue
+            parsed = parse_checkpoint(row.get("checkpoint"))
+            for hold in (parsed or {}).get("holds") or []:
+                add(hold.get("ts"))
+        for raw in list(fresh.get("opens") or []) + list(fresh.get("finished") or []):
+            for key in ("create_time", "update_time", "ts"):
+                add(raw.get(key))
+        return found
+
+    def _install_open_shell(self, executor_id: str, executor: ExecutorBase) -> None:
+        """Grid opens do not call the stock place. The task is kept, not discarded."""
+        if not hasattr(executor, "adjust_and_place_open_order"):
+            return
+        service = self
+        reserves = self.__dict__.setdefault("_quant_reserves", {})
+        tasks = self.__dict__.setdefault("_accept_tasks", set())
+
+        def wrapped(level):
+            task = asyncio.get_event_loop().create_task(
+                service._durable_open(executor_id, executor, level, reserves)
+            )
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+        executor.adjust_and_place_open_order = wrapped
+        original_stop = getattr(executor, "control_shutdown_process", None)
+
+        async def stop_held(*args, **kwargs):
+            if buy_blocked() or not service._executor_proofs_released(executor_id):
+                return None
+            if original_stop is None:
+                return None
+            return await original_stop(*args, **kwargs)
+
+        if original_stop is not None:
+            executor.control_shutdown_process = stop_held
+
+    async def _durable_open(self, executor_id: str, executor, level, reserves: dict) -> None:
+        """Journal the client id, then send. Do not call stock adjust, buy, or sell."""
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None)
+        if connector is None or not pair or not hasattr(connector, "quantize_order_price"):
+            return
+        account = (self._executor_metadata.get(executor_id) or {}).get("account_name")
+        if not account or self.db_manager is None:
+            return
+        recover_folder_debt()
+        if buy_blocked() or ledger_order_ids() is None:
+            return
+        candidate = executor._get_open_order_candidate(level)
+        executor.adjust_order_candidates(connector_name, [candidate])
+        if getattr(candidate, "amount", 0) <= 0:
+            return
+        stored = []
+        journal_ts = []
+        try:
+            from utils.executor_checkpoint import _read_ledger
+            miss = self.__dict__.get("_local_miss_ids", set())
+            for row in _read_ledger():
+                if row.get("order_id") in miss:
+                    continue
+                stored.append(row.get("price"))
+                if row.get("ts") is not None:
+                    journal_ts.append(row.get("ts"))
+        except Exception:
+            return
+        for item in owed_records() or []:
+            if item.get("trading_pair") == pair and item.get("price"):
+                stored.append(item.get("price"))
+                if item.get("ts") is not None:
+                    journal_ts.append(item.get("ts"))
+        rules = getattr(connector, "trading_rules", None) or {}
+        tick = getattr(rules.get(pair) if isinstance(rules, dict) else None, "min_price_increment", None)
+        column_prices = await self._column_prices(pair)
+        if column_prices is None:
+            return
+        fresh = await self._fresh_raw_lists(connector, pair, journal_ts[0] if journal_ts else None)
+        if not fresh.get("opens_read") or not fresh.get("opens_done"):
+            return
+        self._hold_rows = await self._checkpoint_rows()
+        column_ids = await self._column_order_ids(pair)
+        if column_ids is None:
+            return
+        if self._raw_prefix_without_hold(pair, getattr(connector, "client_order_id_prefix", None)):
+            return
+        if not await self._claim_visible_texts(executor_id, connector, pair, fresh, column_ids):
+            return
+        if self._owned_row_lacks_price(connector, fresh, column_ids):
+            return
+        self._hold_rows = await self._checkpoint_rows()
+        column_ids = await self._column_order_ids(pair)
+        if column_ids is None or self._column_hold_lacks_price(pair):
+            return
+        moments = self._known_acceptance_times(pair, fresh)
+        earliest = min(moments) if moments else None
+        request = fresh.get("finished_request") or {}
+        if earliest is not None and not history_covers_ts(request, earliest, {
+            "read": fresh.get("finished_read"),
+            "done": fresh.get("finished_done"),
+        }):
+            fresh = await self._fresh_raw_lists(connector, pair, earliest)
+            request = fresh.get("finished_request") or {}
+            if not fresh.get("opens_read") or not fresh.get("opens_done"):
+                return
+            if not await self._claim_visible_texts(executor_id, connector, pair, fresh, column_ids):
+                return
+            if self._owned_row_lacks_price(connector, fresh, column_ids):
+                return
+            self._hold_rows = await self._checkpoint_rows()
+            column_ids = await self._column_order_ids(pair)
+            if column_ids is None or self._column_hold_lacks_price(pair):
+                return
+        self._remember_seen_texts(connector, fresh, column_ids)
+        if self._seen_prefix_unrecorded(connector, fresh, column_ids):
+            return
+        owned_visible = (
+            self._has_owned_text(connector, fresh, column_ids)
+            or bool(journal_ts)
+            or bool(column_ids)
+            or bool(self.__dict__.get("_seen_client_ids"))
+        )
+        covered = history_covers_ts(request, earliest, {
+            "read": fresh.get("finished_read"),
+            "done": fresh.get("finished_done"),
+        })
+        window_ok = (not owned_visible) or (
+            earliest is not None and covered and "from" in (request.get("params") or {})
+        )
+        if not window_ok:
+            return
+        released = self.__dict__.get("_released_order_ids", set())
+        prices = list(stored)
+        prices.extend(column_prices)
+        prices.extend(self.__dict__.get("_claimed_prices", []))
+        for raw in list(fresh.get("opens") or []) + list(fresh.get("finished") or []):
+            if str(raw.get("text") or "") in released:
+                continue
+            if raw.get("price") not in (None, ""):
+                prices.append(raw.get("price"))
+        price = connector.quantize_order_price(pair, candidate.price)
+        price_text = str(price)
+        if send_blocked(
+            ledger_ok=ledger_order_ids() is not None,
+            column_ok=True,
+            opens_ok=bool(fresh.get("opens_read")) and bool(fresh.get("opens_done")),
+            finished_ok=bool(fresh.get("finished_read")) and bool(fresh.get("finished_done")),
+            history_covers=window_ok and bool(fresh.get("finished_read")) and bool(fresh.get("finished_done")),
+            prices=prices,
+            placement=price_text,
+            tick=tick,
+        ):
+            return
+        if recorded_price_blocks(stored, price_text, tick):
+            return
+        if self._owner_for_pair(account, connector_name, pair) is None and stored:
+            return
+        connector_key = str(id(connector))
+        if not claim_quant(reserves, connector_key, pair, price_text):
+            return
+        from hummingbot.connector.utils import get_new_client_order_id
+        order_id = get_new_client_order_id(
+            is_buy=getattr(getattr(executor.config, "side", None), "name", "BUY") != "SELL",
+            trading_pair=pair,
+            hbot_order_id_prefix=connector.client_order_id_prefix,
+            max_id_len=connector.client_order_id_max_length,
+        )
+        level_id = getattr(level, "id", None)
+        if not remember_open_before_send(
+            executor_id,
+            order_id,
+            level_id,
+            price_text,
+            account_name=account,
+            connector=connector_name,
+            trading_pair=pair,
+        ):
+            release_quant(reserves, connector_key, pair, price_text)
+            return
+        if self._raw_prefix_without_hold(pair, getattr(connector, "client_order_id_prefix", None)):
+            release_quant(reserves, connector_key, pair, price_text)
+            return
+        from hummingbot.strategy_v2.models.executors import TrackedOrder
+        level.active_open_order = TrackedOrder(order_id=order_id)
+        reached = self.__dict__.setdefault("_reached_place", set())
+        token = _placing_order_id.set(order_id)
+        self._chain_place_once(connector, reached)
+        try:
+            await connector._create_order(
+                trade_type=executor.config.side,
+                order_id=order_id,
+                trading_pair=pair,
+                amount=candidate.amount,
+                order_type=executor.config.triple_barrier_config.open_order_type,
+                price=price,
+            )
+        except Exception:
+            logger.exception("durable open create failed")
+        finally:
+            _placing_order_id.reset(token)
+        if order_id not in reached:
+            release_quant(reserves, connector_key, pair, price_text)
+            level.active_open_order = None
+            self.__dict__.setdefault("_local_miss_ids", set()).add(order_id)
+            return
+        await self._commit_open_hold(executor_id, order_id, level_id, price_text, connector)
+
+    async def _commit_open_hold(self, executor_id, order_id, level_id, price_text, connector) -> None:
+        """Write the hold after the exchange id exists. Do not seat a fill."""
+        live = (getattr(connector, "in_flight_orders", None) or {}).get(order_id)
+        exchange_id = getattr(live, "exchange_order_id", None) if live is not None else None
+        state = getattr(live, "current_state", None) if live is not None else None
+        name = getattr(state, "name", str(state or ""))
+        if not exchange_id or name not in ("OPEN", "FILLED", "PARTIALLY_FILLED"):
+            return
+        if not self.db_manager:
+            return
+        from utils.executor_checkpoint import checkpoint_plus
+        try:
+            async with self.db_manager.get_session_context() as session:
+                repo = ExecutorRepository(session)
+                row = await repo.get_executor_by_id(executor_id)
+                seen = row.checkpoint if row is not None else None
+                body = checkpoint_plus(seen, {
+                    "order_id": order_id,
+                    "level_id": level_id,
+                    "price": price_text,
+                    "filled": name != "OPEN",
+                })
+                if body is None:
+                    return
+                changed = await repo.replace_checkpoint_if_unchanged(executor_id, seen, body)
+                if changed:
+                    return
+                fresh = await repo.get_executor_by_id(executor_id)
+                seen = fresh.checkpoint if fresh is not None else None
+                if seen and order_id in seen:
+                    return
+                body = checkpoint_plus(seen, {
+                    "order_id": order_id,
+                    "level_id": level_id,
+                    "price": price_text,
+                    "filled": name != "OPEN",
+                })
+                if body is None:
+                    return
+                await repo.replace_checkpoint_if_unchanged(executor_id, seen, body)
+        except Exception:
+            logger.exception("open hold was not committed")
+
+    def _chain_place_once(self, connector, reached: set) -> None:
+        if getattr(connector, "_accept_place_chained", False):
+            return
+        original = connector._place_order
+
+        async def chained(*args, **kwargs):
+            current = _placing_order_id.get()
+            if current:
+                reached.add(current)
+            return await original(*args, **kwargs)
+
+        connector._place_order = chained
+        connector._accept_place_chained = True
 
     def _event_wrapper(self, executor_id, executor, original, marker):
         service = self
@@ -1005,20 +1993,24 @@ class ExecutorService:
         if executor is None or not executor_type or executor.is_closed:
             return
         try:
-            body = json.dumps(
-                capture_executor(executor, executor_type), default=_json_default, sort_keys=True
-            )
+            captured = capture_executor(executor, executor_type)
         except Exception as e:
             logger.error(f"Error capturing checkpoint for {executor_id}: {e}", exc_info=True)
             return
-        if self._checkpoint_written.get(executor_id) == body:
-            return
         try:
             async with self.db_manager.get_session_context() as session:
-                await ExecutorRepository(session).update_executor(
-                    executor_id=executor_id, checkpoint=body
+                row = await ExecutorRepository(session).get_executor_by_id(executor_id)
+                seen = row.checkpoint if row is not None else None
+                body = checkpoint_keeping_holds(seen, captured)
+                if body is None:
+                    return
+                changed = await ExecutorRepository(session).replace_checkpoint_if_unchanged(
+                    executor_id=executor_id,
+                    seen_text=seen,
+                    new_text=body,
                 )
-            self._checkpoint_written[executor_id] = body
+            if changed:
+                self._checkpoint_written[executor_id] = body
         except Exception as e:
             logger.error(f"Error writing checkpoint for {executor_id}: {e}", exc_info=True)
 
@@ -1036,7 +2028,12 @@ class ExecutorService:
         """
         # Before any resumed grid can place. A prune failure must not skip resume.
         try:
-            prune_order_ledger()
+            recover_folder_debt()
+            protected = self._ledger_ids_without_column()
+            if protected is None:
+                logger.warning("order ledger was not read; not pruning")
+            else:
+                prune_order_ledger(protected=protected)
         except Exception:
             logger.exception("order ledger prune failed; resume continues")
         if not self.db_manager:
@@ -1315,6 +2312,8 @@ class ExecutorService:
     async def _resume_one(self, row: Dict[str, Any], owned_by: Optional[Dict[str, str]] = None) -> Optional[str]:
         """None on success. A string is why this row was left for cleanup."""
         checkpoint = parse_checkpoint(row.get("checkpoint"))
+        if must_keep_executor(row["executor_id"], ledger_executor_ids(), row.get("checkpoint")):
+            self.__dict__.setdefault("_kept_ids", set()).add(row["executor_id"])
         if not row.get("config"):
             return "no stored config"
         try:
@@ -1349,6 +2348,26 @@ class ExecutorService:
                 checkpoint = merge_recent_ids(checkpoint, recent_order_ids(row["executor_id"]))
             reason = can_resume(checkpoint, views)
             if reason:
+                self.__dict__.setdefault("_kept_ids", set()).add(row["executor_id"])
+                if row["executor_id"] not in self._active_executors:
+                    try:
+                        executor_class, _, typed_config = self._validate_executor_config(
+                            config, default_timestamp=trading_interface.current_timestamp
+                        )
+                        metadata = {
+                            "account_name": account,
+                            "connector_name": row["connector_name"],
+                            "trading_pair": row["trading_pair"],
+                            "executor_type": row["executor_type"],
+                            "controller_id": row["controller_id"],
+                            "created_at": row.get("created_at") or datetime.now(timezone.utc),
+                            "config": config,
+                        }
+                        self._instantiate_and_register(
+                            executor_class, typed_config, trading_interface, metadata, start=False
+                        )
+                    except Exception:
+                        logger.exception("resume failed before start; row stays RUNNING")
                 return reason
             plan = None
             if checkpoint and row["executor_type"] == "grid_executor":
@@ -1427,9 +2446,13 @@ class ExecutorService:
                     exc_info=True,
                 )
                 return None
-            self._active_executors.pop(row["executor_id"], None)
-            self._executor_metadata.pop(row["executor_id"], None)
-            logger.error(f"Error resuming executor {row['executor_id']}: {e}", exc_info=True)
+            self.__dict__.setdefault("_kept_ids", set()).add(row["executor_id"])
+            logger.error(
+                "Resume of %s failed before start; leaving it registered: %s",
+                row["executor_id"],
+                e,
+                exc_info=True,
+            )
             return str(e)
         logger.info(
             f"Resumed {row['executor_type']} {row['executor_id']} "
@@ -1822,6 +2845,8 @@ class ExecutorService:
         # Atomically claim the executor so a concurrent completion (e.g. the
         # control loop racing with the synchronous call in create_executor)
         # returns early instead of double-persisting / double-aggregating.
+        if not self._executor_proofs_released(executor_id):
+            return
         executor = self._active_executors.pop(executor_id, None)
         if executor is None:
             return

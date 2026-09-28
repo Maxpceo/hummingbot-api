@@ -28,6 +28,23 @@ from utils.executor_checkpoint import (
     remember_order_now,
     seat_known_opens,
     would_place_at_touch,
+    recorded_price_blocks,
+    send_blocked,
+    finished_list_request,
+    gate_delete_request,
+    must_keep_executor,
+    note_owed,
+    owed_records,
+    four_proofs,
+    gate_base_is_zero,
+    checkpoint_plus,
+    claim_quant,
+    release_quant,
+    pick_owner,
+    local_create_missed_place,
+    unread_blocks_buy,
+    snapshot_body,
+    remember_open_before_send,
 )
 
 
@@ -463,9 +480,13 @@ def test_new_ledger_file_fsyncs_its_directory_once(tmp_path, monkeypatch):
     monkeypatch.setattr("utils.executor_checkpoint._fsync_directory", tracking_dir)
     remember_order_now("ex", "new")
     assert "new" in path.read_text(encoding="utf-8")
-    assert seen == [(str(path), True)]
+    ledger_syncs = [target for target, ready in seen if target == str(path)]
+    marker = str(path.parent.parent / ".order-ledger-debt")
+    assert ledger_syncs
+    assert seen[0][0] == marker and seen[0][1] is True
+    assert seen.index((str(path), True)) > seen.index((marker, True))
     remember_order_now("ex", "next")
-    assert seen == [(str(path), True)]
+    assert [target for target, ready in seen if target == str(path)] == ledger_syncs
 
 
 def test_existing_ledger_does_not_fsync_the_directory(tmp_path, monkeypatch):
@@ -496,10 +517,10 @@ def test_failed_create_fsyncs_directory_on_the_next_success(tmp_path, monkeypatc
 
     monkeypatch.setattr(os, "write", fail_once)
     remember_order_now("ex", "lost")
-    assert dirs == []
+    assert str(path) not in dirs
     monkeypatch.setattr(os, "write", real_write)
     remember_order_now("ex", "kept")
-    assert dirs == [str(path)]
+    assert str(path) in dirs
     text = path.read_text(encoding="utf-8")
     assert "kept" in text
     assert "lost" not in text
@@ -519,15 +540,19 @@ def test_created_directory_fsyncs_parent_and_retries_only_parent(tmp_path, monke
         return True
 
     monkeypatch.setattr("utils.executor_checkpoint._fsync_directory", tracking)
+    marker = str(tmp_path / ".order-ledger-debt")
     remember_order_now("ex", "new")
-    assert calls == [str(path), str(directory)]
+    assert calls[0] == marker
+    assert calls[1:] == [str(path), str(directory)]
     calls.clear()
     remember_order_now("ex", "retry")
     assert calls == [str(directory)]
     parent_ok["on"] = True
     calls.clear()
     remember_order_now("ex", "done")
-    assert calls == [str(directory)]
+    assert calls[:2] == [str(directory), str(tmp_path)]
+    assert marker not in calls
+    assert os.path.exists(marker)
     calls.clear()
     remember_order_now("ex", "later")
     assert calls == []
@@ -570,7 +595,8 @@ def test_prune_does_not_create_a_missing_file(tmp_path, monkeypatch):
 
 
 def test_prune_waits_for_the_lock_and_keeps_both_fresh_ids(tmp_path, monkeypatch):
-    path = tmp_path / "ledger.jsonl"
+    path = tmp_path / "box" / "ledger.jsonl"
+    path.parent.mkdir()
     fresh = json.dumps({"executor_id": "ex", "order_id": "fresh", "ts": time.time()})
     path.write_text(
         '{"executor_id": "ex", "order_id": "old", "ts": 1}\n' + fresh + "\n",
@@ -604,7 +630,8 @@ def test_prune_waits_for_the_lock_and_keeps_both_fresh_ids(tmp_path, monkeypatch
 
 
 def test_prune_keeps_a_line_appended_after_read_before_replace(tmp_path, monkeypatch):
-    path = tmp_path / "ledger.jsonl"
+    path = tmp_path / "box" / "ledger.jsonl"
+    path.parent.mkdir()
     fresh = json.dumps({"executor_id": "ex", "order_id": "fresh", "ts": time.time()})
     path.write_text(
         '{"executor_id": "ex", "order_id": "old", "ts": 1}\n' + fresh + "\n",
@@ -1383,3 +1410,1030 @@ def test_exchange_pass_key_does_not_share_an_empty_list_across_accounts():
     ]
     assert "other-ledger" in foreign_order_ids(rows, {"other": ["other-ledger"]}, "mine")
     assert "mine-ledger" not in foreign_order_ids(rows, {"mine": ["mine-ledger"], "other": []}, "mine")
+
+
+def test_checkpoint_plus_keeps_levels_and_cancel_mark():
+    read = json.dumps({
+        "levels": [{"id": "L0", "price": "110"}],
+        "cancel_mark": {"order_id": "old"},
+    })
+    body = checkpoint_plus(read, {"order_id": "new", "price": "105"})
+    parsed = json.loads(body)
+    assert parsed["levels"][0]["id"] == "L0"
+    assert parsed["cancel_mark"]["order_id"] == "old"
+    assert parsed["holds"][0]["order_id"] == "new"
+    assert snapshot_body(read, {"holds": []}) is not None
+
+
+def test_claim_quant_second_level_of_the_same_grid_does_not_take_it():
+    reserves = {}
+    assert claim_quant(reserves, "conn", "INJ-USDT", "105") is True
+    assert claim_quant(reserves, "conn", "INJ-USDT", "105") is False
+    release_quant(reserves, "conn", "INJ-USDT", "105")
+    assert claim_quant(reserves, "conn", "INJ-USDT", "105") is True
+
+
+def test_owner_is_smallest_on_the_same_pair_only():
+    rows = [
+        {"executor_id": "b", "account": "a", "connector": "gate", "pair": "INJ-USDT"},
+        {"executor_id": "a", "account": "a", "connector": "gate", "pair": "DOGE-USDT"},
+        {"executor_id": "c", "account": "a", "connector": "okx", "pair": "INJ-USDT"},
+    ]
+    assert pick_owner(rows, "a", "gate", "INJ-USDT") == "b"
+    assert pick_owner(rows, "a", "gate", "SOL-USDT") is None
+
+
+def test_failed_append_is_not_permission_to_send(tmp_path, monkeypatch):
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    monkeypatch.setattr(os, "write", lambda *args: (_ for _ in ()).throw(OSError("append")))
+    assert remember_open_before_send("ex", "new", "L0", "105") is False
+
+
+def test_prune_keeps_a_protected_id_older_than_the_window(tmp_path, monkeypatch):
+    path = tmp_path / "ledger.jsonl"
+    path.write_text('{"executor_id": "ex", "order_id": "keep", "ts": 1}\n', encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    prune_order_ledger(protected={"keep"})
+    assert "keep" in path.read_text(encoding="utf-8")
+
+
+def test_hold_without_level_id_stays_a_hold():
+    body = checkpoint_plus(None, {"order_id": "new", "price": "105"})
+    parsed = parse_checkpoint(body)
+    assert parsed["holds"][0]["order_id"] == "new"
+    assert "level_id" not in parsed["holds"][0]
+
+
+def test_owed_survives_a_reread_and_partial_cancel_does_not_release(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    parent.mkdir()
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(parent / "data" / "order-ledger.jsonl"))
+    assert note_owed({
+        "order_id": "cid",
+        "price": "105",
+        "executor_id": "grid-a",
+        "account_name": "main",
+        "connector": "gate_io",
+        "trading_pair": "INJ-USDT",
+        "ts": 1,
+    }) is True
+    assert owed_records()[0]["order_id"] == "cid"
+    assert four_proofs(
+        {"status": "closed", "finish_as": "cancelled", "amount": "2", "left": "1"},
+        in_opens=False,
+        in_flight=False,
+        in_lost=False,
+    ) is False
+    assert gate_base_is_zero({"status": "closed", "finish_as": "cancelled"}) is False
+    assert four_proofs(
+        {"status": "closed", "finish_as": "cancelled", "amount": "2", "left": "2"},
+        in_opens=False,
+        in_flight=False,
+        in_lost=False,
+        history_read=True,
+    ) is True
+    assert four_proofs(
+        {"status": "closed", "finish_as": "cancelled", "amount": "2", "left": "2"},
+        in_opens=False,
+        in_flight=False,
+        in_lost=False,
+    ) is False
+
+
+def test_new_session_blocks_buy_without_finished_history():
+    assert finished_list_request("gate", "INJ_USDT")["params"]["status"] == "finished"
+    assert send_blocked(
+        ledger_ok=True,
+        column_ok=True,
+        opens_ok=True,
+        finished_ok=False,
+        prices=[],
+        placement="105",
+        tick=Decimal("0.01"),
+    ) is True
+    request = gate_delete_request({"text": "cid", "id": "991", "currency_pair": "INJ_USDT"})
+    assert request["path"] == "spot/orders/991"
+    assert request["params"]["currency_pair"] == "INJ_USDT"
+    assert gate_delete_request({"text": "cid"}) is None
+    assert must_keep_executor("ex", None, None) is True
+    assert must_keep_executor("ex", [], '{"order_id": "cid"}') is True
+
+
+def test_missing_recorded_price_blocks_a_new_buy():
+    assert recorded_price_blocks([None], "105", Decimal("0.01")) is True
+    assert send_blocked(
+        ledger_ok=True,
+        column_ok=False,
+        opens_ok=True,
+        prices=[],
+        placement="105",
+        tick=Decimal("0.01"),
+    ) is True
+    assert send_blocked(
+        ledger_ok=True,
+        column_ok=True,
+        opens_ok=True,
+        prices=["105"],
+        placement="105",
+        tick=Decimal("0.01"),
+    ) is True
+
+
+def test_place_throw_is_not_a_local_miss_and_unread_blocks_buy():
+    assert local_create_missed_place(False) is True
+    assert local_create_missed_place(True) is False
+    assert unread_blocks_buy(False) is True
+    assert unread_blocks_buy(True) is False
+
+
+import asyncio
+from contextlib import asynccontextmanager
+
+import pytest
+
+from utils.executor_checkpoint import (
+    buy_blocked,
+    history_covers_ts,
+    ledger_debt_marker,
+    ledger_executor_ids,
+    ledger_order_ids,
+    recover_folder_debt,
+    reset_ledger_process_state,
+)
+
+
+class _Kept:
+    is_closed = False
+
+    def stop(self):
+        return None
+
+
+class _Gate:
+    client_order_id_prefix = "t-HBOT"
+
+    def __init__(self):
+        self.opens = []
+        self.finished = []
+        self.deleted = []
+        self.created = []
+        self.in_flight_orders = {}
+        self._order_tracker = SimpleNamespace(lost_orders={})
+        self.fail = False
+
+    async def exchange_symbol_associated_to_pair(self, pair):
+        return pair.replace("-", "_")
+
+    async def _api_get(self, path_url, params, is_auth_required=True, limit_id=None):
+        if self.fail:
+            raise OSError("unread")
+        if params.get("status") == "open":
+            return list(self.opens)
+        return list(self.finished)
+
+    async def _api_delete(self, path_url, params, is_auth_required=True):
+        self.deleted.append((path_url, dict(params)))
+
+    async def _create_order(self, **kwargs):
+        self.created.append(kwargs)
+
+
+class _Repo:
+    def __init__(self, rows):
+        self.rows = rows
+        self.cleaned = None
+        self.holds = []
+
+    async def get_running_for_resume(self):
+        return self.rows
+
+    async def get_checkpoint_rows(self):
+        return self.rows
+
+    async def get_executor_by_id(self, executor_id):
+        for row in self.rows:
+            if row["executor_id"] == executor_id:
+                return SimpleNamespace(checkpoint=row.get("checkpoint"), status="RUNNING")
+        return None
+
+    async def replace_checkpoint_if_unchanged(self, executor_id, seen, body):
+        self.holds.append((executor_id, body))
+        for row in self.rows:
+            if row["executor_id"] == executor_id:
+                row["checkpoint"] = body
+        return 1
+
+    async def cleanup_orphaned_executors(self, active_executor_ids, close_type="SYSTEM_CLEANUP"):
+        self.cleaned = list(active_executor_ids)
+        self.close_type = close_type
+        return 0
+
+
+def _owed(order_id="t-HBOTcid", price="105", executor_id="grid-a", pair="INJ-USDT", account="main"):
+    return {
+        "order_id": order_id,
+        "price": price,
+        "executor_id": executor_id,
+        "account_name": account,
+        "connector": "gate_io",
+        "trading_pair": pair,
+        "ts": 10,
+    }
+
+
+def _running_row(executor_id="grid-a", pair="INJ-USDT", account="main", checkpoint=None):
+    return {
+        "executor_id": executor_id,
+        "executor_type": "grid_executor",
+        "account_name": account,
+        "connector_name": "gate_io",
+        "trading_pair": pair,
+        "controller_id": "main",
+        "config": "{}",
+        "checkpoint": checkpoint,
+        "status": "RUNNING",
+    }
+
+
+def _load_executor_service():
+    import importlib.util
+    import sys
+    import types
+    loaded = sys.modules.get("services.executor_service") or sys.modules.get("executor_service_under_test")
+    if loaded is not None and hasattr(loaded, "ExecutorService"):
+        return loaded
+    try:
+        import hummingbot  # noqa: F401
+    except ImportError:
+        hummingbot = None
+    if hummingbot is not None:
+        import services.executor_service as loaded
+        return loaded
+
+    class _Flex(types.ModuleType):
+        def __getattr__(self, item):
+            if item.startswith("__"):
+                raise AttributeError(item)
+            value = type(item, (), {"__init__": lambda self, *args, **kwargs: None})
+            setattr(self, item, value)
+            return value
+
+    class _Hook:
+        def find_spec(self, name, path, target=None):
+            if name == "hummingbot" or name.startswith("hummingbot."):
+                return importlib.util.spec_from_loader(name, self)
+            return None
+
+        def create_module(self, spec):
+            module = _Flex(spec.name)
+            module.__path__ = []
+            module.__package__ = spec.name
+            return module
+
+        def exec_module(self, module):
+            return None
+
+    sys.meta_path.insert(0, _Hook())
+    package = sys.modules.get("services")
+    if package is None:
+        package = types.ModuleType("services")
+        package.__path__ = []
+        sys.modules["services"] = package
+    gateway = types.ModuleType("services.gateway_client")
+    gateway.get_native_gas_token = lambda *args, **kwargs: None
+    sys.modules["services.gateway_client"] = gateway
+    trading = types.ModuleType("services.trading_service")
+    trading.AccountTradingInterface = type("AccountTradingInterface", (), {})
+    trading.TradingService = type("TradingService", (), {})
+    sys.modules["services.trading_service"] = trading
+    spec = importlib.util.spec_from_file_location(
+        "executor_service_under_test", "services/executor_service.py"
+    )
+    loaded = importlib.util.module_from_spec(spec)
+    sys.modules["executor_service_under_test"] = loaded
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+def _service(monkeypatch, repo, connector, executor_id="grid-a"):
+    loaded = _load_executor_service()
+    monkeypatch.setattr(loaded, "ExecutorRepository", lambda session: repo)
+    service = loaded.ExecutorService.__new__(loaded.ExecutorService)
+    service.db_manager = SimpleNamespace(get_session_context=lambda: _session())
+    service._active_executors = {}
+    service._executor_metadata = {
+        executor_id: {
+            "account_name": "main",
+            "connector_name": "gate_io",
+            "trading_pair": "INJ-USDT",
+            "executor_type": "grid_executor",
+        }
+    }
+    service._trading_interfaces = {"main": SimpleNamespace(connectors={"gate_io": connector}, current_timestamp=1)}
+    service._trading_service = SimpleNamespace(update_all_timestamps=lambda: None)
+    service._resume_rows = list(repo.rows)
+    service._is_running = True
+    service._control_loop_task = None
+    service.update_interval = 0
+    service._lp_rent_recorded = set()
+    service._lp_rent_retry_after = {}
+    service._last_snapshot_at = time.monotonic()
+    service._last_prune_at = time.monotonic()
+    service.performance_snapshot_interval = 10 ** 9
+    service.performance_retention_days = 0
+    service.PERFORMANCE_PRUNE_INTERVAL_SECONDS = 10 ** 9
+    service._kept_ids = set()
+    return service
+
+
+@asynccontextmanager
+async def _session():
+    yield SimpleNamespace()
+
+
+async def _one_tick(service, monkeypatch):
+    service._is_running = True
+
+    async def _sleep(_seconds):
+        service._is_running = False
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    await service._control_loop()
+
+
+def test_marker_is_synced_before_the_live_name_is_created(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    parent.mkdir()
+    path = parent / "data" / "order-ledger.jsonl"
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    events = []
+    real_open = os.open
+    real_dir = __import__("utils.executor_checkpoint", fromlist=["_fsync_directory"])._fsync_directory
+    marker = str(parent / ".order-ledger-debt")
+
+    def tracking_open(file, flags, *args, **kwargs):
+        events.append(("open", str(file)))
+        return real_open(file, flags, *args, **kwargs)
+
+    def tracking_dir(target):
+        text = ""
+        if os.path.exists(marker):
+            text = open(marker, encoding="utf-8").read()
+        events.append(("dir", str(target), text))
+        return real_dir(target)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr("utils.executor_checkpoint._fsync_directory", tracking_dir)
+    assert remember_open_before_send(
+        "grid-a", "t-HBOTcid", None, "105",
+        account_name="main", connector="gate_io", trading_pair="INJ-USDT", ts=10,
+    )
+    marker_dir = next(i for i, event in enumerate(events) if event[0] == "dir" and event[1] == marker and "t-HBOTcid" in event[2])
+    live_open = next(i for i, event in enumerate(events) if event[0] == "open" and event[1] == str(path))
+    assert marker_dir < live_open
+    assert os.path.exists(marker)
+    assert "t-HBOTcid" in path.read_text(encoding="utf-8")
+    reset_ledger_process_state()
+    assert recover_folder_debt() is True
+    assert not os.path.exists(marker)
+
+
+def test_new_process_fsyncs_the_file_before_clearing_the_marker(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    parent.mkdir()
+    path = parent / "data" / "order-ledger.jsonl"
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    real_dir = __import__("utils.executor_checkpoint", fromlist=["_fsync_directory"])._fsync_directory
+    fail = {"on": True}
+
+    def tracking(target):
+        if fail["on"] and str(target) == str(path):
+            return False
+        return real_dir(target)
+
+    monkeypatch.setattr("utils.executor_checkpoint._fsync_directory", tracking)
+    assert remember_open_before_send(
+        "grid-a", "t-HBOTcid", None, "105",
+        account_name="main", connector="gate_io", trading_pair="INJ-USDT", ts=10,
+    ) is False
+    assert os.path.exists(ledger_debt_marker())
+    assert buy_blocked()
+    reset_ledger_process_state()
+    assert buy_blocked()
+    fail["on"] = False
+    assert recover_folder_debt() is True
+    assert not os.path.exists(ledger_debt_marker())
+    assert path.exists()
+    reset_ledger_process_state()
+    assert path.exists()
+    assert "t-HBOTcid" in path.read_text(encoding="utf-8")
+
+
+def test_missing_file_with_a_marker_is_not_an_empty_start(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    parent.mkdir()
+    path = parent / "data" / "order-ledger.jsonl"
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    assert note_owed(_owed()) is True
+    assert not path.exists()
+    assert ledger_order_ids() is None
+    assert ledger_executor_ids() is None
+    assert buy_blocked()
+
+
+def test_marker_is_not_reopened_or_unlinked_before_the_journal_has_the_id(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    parent.mkdir()
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(parent / "data" / "order-ledger.jsonl"))
+    reset_ledger_process_state()
+    assert note_owed(_owed()) is True
+    opens = []
+    real_open = os.open
+    unlinked = []
+
+    def tracking_open(file, flags, *args, **kwargs):
+        opens.append(str(file))
+        return real_open(file, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "unlink", lambda file: unlinked.append(str(file)))
+    assert note_owed(_owed(order_id="t-HBOTnext")) is True
+    assert ledger_debt_marker() not in opens
+    assert unlinked == []
+    assert owed_records()[0]["order_id"] == "t-HBOTcid"
+    assert owed_records()[0]["price"] == "105"
+
+
+async def test_missing_file_does_not_buy_and_the_next_tick_deletes(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    parent.mkdir()
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(parent / "data" / "order-ledger.jsonl"))
+    reset_ledger_process_state()
+    assert note_owed(_owed()) is True
+    connector = _Gate()
+    repo = _Repo([_running_row(), _running_row("other", pair="DOGE-USDT", account="other")])
+    service = _service(monkeypatch, repo, connector)
+    service._active_executors["grid-a"] = _Kept()
+    await _one_tick(service, monkeypatch)
+    assert connector.created == []
+    assert connector.deleted == []
+    connector.opens = [
+        {"text": "t-HBOTcid", "id": "991", "currency_pair": "INJ_USDT", "price": "105", "status": "open"},
+        {"text": "t-HBOTother", "id": "992", "currency_pair": "DOGE_USDT", "price": "1", "status": "open"},
+    ]
+    await _one_tick(service, monkeypatch)
+    assert connector.created == []
+    assert connector.deleted == [("spot/orders/991", {"currency_pair": "INJ_USDT"})]
+    assert repo.holds and "t-HBOTcid" in repo.holds[0][1]
+    assert "level_id" not in repo.holds[0][1]
+
+
+async def test_unread_open_list_keeps_the_row_running_and_the_next_tick_deletes(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _Gate()
+    connector.fail = True
+    row = _running_row(checkpoint=None)
+    repo = _Repo([row])
+    service = _service(monkeypatch, repo, connector)
+    interface = service._trading_interfaces["main"]
+    interface.get_connector = lambda name: connector
+
+    async def _prepare(*args, **kwargs):
+        return None
+
+    service._prepare_market = _prepare
+    reason = await service._resume_one(row)
+    assert reason
+    assert "grid-a" in service._kept_ids
+    assert not any(isinstance(item, SimpleNamespace) for item in service._active_executors.values())
+    await service.cleanup_orphaned_executors()
+    assert repo.cleaned is not None and "grid-a" in repo.cleaned
+    assert row["status"] == "RUNNING"
+    connector.fail = False
+    connector.opens = [
+        {"text": "t-HBOTcid", "id": "991", "currency_pair": "INJ_USDT", "price": "105", "status": "open"},
+    ]
+    service._executor_metadata["grid-a"] = {
+        "account_name": "main",
+        "connector_name": "gate_io",
+        "trading_pair": "INJ-USDT",
+        "executor_type": "grid_executor",
+    }
+    if "grid-a" not in service._active_executors:
+        service._active_executors["grid-a"] = _Kept()
+    await _one_tick(service, monkeypatch)
+    await _one_tick(service, monkeypatch)
+    assert len(connector.deleted) >= 2
+    assert connector.created == []
+
+
+async def test_absence_from_both_lists_does_not_release_or_buy(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "t-HBOTcid", "price": "105", "ts": 10}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _Gate()
+    connector.finished = [{"text": "other", "status": "closed", "finish_as": "cancelled", "amount": "1", "left": "1", "currency_pair": "INJ_USDT", "price": "90"}]
+    repo = _Repo([_running_row(checkpoint=json.dumps({"holds": [{"order_id": "t-HBOTcid", "price": "105"}]}))])
+    service = _service(monkeypatch, repo, connector)
+    service._active_executors["grid-a"] = _Kept()
+    await _one_tick(service, monkeypatch)
+    assert "t-HBOTcid" not in service.__dict__.get("_released_order_ids", set())
+    assert service._executor_proofs_released("grid-a") is False
+    assert connector.created == []
+
+
+async def test_four_proofs_release_the_tick(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "t-HBOTcid", "price": "105", "ts": 10}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _Gate()
+    connector.finished = [{
+        "text": "t-HBOTcid",
+        "status": "closed",
+        "finish_as": "cancelled",
+        "amount": "2",
+        "left": "2",
+        "currency_pair": "INJ_USDT",
+        "price": "105",
+    }]
+    repo = _Repo([_running_row()])
+    service = _service(monkeypatch, repo, connector)
+    service._active_executors["grid-a"] = _Kept()
+    await _one_tick(service, monkeypatch)
+    assert "t-HBOTcid" in service._released_order_ids
+    assert service._executor_proofs_released("grid-a") is True
+    partial = dict(connector.finished[0])
+    partial["left"] = "1"
+    assert four_proofs(partial, in_opens=False, in_flight=False, in_lost=False, history_read=True) is False
+    assert four_proofs({"status": "closed", "finish_as": "cancelled"}, in_opens=False, in_flight=False, in_lost=False, history_read=True) is False
+
+
+def test_full_page_or_uncovered_window_is_not_history(tmp_path):
+    request = finished_list_request("gate", "INJ_USDT")
+    full = {"read": True, "done": False, "orders": []}
+    assert history_covers_ts(request, 10, full) is False
+    covered = finished_list_request("gate", "INJ_USDT", ts=10, now=20)
+    assert history_covers_ts(covered, 10, {"read": True, "done": True}) is True
+    assert history_covers_ts(request, 10, {"read": True, "done": True}) is False
+
+
+def test_replace_fsyncs_the_live_file_before_dropping_the_marker(tmp_path, monkeypatch):
+    path = tmp_path / "box" / "ledger.jsonl"
+    path.parent.mkdir()
+    fresh = json.dumps({"executor_id": "ex", "order_id": "keep", "ts": time.time()})
+    path.write_text('{"executor_id": "ex", "order_id": "old", "ts": 1}\n' + fresh + "\n", encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    events = []
+    real_replace = os.replace
+    real_unlink = os.unlink
+    real_live = __import__("utils.executor_checkpoint", fromlist=["_fsync_live_file"])._fsync_live_file
+
+    def tracking_replace(src, dst):
+        events.append("replace")
+        return real_replace(src, dst)
+
+    def tracking_live(target):
+        events.append(("live", str(target)))
+        return real_live(target)
+
+    def tracking_unlink(file, *args, **kwargs):
+        events.append(("unlink", str(file)))
+        return real_unlink(file, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", tracking_replace)
+    monkeypatch.setattr(os, "unlink", tracking_unlink)
+    monkeypatch.setattr("utils.executor_checkpoint._fsync_live_file", tracking_live)
+    prune_order_ledger()
+    assert events.index("replace") < events.index(("live", str(path)))
+    assert events.index(("live", str(path))) < events.index(("unlink", ledger_debt_marker()))
+    assert "keep" in path.read_text(encoding="utf-8")
+    assert "old" not in path.read_text(encoding="utf-8")
+
+
+def test_recover_does_not_unlink_before_the_directory_fsync(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text('{"executor_id": "grid-a", "order_id": "old", "price": "1", "ts": 1}\n', encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    assert note_owed(_owed()) is True
+    unlinked = []
+    real_unlink = os.unlink
+
+    def tracking_unlink(file, *args, **kwargs):
+        unlinked.append(str(file))
+        return real_unlink(file, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", tracking_unlink)
+    real_dir = __import__("utils.executor_checkpoint", fromlist=["_fsync_directory"])._fsync_directory
+
+    def fail_live_dir(target):
+        if str(target) == str(path):
+            return False
+        return real_dir(target)
+
+    monkeypatch.setattr("utils.executor_checkpoint._fsync_directory", fail_live_dir)
+    assert recover_folder_debt() is False
+    assert os.path.exists(ledger_debt_marker())
+    assert ledger_debt_marker() not in unlinked
+    assert buy_blocked() is True
+    monkeypatch.setattr("utils.executor_checkpoint._fsync_directory", real_dir)
+    assert recover_folder_debt() is True
+    assert not os.path.exists(ledger_debt_marker())
+    assert "t-HBOTcid" in path.read_text(encoding="utf-8")
+
+
+class _PagedGate(_Gate):
+    def __init__(self):
+        super().__init__()
+        self.pages = {}
+
+    async def _api_get(self, path_url, params, is_auth_required=True, limit_id=None):
+        self.calls = getattr(self, "calls", [])
+        self.calls.append(dict(params))
+        if self.fail:
+            raise OSError("unread")
+        if params.get("status") == "open":
+            page = int(params.get("page") or 1)
+            if page == 2 and self.pages.get("fail_next"):
+                raise OSError("next page")
+            return list(self.pages.get(page, []))
+        return list(self.finished)
+
+
+def _open_level():
+    return SimpleNamespace(
+        price=Decimal("105"),
+        amount=Decimal("1"),
+        id="L0",
+    )
+
+
+def _buyer(connector):
+    config = SimpleNamespace(
+        connector_name="gate_io",
+        trading_pair="INJ-USDT",
+        side=SimpleNamespace(name="BUY"),
+        triple_barrier_config=SimpleNamespace(open_order_type="LIMIT"),
+    )
+    executor = SimpleNamespace(
+        config=config,
+        connectors={"gate_io": connector},
+        _get_open_order_candidate=lambda level: level,
+        adjust_order_candidates=lambda name, rows: None,
+    )
+    connector.quantize_order_price = lambda pair, price: price
+    connector.trading_rules = {"INJ-USDT": SimpleNamespace(min_price_increment=Decimal("0.01"))}
+    connector.client_order_id_prefix = "t-HBOT"
+    connector.client_order_id_max_length = 28
+    return executor
+
+
+async def test_full_open_page_does_not_create(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _PagedGate()
+    connector.pages = {
+        1: [{"text": "other-%s" % i, "id": str(i), "currency_pair": "INJ_USDT", "price": "90"} for i in range(100)],
+        "fail_next": True,
+    }
+    repo = _Repo([_running_row(checkpoint=json.dumps({"holds": []}))])
+    service = _service(monkeypatch, repo, connector)
+    await service._durable_open("grid-a", _buyer(connector), _open_level(), {})
+    assert connector.created == []
+
+
+async def test_open_row_without_price_does_not_create(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _Gate()
+    connector.opens = [{"text": "t-HBOTcid", "id": "991", "currency_pair": "INJ_USDT", "status": "open"}]
+    repo = _Repo([_running_row(checkpoint=json.dumps({"version": 1, "type": "grid_executor", "holds": [], "levels": []}))])
+    service = _service(monkeypatch, repo, connector)
+    await service._durable_open("grid-a", _buyer(connector), _open_level(), {})
+    assert connector.deleted == [("spot/orders/991", {"currency_pair": "INJ_USDT"})]
+    assert repo.holds and "t-HBOTcid" in repo.holds[0][1]
+    assert "\"price\"" not in repo.holds[0][1]
+    assert connector.created == []
+    connector.opens = []
+    connector.deleted = []
+    nxt = _service(monkeypatch, repo, connector)
+    await nxt._durable_open("grid-a", _buyer(connector), _open_level(), {})
+    assert connector.created == []
+
+
+async def test_column_only_id_survives_stop_and_cleanup(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _Gate()
+    checkpoint = json.dumps({
+        "version": 1,
+        "type": "grid_executor",
+        "holds": [{"order_id": "t-HBOTold", "price": "105", "ts": 1}],
+        "levels": [],
+    })
+    row = _running_row(checkpoint=checkpoint)
+    repo = _Repo([row])
+    service = _service(monkeypatch, repo, connector)
+    kept = _Kept()
+    kept.is_closed = True
+    service._active_executors["grid-a"] = kept
+    await _one_tick(service, monkeypatch)
+    assert "grid-a" in service._active_executors
+    await service.stop()
+    assert "grid-a" in service._active_executors
+    await service.cleanup_orphaned_executors()
+    assert "grid-a" in repo.cleaned
+    await service._durable_open("grid-a", _buyer(connector), _open_level(), {})
+    assert connector.created == []
+
+
+async def test_finished_prefix_without_price_does_not_create(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _Gate()
+    connector.finished = [{
+        "text": "t-HBOTcid",
+        "id": "991",
+        "currency_pair": "INJ_USDT",
+        "status": "closed",
+        "finish_as": "filled",
+        "amount": "2",
+        "left": "0",
+    }]
+    repo = _Repo([_running_row(checkpoint=json.dumps({"version": 1, "type": "grid_executor", "holds": [], "levels": []}))])
+    service = _service(monkeypatch, repo, connector)
+    await service._durable_open("grid-a", _buyer(connector), _open_level(), {})
+    assert connector.created == []
+
+
+async def test_unowned_prefix_is_claimed_before_any_create(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _Gate()
+    connector.finished = [{
+        "text": "t-HBOTcid",
+        "id": "991",
+        "currency_pair": "INJ_USDT",
+        "price": "105",
+        "status": "closed",
+        "finish_as": "filled",
+        "amount": "2",
+        "left": "0",
+    }]
+    repo = _Repo([_running_row(checkpoint=json.dumps({"version": 1, "type": "grid_executor", "holds": [], "levels": []}))])
+    service = _service(monkeypatch, repo, connector)
+    level = _open_level()
+    level.price = Decimal("110")
+    await service._durable_open("grid-a", _buyer(connector), level, {})
+    assert connector.created == []
+    assert repo.holds and "t-HBOTcid" in repo.holds[0][1]
+    assert "level_id" not in repo.holds[0][1]
+
+
+async def test_failed_commit_does_not_delete_or_create(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _Gate()
+    connector.opens = [{
+        "text": "t-HBOTcid",
+        "id": "991",
+        "currency_pair": "INJ_USDT",
+        "price": "105",
+        "status": "open",
+    }]
+    repo = _Repo([_running_row(checkpoint=json.dumps({"version": 1, "type": "grid_executor", "holds": [], "levels": []}))])
+
+    async def _fail_commit(self, executor_id, seen, body):
+        return 0
+
+    repo.replace_checkpoint_if_unchanged = _fail_commit.__get__(repo, _Repo)
+    service = _service(monkeypatch, repo, connector)
+    await service._durable_open("grid-a", _buyer(connector), _open_level(), {})
+    assert connector.deleted == []
+    assert connector.created == []
+
+
+class _WidenGate(_Gate):
+    async def _api_get(self, path_url, params, is_auth_required=True, limit_id=None):
+        if params.get("status") == "open":
+            return []
+        if int(params.get("from", 999)) <= 10:
+            return [{
+                "text": "t-HBOTcid",
+                "id": "991",
+                "currency_pair": "INJ_USDT",
+                "status": "closed",
+                "finish_as": "filled",
+                "amount": "2",
+                "left": "0",
+            }]
+        return []
+
+
+async def test_widened_finished_page_without_price_does_not_create(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "old", "price": "90", "ts": 200}\n'
+        '{"executor_id": "grid-a", "order_id": "early", "price": "1", "ts": 10}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _WidenGate()
+    repo = _Repo([_running_row(checkpoint=json.dumps({"version": 1, "type": "grid_executor", "holds": [], "levels": []}))])
+    service = _service(monkeypatch, repo, connector)
+    await service._durable_open("grid-a", _buyer(connector), _open_level(), {})
+    assert connector.created == []
+
+
+async def test_released_other_id_does_not_free_an_open_price(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text('{"executor_id": "grid-a", "order_id": "old", "price": "90", "ts": 10}\n', encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _Gate()
+    connector.opens = [{
+        "text": "t-HBOTlive",
+        "id": "991",
+        "currency_pair": "INJ_USDT",
+        "price": "105",
+        "create_time": "10",
+        "status": "open",
+    }]
+    connector.finished = [{
+        "text": "t-HBOTgone",
+        "id": "990",
+        "currency_pair": "INJ_USDT",
+        "price": "105",
+        "status": "closed",
+        "finish_as": "cancelled",
+        "amount": "1",
+        "left": "1",
+        "create_time": "10",
+    }]
+    repo = _Repo([_running_row(checkpoint=json.dumps({"version": 1, "type": "grid_executor", "holds": [], "levels": []}))])
+    service = _service(monkeypatch, repo, connector)
+    service._released_order_ids = {"t-HBOTgone"}
+    await service._durable_open("grid-a", _buyer(connector), _open_level(), {})
+    assert connector.deleted
+    assert connector.created == []
+
+
+async def test_failed_read_does_not_pop_on_an_old_release(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text('{"executor_id": "grid-a", "order_id": "t-HBOTold", "price": "105", "ts": 10}\n', encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _Gate()
+    connector.fail = True
+    repo = _Repo([_running_row(checkpoint=json.dumps({
+        "version": 1,
+        "type": "grid_executor",
+        "holds": [{"order_id": "t-HBOTold", "price": "105", "ts": 10}],
+        "levels": [],
+    }))])
+    service = _service(monkeypatch, repo, connector)
+    kept = _Kept()
+    kept.is_closed = True
+    service._active_executors["grid-a"] = kept
+    service._released_order_ids = {"t-HBOTold"}
+    service._sweep_seen = True
+    await _one_tick(service, monkeypatch)
+    assert "grid-a" in service._active_executors
+
+
+def test_plain_append_does_not_unlink_the_marker(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text('{"executor_id": "grid-a", "order_id": "keep", "ts": 1}\n', encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    assert note_owed(_owed()) is True
+    remember_order_now("grid-a", "other")
+    assert os.path.exists(ledger_debt_marker())
+    assert "t-HBOTcid" in open(ledger_debt_marker(), encoding="utf-8").read()
+
+
+async def test_missing_file_after_send_still_has_an_owner(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    parent.mkdir()
+    ledger = parent / "data" / "order-ledger.jsonl"
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(ledger))
+    reset_ledger_process_state()
+    assert remember_open_before_send(
+        "grid-a", "t-HBOTcid", None, "105",
+        account_name="main", connector="gate_io", trading_pair="INJ-USDT", ts=10,
+    )
+    assert os.path.exists(ledger_debt_marker())
+    ledger.unlink()
+    reset_ledger_process_state()
+    connector = _Gate()
+    connector.opens = [{
+        "text": "t-HBOTcid",
+        "id": "991",
+        "currency_pair": "INJ_USDT",
+        "price": "105",
+        "status": "open",
+    }]
+    repo = _Repo([_running_row(checkpoint=json.dumps({"version": 1, "type": "grid_executor", "holds": [], "levels": []}))])
+    service = _service(monkeypatch, repo, connector)
+    service._active_executors["grid-a"] = _Kept()
+    await _one_tick(service, monkeypatch)
+    assert connector.deleted == [("spot/orders/991", {"currency_pair": "INJ_USDT"})]
+    await service._durable_open("grid-a", _buyer(connector), _open_level(), {})
+    assert connector.created == []
+
+
+async def test_substring_checkpoint_is_not_a_hold_and_does_not_buy(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    note = json.dumps({
+        "version": 1,
+        "type": "grid_executor",
+        "levels": [],
+        "holds": [],
+        "comment": "saw t-HBOTcid",
+    })
+    repo = _Repo([_running_row(checkpoint=note)])
+    connector = _Gate()
+    service = _service(monkeypatch, repo, connector)
+    await service._durable_open("grid-a", _buyer(connector), _open_level(), {})
+    assert connector.created == []
+    assert connector.deleted == []
+
+
+async def test_unreadable_marker_still_deletes_prefix(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    parent.mkdir()
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(parent / "data" / "order-ledger.jsonl"))
+    reset_ledger_process_state()
+    marker = ledger_debt_marker()
+    open(marker, "w", encoding="utf-8").write("not-json\n")
+    reset_ledger_process_state()
+    connector = _Gate()
+    connector.opens = [{"text": "t-HBOTcid", "id": "991", "currency_pair": "INJ_USDT", "price": "105", "status": "open"}]
+    repo = _Repo([_running_row()])
+    service = _service(monkeypatch, repo, connector)
+    service._active_executors["grid-a"] = _Kept()
+    await _one_tick(service, monkeypatch)
+    assert connector.deleted == [("spot/orders/991", {"currency_pair": "INJ_USDT"})]
+    assert connector.created == []

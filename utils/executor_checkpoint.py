@@ -242,31 +242,62 @@ def _fsync_directory(path: str) -> bool:
 
 
 # One ledger path owes a directory entry until that fsync is seen to succeed.
-# A different path does not inherit the debt. Not a second file.
+# A different path does not inherit the debt. The durable debt is the marker file.
 _LEDGER_NAME_FSYNC_OWED: Optional[str] = None
 _LEDGER_PARENT_FSYNC_OWED: Optional[str] = None
+_MARKER_FD: Optional[int] = None
+_MARKER_FD_PATH: Optional[str] = None
+_MARKER_NAME_SYNCED = False
+_MARKER_UNLINK_DIR_OWED = False
+_BOUND_LEDGER_PATH: Optional[str] = None
+OWED_FIELDS = (
+    "order_id",
+    "price",
+    "executor_id",
+    "account_name",
+    "connector",
+    "trading_pair",
+    "ts",
+)
 
 
 def _write_ledger(rows: List[Dict[str, Any]]) -> None:
-    """Replace the ledger only after the new bytes are on disk."""
+    """Replace only after owed bytes are durable and the live name points at them."""
+    global _LEDGER_NAME_FSYNC_OWED
     path = order_ledger_path()
     temporary = None
     descriptor = None
     replaced = False
     try:
+        kept = _rows_plus_owed(rows)
+        if kept is None:
+            return
+        if not _marker_synced_before_name(kept):
+            return
         directory = os.path.dirname(path) or "."
+        created_directory = not os.path.isdir(directory)
         os.makedirs(directory, exist_ok=True)
+        if created_directory:
+            _LEDGER_PARENT_FSYNC_OWED = directory
+            if not _fsync_new_directory(directory):
+                return
         descriptor, temporary = tempfile.mkstemp(prefix=".order-ledger-", dir=directory)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             descriptor = None
-            for row in rows:
+            for row in kept:
                 handle.write(json.dumps(row) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         replaced = True
         temporary = None
-        _fsync_directory(path)
+        _LEDGER_NAME_FSYNC_OWED = path
+        if not _fsync_live_file(path):
+            return
+        if not _fsync_directory(path):
+            return
+        _LEDGER_NAME_FSYNC_OWED = None
+        _release_marker_if_journal_has_owed()
     except OSError as exc:
         logger.warning("order ledger write failed: %s", exc)
     finally:
@@ -279,15 +310,24 @@ def _write_ledger(rows: List[Dict[str, Any]]) -> None:
                 pass
 
 
-def _append_ledger_line(row: Dict[str, Any]) -> None:
-    """Append one id. Fsync the directory only while this process still owes the name."""
+def _append_ledger_line(row: Dict[str, Any], *, marker_ready: bool = False) -> bool:
+    """Append one id. False means this line is not durable and must not be sent."""
     global _LEDGER_NAME_FSYNC_OWED, _LEDGER_PARENT_FSYNC_OWED
+    _bind_process_to_ledger_path()
     path = order_ledger_path()
     descriptor = None
     file_synced = False
     directory = os.path.dirname(path) or "."
+    created_directory = not os.path.isdir(directory)
+    created_file = created_directory or not os.path.exists(path)
+    marker_existed = os.path.exists(ledger_debt_marker())
+    if created_directory or created_file:
+        if marker_ready:
+            if not _marker_name_synced():
+                return False
+        elif not _marker_synced_before_name([row]):
+            return False
     try:
-        created_directory = not os.path.isdir(directory)
         os.makedirs(directory, exist_ok=True)
         if created_directory:
             _LEDGER_PARENT_FSYNC_OWED = directory
@@ -311,12 +351,21 @@ def _append_ledger_line(row: Dict[str, Any]) -> None:
         if descriptor is not None:
             os.close(descriptor)
     if not file_synced:
-        return
+        return False
     if _LEDGER_NAME_FSYNC_OWED == path and _fsync_directory(path):
         _LEDGER_NAME_FSYNC_OWED = None
     if _LEDGER_PARENT_FSYNC_OWED == directory and _LEDGER_NAME_FSYNC_OWED != path:
-        if _fsync_directory(directory):
-            _LEDGER_PARENT_FSYNC_OWED = None
+        if not _fsync_new_directory(directory):
+            return False
+    if (
+        file_synced
+        and created_file
+        and not marker_existed
+        and not _LEDGER_NAME_FSYNC_OWED
+        and not _LEDGER_PARENT_FSYNC_OWED
+    ):
+        _release_marker_if_journal_has_owed()
+    return file_synced and not _LEDGER_NAME_FSYNC_OWED and not _LEDGER_PARENT_FSYNC_OWED
 
 
 def remember_order_now(executor_id: str, order_id: Optional[str]) -> None:
@@ -332,7 +381,40 @@ def remember_order_now(executor_id: str, order_id: Optional[str]) -> None:
         _append_ledger_line(row)
 
 
-def prune_order_ledger() -> None:
+def remember_open_before_send(
+    executor_id: str,
+    order_id: Optional[str],
+    level_id: Optional[str],
+    price: Optional[str],
+    account_name: Optional[str] = None,
+    connector: Optional[str] = None,
+    trading_pair: Optional[str] = None,
+    ts: Optional[float] = None,
+) -> bool:
+    """Marker and live name first. The marker stays until a later read sees the file."""
+    if not executor_id or not order_id:
+        return False
+    record = {
+        "executor_id": executor_id,
+        "order_id": order_id,
+        "level_id": level_id,
+        "price": price,
+        "account_name": account_name,
+        "connector": connector,
+        "trading_pair": trading_pair,
+        "ts": time.time() if ts is None else ts,
+    }
+    if not _owed_complete(record):
+        return False
+    with LEDGER_LOCK:
+        if not _append_marker_line(record):
+            return False
+        if not _append_ledger_line(record, marker_ready=True):
+            return False
+        return _fsync_live_name()
+
+
+def prune_order_ledger(protected: Optional[set] = None) -> None:
     """Drop ids older than the keep window once, before resume places again.
 
     Not on the place path. The same keep rule as the old rewrite: a row with no
@@ -356,6 +438,9 @@ def prune_order_ledger() -> None:
         if size > 0 and not existing:
             logger.warning("order ledger prune skipped; file has no readable rows")
             return
+        if ledger_order_ids() is None:
+            logger.warning("order ledger prune skipped; file was not read")
+            return
         cutoff = time.time() - LEDGER_KEEP_SECONDS
         kept = []
         for item in existing:
@@ -363,11 +448,384 @@ def prune_order_ledger() -> None:
                 ts = float(item.get("ts") or 0)
             except (TypeError, ValueError):
                 continue
+            if protected and item.get("order_id") in protected:
+                kept.append(item)
+                continue
             if ts >= cutoff:
                 kept.append(item)
         if len(kept) == len(existing):
             return
         _write_ledger(kept)
+
+
+def ledger_debt_marker() -> str:
+    directory = os.path.dirname(order_ledger_path()) or "."
+    parent = os.path.dirname(directory) or "."
+    return os.path.join(parent, ".order-ledger-debt")
+
+
+def reset_ledger_process_state() -> None:
+    """Drop this process's memory of the ledger. The marker file stays."""
+    global _MARKER_FD, _MARKER_FD_PATH, _MARKER_NAME_SYNCED, _MARKER_UNLINK_DIR_OWED
+    global _LEDGER_NAME_FSYNC_OWED, _LEDGER_PARENT_FSYNC_OWED, _BOUND_LEDGER_PATH
+    if _MARKER_FD is not None:
+        try:
+            os.close(_MARKER_FD)
+        except OSError:
+            pass
+    _MARKER_FD = None
+    _MARKER_FD_PATH = None
+    _MARKER_NAME_SYNCED = False
+    _MARKER_UNLINK_DIR_OWED = False
+    _LEDGER_NAME_FSYNC_OWED = None
+    _LEDGER_PARENT_FSYNC_OWED = None
+    _BOUND_LEDGER_PATH = order_ledger_path()
+
+
+def _bind_process_to_ledger_path() -> None:
+    global _BOUND_LEDGER_PATH
+    path = order_ledger_path()
+    if _BOUND_LEDGER_PATH != path:
+        reset_ledger_process_state()
+
+
+def _bind_marker_fd() -> None:
+    global _MARKER_FD, _MARKER_FD_PATH, _MARKER_NAME_SYNCED
+    path = ledger_debt_marker()
+    if _MARKER_FD is not None and _MARKER_FD_PATH != path:
+        try:
+            os.close(_MARKER_FD)
+        except OSError:
+            pass
+        _MARKER_FD = None
+        _MARKER_NAME_SYNCED = False
+    _MARKER_FD_PATH = path
+
+
+def buy_blocked() -> bool:
+    """A live marker, or a directory entry not yet durable, is not permission to buy."""
+    _bind_process_to_ledger_path()
+    if _MARKER_UNLINK_DIR_OWED or _LEDGER_NAME_FSYNC_OWED or _LEDGER_PARENT_FSYNC_OWED:
+        return True
+    return os.path.exists(ledger_debt_marker())
+
+
+def _marker_name_synced() -> bool:
+    return bool(_MARKER_NAME_SYNCED and (_MARKER_FD is not None or os.path.exists(ledger_debt_marker())))
+
+
+def _owed_complete(record: Dict[str, Any]) -> bool:
+    return all(record.get(key) not in (None, "") for key in OWED_FIELDS)
+
+
+def _append_marker_line(record: Dict[str, Any]) -> bool:
+    """Append. Do not truncate, rewrite, or open the marker a second time."""
+    global _MARKER_FD, _MARKER_NAME_SYNCED
+    _bind_process_to_ledger_path()
+    _bind_marker_fd()
+    marker = ledger_debt_marker()
+    directory = os.path.dirname(marker) or "."
+    if not os.path.isdir(directory):
+        return False
+    if _MARKER_FD is None:
+        try:
+            _MARKER_FD = os.open(marker, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
+        except OSError:
+            _MARKER_FD = None
+            return False
+        _MARKER_NAME_SYNCED = False
+    try:
+        os.write(_MARKER_FD, (json.dumps(record) + "\n").encode("utf-8"))
+        os.fsync(_MARKER_FD)
+    except OSError:
+        return False
+    if not _fsync_directory(marker):
+        return False
+    _MARKER_NAME_SYNCED = True
+    return True
+
+
+def _marker_text() -> Optional[str]:
+    """Read the held descriptor. A new process opens the marker once, without truncation."""
+    global _MARKER_FD
+    _bind_marker_fd()
+    marker = ledger_debt_marker()
+    if _MARKER_FD is None:
+        if not os.path.exists(marker):
+            return ""
+        try:
+            _MARKER_FD = os.open(marker, os.O_RDWR | os.O_APPEND, 0o644)
+        except OSError:
+            return None
+    try:
+        os.lseek(_MARKER_FD, 0, os.SEEK_SET)
+        chunks = []
+        while True:
+            piece = os.read(_MARKER_FD, 65536)
+            if not piece:
+                break
+            chunks.append(piece)
+        os.lseek(_MARKER_FD, 0, os.SEEK_END)
+    except OSError:
+        return None
+    try:
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _fsync_live_file(path: str) -> bool:
+    """Fsync the file that the live name already points at. Not a create, not a truncate."""
+    try:
+        descriptor = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def _fsync_new_directory(directory: str) -> bool:
+    """Fsync the parent after the new directory name exists. A miss keeps the debt."""
+    global _LEDGER_PARENT_FSYNC_OWED
+    if not _fsync_directory(directory):
+        return False
+    parent = os.path.dirname(directory) or "."
+    if parent != directory and not _fsync_directory(parent):
+        return False
+    if _LEDGER_PARENT_FSYNC_OWED == directory:
+        _LEDGER_PARENT_FSYNC_OWED = None
+    return True
+
+
+def _journal_has_owed(owed: List[Dict[str, Any]]) -> bool:
+    try:
+        rows = _read_ledger()
+    except _LedgerReadError:
+        return False
+    by_id = {str(row.get("order_id")): row for row in rows if row.get("order_id")}
+    for item in owed:
+        order_id = item.get("order_id")
+        if not order_id:
+            continue
+        live = by_id.get(str(order_id))
+        if live is None:
+            return False
+        if item.get("price") is not None and str(live.get("price")) != str(item.get("price")):
+            return False
+    return True
+
+
+def _rows_plus_owed(rows: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    if os.path.exists(ledger_debt_marker()):
+        owed = owed_records()
+        if owed is None:
+            return None
+    else:
+        owed = []
+    kept = list(rows)
+    seen = {item.get("order_id") for item in kept}
+    for item in owed:
+        if item.get("order_id") and item.get("order_id") not in seen:
+            kept.append(item)
+            seen.add(item.get("order_id"))
+    return kept
+
+
+def _marker_synced_before_name(rows: List[Dict[str, Any]]) -> bool:
+    """Marker file and marker directory are durable before mkdir, O_CREAT, or replace."""
+    payload = list(rows) or [{"ts": time.time()}]
+    for row in payload:
+        if not _append_marker_line(row):
+            return False
+    return _marker_name_synced()
+
+
+def _unlink_marker() -> bool:
+    """Unlink is the only way old owed bytes are removed. Directory fsync comes after it."""
+    global _MARKER_FD, _MARKER_NAME_SYNCED, _MARKER_UNLINK_DIR_OWED
+    marker = ledger_debt_marker()
+    if _MARKER_FD is not None:
+        try:
+            os.close(_MARKER_FD)
+        except OSError:
+            pass
+        _MARKER_FD = None
+    if os.path.exists(marker):
+        try:
+            os.unlink(marker)
+        except OSError:
+            return False
+    _MARKER_NAME_SYNCED = False
+    _MARKER_UNLINK_DIR_OWED = True
+    if not _fsync_directory(marker):
+        return False
+    _MARKER_UNLINK_DIR_OWED = False
+    return not os.path.exists(marker)
+
+
+def _release_marker_if_journal_has_owed() -> bool:
+    marker = ledger_debt_marker()
+    if not os.path.exists(marker) and not _MARKER_UNLINK_DIR_OWED:
+        return not buy_blocked()
+    path = order_ledger_path()
+    if not os.path.exists(path) or _LEDGER_NAME_FSYNC_OWED == path or _LEDGER_PARENT_FSYNC_OWED:
+        return False
+    owed = owed_records()
+    if owed is None or not _journal_has_owed(owed):
+        return False
+    if not _unlink_marker():
+        return False
+    return not buy_blocked()
+
+
+def _fsync_live_name() -> bool:
+    """Fsync the live file and its directory. Do not unlink the marker."""
+    global _LEDGER_NAME_FSYNC_OWED
+    path = order_ledger_path()
+    if not os.path.exists(path) or not _fsync_live_file(path):
+        return False
+    if _LEDGER_NAME_FSYNC_OWED == path or os.path.exists(ledger_debt_marker()):
+        if not _fsync_directory(path):
+            return False
+        if _LEDGER_NAME_FSYNC_OWED == path:
+            _LEDGER_NAME_FSYNC_OWED = None
+    return not _LEDGER_NAME_FSYNC_OWED and not _LEDGER_PARENT_FSYNC_OWED
+
+
+def _commit_live_name() -> bool:
+    """Fsync the live file, then its directory, and only then drop the marker."""
+    if not _fsync_live_name():
+        return False
+    if _LEDGER_PARENT_FSYNC_OWED:
+        return False
+    if not os.path.exists(ledger_debt_marker()) and not _MARKER_UNLINK_DIR_OWED:
+        return not buy_blocked()
+    return _release_marker_if_journal_has_owed()
+
+
+def recover_folder_debt() -> bool:
+    """A new process fsyncs the live file before it may clear the marker. Never sends."""
+    with LEDGER_LOCK:
+        return _recover_folder_debt_locked()
+
+
+def _recover_folder_debt_locked() -> bool:
+    global _LEDGER_NAME_FSYNC_OWED
+    _bind_process_to_ledger_path()
+    if not os.path.exists(ledger_debt_marker()) and not _MARKER_UNLINK_DIR_OWED:
+        return not _LEDGER_NAME_FSYNC_OWED and not _LEDGER_PARENT_FSYNC_OWED
+    path = order_ledger_path()
+    if not os.path.exists(path):
+        return False
+    if not _fsync_live_file(path):
+        return False
+    owed = owed_records()
+    if owed is None:
+        return False
+    if not _journal_has_owed(owed):
+        for item in owed:
+            if not item.get("order_id"):
+                continue
+            if not _append_ledger_line(item, marker_ready=True):
+                return False
+        if not _fsync_live_file(path):
+            return False
+    if not _fsync_directory(path):
+        return False
+    if _LEDGER_NAME_FSYNC_OWED == path:
+        _LEDGER_NAME_FSYNC_OWED = None
+    return _release_marker_if_journal_has_owed()
+
+
+def ledger_order_ids() -> Optional[set]:
+    """Every id still in the file. None means the file was not read or marker debt survived."""
+    _bind_process_to_ledger_path()
+    if os.path.exists(ledger_debt_marker()) or _MARKER_UNLINK_DIR_OWED:
+        return None
+    if _LEDGER_NAME_FSYNC_OWED or _LEDGER_PARENT_FSYNC_OWED:
+        return None
+    try:
+        rows = _read_ledger()
+    except _LedgerReadError:
+        return None
+    return {item.get("order_id") for item in rows if item.get("order_id")}
+
+
+def owed_records() -> Optional[List[Dict[str, Any]]]:
+    """None means the marker is debt and must not be treated as an empty list."""
+    _bind_process_to_ledger_path()
+    marker = ledger_debt_marker()
+    if not os.path.exists(marker) and _MARKER_FD is None:
+        return []
+    text = _marker_text()
+    if text is None or not text.strip():
+        return None
+    rows = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(row, dict):
+            return None
+        rows.append(row)
+    return rows or None
+
+
+def note_owed(record: Dict[str, Any]) -> bool:
+    """Append one complete owed line. False means do not send."""
+    if not _owed_complete(record):
+        return False
+    with LEDGER_LOCK:
+        return _append_marker_line(record)
+
+
+def gate_base_is_zero(body: Dict[str, Any]) -> bool:
+    """Cancelled with base 0. Missing amount or left is not zero."""
+    if body.get("status") != "closed" or body.get("finish_as") != "cancelled":
+        return False
+    if "amount" not in body or "left" not in body:
+        return False
+    try:
+        base = Decimal(str(body["amount"])) - Decimal(str(body["left"]))
+    except (ArithmeticError, ValueError, TypeError):
+        return False
+    return base == 0
+
+
+def four_proofs(
+    status: Dict[str, Any],
+    *,
+    in_opens: bool,
+    in_flight: bool,
+    in_lost: bool,
+    history_read: bool = False,
+) -> bool:
+    """Absence from both lists is not enough. History must have been read in this step."""
+    if not history_read or in_opens or in_flight or in_lost:
+        return False
+    return gate_base_is_zero(status)
+
+
+def ledger_executor_ids() -> Optional[List[str]]:
+    """None while the marker is debt. After it is cleared, ids in the file, not an empty stub."""
+    _bind_process_to_ledger_path()
+    if os.path.exists(ledger_debt_marker()) or _MARKER_UNLINK_DIR_OWED:
+        return None
+    if _LEDGER_NAME_FSYNC_OWED or _LEDGER_PARENT_FSYNC_OWED:
+        return None
+    try:
+        rows = _read_ledger()
+    except _LedgerReadError:
+        return None
+    return [item.get("executor_id") for item in rows if item.get("executor_id")]
 
 
 def recent_order_ids(executor_id: str) -> List[str]:
@@ -1968,3 +2426,242 @@ def _held_matches(
         if _same_tick(_order_price(order), placement, tick) is True:
             return True
     return False
+
+
+def checkpoint_plus(read_text: Optional[str], addition: Dict[str, Any]) -> Optional[str]:
+    """Full copy of the read column plus one hold. A missing old field is not a body."""
+    if read_text:
+        try:
+            base = json.loads(read_text)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(base, dict):
+            return None
+    else:
+        base = {"version": CHECKPOINT_VERSION, "type": "grid_executor", "levels": []}
+    body = json.loads(json.dumps(base))
+    holds = list(body.get("holds") or [])
+    order_id = addition.get("order_id")
+    if order_id and not any(item.get("order_id") == order_id for item in holds):
+        holds.append(dict(addition))
+    body["holds"] = holds
+    encoded = json.dumps(body, sort_keys=True)
+    if read_text and not _keeps_previous_fields(base, json.loads(encoded)):
+        return None
+    return encoded
+
+
+def _keeps_previous_fields(before: Any, after: Any) -> bool:
+    if isinstance(before, dict):
+        if not isinstance(after, dict):
+            return False
+        for key, value in before.items():
+            if key not in after or not _keeps_previous_fields(value, after[key]):
+                return False
+        return True
+    if isinstance(before, list):
+        if not isinstance(after, list) or len(after) < len(before):
+            return False
+        return all(_keeps_previous_fields(left, right) for left, right in zip(before, after))
+    return before == after
+
+
+def claim_quant(reserves: Dict[tuple, str], connector_key: str, pair: str, price: str) -> bool:
+    """One quant on this connector. A second level, even of the same grid, does not take it."""
+    key = (connector_key, pair, price)
+    if key in reserves:
+        return False
+    reserves[key] = price
+    return True
+
+
+def release_quant(reserves: Dict[tuple, str], connector_key: str, pair: str, price: str) -> None:
+    reserves.pop((connector_key, pair, price), None)
+
+
+def pick_owner(rows: List[Dict[str, Any]], account: str, connector: str, pair: str) -> Optional[str]:
+    """Smallest executor on this pair, account, and connector. A foreign pair is not an owner."""
+    names = sorted(
+        row["executor_id"]
+        for row in rows
+        if row.get("account") == account
+        and row.get("connector") == connector
+        and row.get("pair") == pair
+        and row.get("executor_id")
+    )
+    return names[0] if names else None
+
+
+def local_create_missed_place(reached_place: bool) -> bool:
+    """True only when this process never awaited _place_order. A throw is not that."""
+    return not reached_place
+
+
+def unread_blocks_buy(read_ok: bool) -> bool:
+    return not read_ok
+
+
+def finished_list_request(
+    venue: str,
+    symbol: str,
+    ts: Optional[float] = None,
+    now: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Closed orders for this pair. A known ts is uncovered without from and to."""
+    if venue != "gate" or not symbol:
+        return None
+    params = {
+        "currency_pair": symbol,
+        "status": "finished",
+        "page": 1,
+        "limit": OPEN_PAGE_LIMIT,
+    }
+    if ts is not None:
+        try:
+            moment = float(ts)
+            end = float(now if now is not None else time.time())
+        except (TypeError, ValueError):
+            return None
+        params["from"] = int(moment)
+        params["to"] = int(end if end >= moment else moment)
+    return {
+        "path": "spot/orders",
+        "params": params,
+        "is_auth_required": True,
+    }
+
+
+def raw_list_page(body: Any, symbol: str) -> Dict[str, Any]:
+    """One raw page. A full page is not done. A non-list is unread, not an empty book."""
+    if not isinstance(body, list):
+        return {"read": False, "done": False, "orders": []}
+    orders = []
+    for row in body:
+        if not isinstance(row, dict):
+            return {"read": False, "done": False, "orders": []}
+        if row.get("currency_pair") != symbol:
+            continue
+        orders.append(row)
+    return {"read": True, "done": len(body) < OPEN_PAGE_LIMIT, "orders": orders}
+
+
+def history_covers_ts(request: Optional[Dict[str, Any]], ts: Any, page: Optional[Dict[str, Any]]) -> bool:
+    """A full page without done, a failed read, or a window that misses ts is unread."""
+    if not isinstance(page, dict) or not page.get("read") or not page.get("done"):
+        return False
+    if ts is None:
+        return True
+    params = (request or {}).get("params") or {}
+    if "from" not in params or "to" not in params:
+        return False
+    try:
+        moment = float(ts)
+    except (TypeError, ValueError):
+        return False
+    return float(params["from"]) <= moment <= float(params["to"])
+
+
+def gate_delete_request(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """DELETE by the exchange id on the row whose text is the client id."""
+    exchange_id = raw.get("id")
+    pair = raw.get("currency_pair")
+    if not raw.get("text") or not exchange_id or not pair:
+        return None
+    return {
+        "path": f"spot/orders/{exchange_id}",
+        "params": {"currency_pair": pair},
+        "is_auth_required": True,
+    }
+
+
+def must_keep_executor(executor_id: str, journal_ids: Optional[List[str]], column_text: Optional[str]) -> bool:
+    """Unread journal or a stored client id is not a reason to drop the row."""
+    if journal_ids is None:
+        return True
+    if executor_id in journal_ids:
+        return True
+    return bool(column_text and executor_id and "order_id" in column_text)
+
+
+def send_blocked(
+    *,
+    ledger_ok: bool,
+    column_ok: bool,
+    opens_ok: bool,
+    finished_ok: bool = False,
+    history_covers: bool = False,
+    prices: List[Any],
+    placement: Any,
+    tick: Optional[Decimal],
+) -> bool:
+    """Unread ledger, column, open list, or finished history is not permission to buy."""
+    if not ledger_ok or not column_ok or not opens_ok or not finished_ok or not history_covers:
+        return True
+    return recorded_price_blocks(prices, placement, tick)
+
+
+def recorded_price_blocks(prices: List[Any], placement: Any, tick: Optional[Decimal]) -> bool:
+    """A stored placement price holds the tick. No price and no tick are not permission."""
+    for price in prices:
+        if not price or tick is None:
+            return True
+        same = _same_tick(price, placement, tick)
+        if same is None or same is True:
+            return True
+    return False
+
+
+def checkpoint_keeping_holds(read_text: Optional[str], captured: Dict[str, Any]) -> Optional[str]:
+    """Captured fields replace the column. A hold already committed is not dropped."""
+    try:
+        body = json.loads(json.dumps(captured))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    if read_text:
+        try:
+            previous = json.loads(read_text)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(previous, dict):
+            return None
+        holds = list(body.get("holds") or [])
+        seen = {item.get("order_id") for item in holds if isinstance(item, dict)}
+        for item in previous.get("holds") or []:
+            if isinstance(item, dict) and item.get("order_id") not in seen:
+                holds.append(item)
+        if holds:
+            body["holds"] = holds
+    return json.dumps(body, sort_keys=True)
+
+
+def snapshot_body(read_text: Optional[str], captured: Dict[str, Any]) -> Optional[str]:
+    """Copy the column, then add. A snapshot must not erase holds, levels, or marks."""
+    return _merge_without_dropping(read_text, captured)
+
+
+def _merge_without_dropping(read_text: Optional[str], captured: Dict[str, Any]) -> Optional[str]:
+    if read_text:
+        try:
+            base = json.loads(read_text)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(base, dict):
+            return None
+    else:
+        base = {}
+    merged = json.loads(json.dumps(base))
+    for key, value in captured.items():
+        if key not in merged:
+            merged[key] = value
+        elif key == "holds" and isinstance(value, list):
+            existing = list(merged.get("holds") or [])
+            seen = {item.get("order_id") for item in existing if isinstance(item, dict)}
+            for item in value:
+                if isinstance(item, dict) and item.get("order_id") not in seen:
+                    existing.append(item)
+            merged["holds"] = existing
+    if read_text and not _keeps_previous_fields(base, merged):
+        return None
+    return json.dumps(merged, sort_keys=True)

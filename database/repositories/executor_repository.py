@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import and_, case, desc, func, select
+from sqlalchemy import and_, case, desc, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -108,6 +108,23 @@ class ExecutorRepository:
             await self.session.refresh(executor)
 
         return executor
+
+    async def replace_checkpoint_if_unchanged(
+            self,
+            executor_id: str,
+            seen_text: Optional[str],
+            new_text: str,
+    ) -> int:
+        """One UPDATE. NULL matches. Rowcount of an open transaction is not commit success."""
+        stmt = (
+            update(ExecutorRecord)
+            .where(ExecutorRecord.executor_id == executor_id)
+            .where(ExecutorRecord.checkpoint.is_not_distinct_from(seen_text))
+            .values(checkpoint=new_text)
+        )
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        return int(result.rowcount or 0)
 
     async def upsert_executor_completion(
             self,
@@ -264,6 +281,27 @@ class ExecutorRepository:
                 "controller_id": record.controller_id or "main",
                 "created_at": record.created_at,
                 "config": record.config,
+                "checkpoint": record.checkpoint,
+            }
+            for record in records
+        ]
+
+    async def get_checkpoint_rows(self) -> List[Dict[str, Any]]:
+        """Rows with a checkpoint, including ones that are no longer RUNNING.
+
+        A hold price is still a hold after the status changes. The 48 hour
+        window for an id already in the column is not decided here.
+        """
+        stmt = select(ExecutorRecord).where(ExecutorRecord.checkpoint.isnot(None))
+        records = (await self.session.execute(stmt)).scalars().all()
+        return [
+            {
+                "executor_id": record.executor_id,
+                "executor_type": record.executor_type,
+                "account_name": record.account_name,
+                "connector_name": record.connector_name,
+                "trading_pair": record.trading_pair,
+                "status": record.status,
                 "checkpoint": record.checkpoint,
             }
             for record in records
