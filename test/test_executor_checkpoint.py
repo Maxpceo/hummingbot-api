@@ -205,6 +205,12 @@ def test_order_ledger_drops_ids_older_than_the_keep_window(tmp_path, monkeypatch
     opens = []
     _track_ledger_opens(monkeypatch, modes, opens)
     prune_order_ledger()
+    assert "old" in path.read_text(encoding="utf-8")
+    prune_order_ledger(protected=ledger_order_ids())
+    assert "old" in path.read_text(encoding="utf-8")
+    prune_order_ledger(protected=ledger_order_ids(), proven={("other", "old")})
+    assert "old" in path.read_text(encoding="utf-8")
+    prune_order_ledger(protected=ledger_order_ids(), proven={("ex", "old")})
     ids = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line:
@@ -243,6 +249,7 @@ import json
 from utils.executor_checkpoint import (
     LEDGER_LOCK,
     _LedgerReadError,
+    accounted_orders,
     cap_arguments,
     install_grid_resume_cap,
     merge_recent_ids,
@@ -350,7 +357,7 @@ def test_ledger_replace_failure_keeps_the_old_file(tmp_path, monkeypatch):
         raise OSError("replace failed")
 
     monkeypatch.setattr(os, "replace", fail_replace)
-    prune_order_ledger()
+    prune_order_ledger(protected={"old", "keep"}, proven={("ex", "old")})
     assert path.read_bytes() == before
     assert not _live_opened_for_rewrite(path, modes, opens)
     assert not list(tmp_path.glob(".order-ledger-*"))
@@ -607,7 +614,7 @@ def test_prune_waits_for_the_lock_and_keeps_both_fresh_ids(tmp_path, monkeypatch
     LEDGER_LOCK.acquire()
     try:
         def prune():
-            prune_order_ledger()
+            prune_order_ledger(proven={("ex", "old")})
             done.append("prune")
 
         def append():
@@ -663,7 +670,7 @@ def test_prune_keeps_a_line_appended_after_read_before_replace(tmp_path, monkeyp
         return real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", replace_after_append_window)
-    prune_order_ledger()
+    prune_order_ledger(proven={("ex", "old")})
     worker.join(2)
     assert not worker.is_alive()
     ids = [json.loads(line)["order_id"] for line in path.read_text(encoding="utf-8").splitlines() if line]
@@ -1578,19 +1585,28 @@ class _Gate:
         self.finished = []
         self.deleted = []
         self.created = []
+        self.calls = []
         self.in_flight_orders = {}
         self._order_tracker = SimpleNamespace(lost_orders={})
         self.fail = False
+
+    def add_listener(self, event, forwarder):
+        listeners = self.__dict__.setdefault("_listeners", {})
+        listeners[event] = forwarder
 
     async def exchange_symbol_associated_to_pair(self, pair):
         return pair.replace("-", "_")
 
     async def _api_get(self, path_url, params, is_auth_required=True, limit_id=None):
+        self.calls.append(dict(params))
         if self.fail:
             raise OSError("unread")
         if params.get("status") == "open":
             return list(self.opens)
         return list(self.finished)
+
+    def quantize_order_price(self, pair, price):
+        return price
 
     async def _api_delete(self, path_url, params, is_auth_required=True):
         self.deleted.append((path_url, dict(params)))
@@ -1628,6 +1644,12 @@ class _Repo:
         self.cleaned = list(active_executor_ids)
         self.close_type = close_type
         return 0
+
+    async def update_executor(self, executor_id, status=None, error_log=None):
+        for row in self.rows:
+            if row["executor_id"] == executor_id:
+                row["status"] = status or row.get("status")
+        return None
 
 
 def _owed(order_id="t-HBOTcid", price="105", executor_id="grid-a", pair="INJ-USDT", account="main"):
@@ -2025,7 +2047,7 @@ def test_replace_fsyncs_the_live_file_before_dropping_the_marker(tmp_path, monke
     monkeypatch.setattr(os, "replace", tracking_replace)
     monkeypatch.setattr(os, "unlink", tracking_unlink)
     monkeypatch.setattr("utils.executor_checkpoint._fsync_live_file", tracking_live)
-    prune_order_ledger()
+    prune_order_ledger(proven={("ex", "old")})
     assert events.index("replace") < events.index(("live", str(path)))
     assert events.index(("live", str(path))) < events.index(("unlink", ledger_debt_marker()))
     assert "keep" in path.read_text(encoding="utf-8")
@@ -2437,3 +2459,620 @@ async def test_unreadable_marker_still_deletes_prefix(tmp_path, monkeypatch):
     await _one_tick(service, monkeypatch)
     assert connector.deleted == [("spot/orders/991", {"currency_pair": "INJ_USDT"})]
     assert connector.created == []
+
+
+# --- grid-ledger-48h: the prune keeps an old line until the column proves the price ban.
+
+
+def test_prune_keeps_an_old_line_without_a_price_proof(tmp_path, monkeypatch):
+    box = tmp_path / "box"
+    box.mkdir()
+    path = box / "ledger.jsonl"
+    fresh = json.dumps({"executor_id": "grid-a", "order_id": "fresh", "ts": time.time()})
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "t-HBOTold", "price": "105", "ts": 1}\n' + fresh + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    replaced = []
+    monkeypatch.setattr(os, "replace", lambda *args: replaced.append(args))
+    prune_order_ledger(protected=ledger_order_ids())
+    assert replaced == []
+    text = path.read_text(encoding="utf-8")
+    assert "t-HBOTold" in text and "fresh" in text
+    prune_order_ledger(protected=ledger_order_ids(), proven=set())
+    assert replaced == []
+    assert "t-HBOTold" in path.read_text(encoding="utf-8")
+
+
+def test_prune_erases_only_the_proven_old_line(tmp_path, monkeypatch):
+    box = tmp_path / "box"
+    box.mkdir()
+    path = box / "ledger.jsonl"
+    fresh = json.dumps({"executor_id": "grid-a", "order_id": "fresh", "ts": time.time()})
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "t-HBOTold", "price": "105", "ts": 1}\n'
+        '{"executor_id": "grid-b", "order_id": "t-HBOTkeep", "price": "106", "ts": 1}\n'
+        + fresh + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    prune_order_ledger(protected=ledger_order_ids(), proven={("grid-a", "t-HBOTold")})
+    text = path.read_text(encoding="utf-8")
+    assert "t-HBOTold" not in text
+    assert "t-HBOTkeep" in text and "fresh" in text
+
+
+def test_prune_ignores_a_substring_or_a_foreign_executor_proof(tmp_path, monkeypatch):
+    box = tmp_path / "box"
+    box.mkdir()
+    path = box / "ledger.jsonl"
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "buy-1", "price": "105", "ts": 1}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    prune_order_ledger(protected=ledger_order_ids(), proven={("grid-a", "buy-10"), ("grid-b", "buy-1")})
+    assert "buy-1" in path.read_text(encoding="utf-8")
+
+
+def test_accounted_orders_reads_the_journal_and_the_holds(tmp_path, monkeypatch):
+    path = tmp_path / "ledger.jsonl"
+    fresh = json.dumps({"executor_id": "grid-a", "order_id": "young", "ts": time.time()})
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "t-HBOTold", "price": "105", "ts": 1}\n'
+        '{"executor_id": "grid-b", "order_id": "t-HBOTother", "price": "107", "ts": 1}\n'
+        + fresh + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    checkpoint = {"holds": [{"order_id": "t-HBOThold", "price": "106"}, {"order_id": "t-HBOTold"}]}
+    assert accounted_orders("grid-a", checkpoint) == {
+        "t-HBOTold": "105",
+        "young": None,
+        "t-HBOThold": "106",
+    }
+
+
+def test_own_price_ban_blocks_an_empty_read_and_releases_when_led():
+    from utils.executor_checkpoint import install_occupied_open_brake, order_ledger
+
+    connector = _Gate()
+    connector.trading_rules = {"INJ-USDT": SimpleNamespace(min_price_increment=Decimal("0.01"))}
+    level = _open_level()
+    executor = SimpleNamespace(
+        config=SimpleNamespace(
+            connector_name="gate_io",
+            trading_pair="INJ-USDT",
+            side=_Side("BUY"),
+            safe_extra_spread=Decimal("0"),
+        ),
+        connectors={"gate_io": connector},
+        current_open_quote=Decimal("105"),
+        trading_rules=SimpleNamespace(min_price_increment=Decimal("0.01")),
+        _order_ledger={},
+    )
+    executor.get_open_orders_to_create = lambda: [level]
+    install_occupied_open_brake(
+        executor,
+        {"read": True, "done": True, "orders": []},
+        lambda: set(),
+        own_ids={"t-HBOTold"},
+        own_prices={"t-HBOTold": "105"},
+    )
+    assert executor.get_open_orders_to_create() == []
+    order_ledger(executor).setdefault("t-HBOTold", {"order_id": "t-HBOTold", "filled": False, "gone": False})
+    order_ledger(executor)["t-HBOTold"]["gone"] = True
+    assert executor.get_open_orders_to_create() == [level]
+
+
+class _LiveInflight:
+    def __init__(self, order_id, price):
+        self.client_order_id = order_id
+        self.trading_pair = "INJ-USDT"
+        self.price = Decimal(price)
+        self.is_open = True
+        self.is_filled = False
+        self.trade_type = _Side("BUY")
+
+    def to_json(self):
+        return {"client_order_id": self.client_order_id, "price": str(self.price)}
+
+
+class _StartedGrid:
+    is_closed = False
+
+    def __init__(self, connector, levels=None):
+        self.config = SimpleNamespace(
+            connector_name="gate_io",
+            trading_pair="INJ-USDT",
+            side=_Side("BUY"),
+            safe_extra_spread=Decimal("0"),
+        )
+        self.connectors = {"gate_io": connector}
+        self.current_open_quote = Decimal("105")
+        self.trading_rules = SimpleNamespace(min_price_increment=Decimal("0.01"))
+        self.grid_levels = []
+        self._close_order = None
+        self._order_ledger = {}
+        self._proposed = list(levels or [])
+        self.started = 0
+
+    def update_grid_levels(self):
+        return None
+
+    def _get_open_order_candidate(self, level):
+        return level
+
+    def adjust_order_candidates(self, name, rows):
+        return None
+
+    def get_open_orders_to_create(self):
+        return list(self._proposed)
+
+    def start(self):
+        self.started += 1
+
+    def stop(self):
+        return None
+
+
+def _fake_market_events(monkeypatch):
+    import sys
+    import types
+
+    events = types.ModuleType("hummingbot.core.event.events")
+
+    class _MarketEvent:
+        OrderFilled = "accounted-fill"
+        OrderCancelled = "accounted-cancel"
+
+    events.MarketEvent = _MarketEvent
+    forwarder = types.ModuleType("hummingbot.core.event.event_forwarder")
+
+    class _Forwarder:
+        def __init__(self, callback):
+            self.callback = callback
+
+    forwarder.SourceInfoEventForwarder = _Forwarder
+    common = types.ModuleType("hummingbot.core.data_type.common")
+
+    class _FakeEnum(dict):
+        def __init__(self, **items):
+            super().__init__(**items)
+            self.__dict__.update(items)
+
+    class _CommonModule(types.ModuleType):
+        def __getattr__(self, item):
+            if item.startswith("__"):
+                raise AttributeError(item)
+            value = _FakeEnum(**{item: item})
+            setattr(self, item, value)
+            return value
+
+    common = _CommonModule("hummingbot.core.data_type.common")
+    common.TradeType = _FakeEnum(BUY="BUY", SELL="SELL")
+    common.OrderType = _FakeEnum(LIMIT="LIMIT", MARKET="MARKET")
+    common.PriceType = _FakeEnum(MidPrice="MidPrice")
+    monkeypatch.setitem(sys.modules, "hummingbot.core.event.events", events)
+    monkeypatch.setitem(sys.modules, "hummingbot.core.event.event_forwarder", forwarder)
+    monkeypatch.setitem(sys.modules, "hummingbot.core.data_type.common", common)
+
+
+def _stubbed_resume(monkeypatch, service, connector):
+    loaded = _load_executor_service()
+    interface = service._trading_interfaces["main"]
+    interface.get_connector = lambda name: connector
+
+    async def _prepare(*args, **kwargs):
+        return None
+
+    service._prepare_market = _prepare
+
+    async def _open_pass(account, conn, pair):
+        return {"read": True, "done": True, "orders": []}
+
+    service._exchange_open_pass = _open_pass
+    monkeypatch.setattr(loaded, "grid_resume_plan", lambda *args, **kwargs: None)
+
+    def _validate(config, default_timestamp=None):
+        return _StartedGrid, object, SimpleNamespace(id=config.get("id"))
+
+    def _instantiate(executor_class, typed_config, trading_interface, metadata, start=True):
+        executor = _StartedGrid(connector, [_open_level()])
+        service._active_executors[metadata["config"]["id"]] = executor
+        return metadata["config"]["id"], executor
+
+    service._validate_executor_config = _validate
+    service._instantiate_and_register = _instantiate
+    connector.trading_rules = {"INJ-USDT": SimpleNamespace(min_price_increment=Decimal("0.01"))}
+    return service
+
+
+async def test_old_ledger_line_keeps_a_started_owner_and_blocks_the_price(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    fresh = json.dumps({"executor_id": "grid-a", "order_id": "fresh", "ts": time.time()})
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "t-HBOTold", "price": "105", "ts": 1}\n'
+        '{"executor_id": "grid-a", "order_id": "t-HBOTgone", "ts": 1}\n'
+        + fresh + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    _fake_market_events(monkeypatch)
+    connector = _Gate()
+    checkpoint = json.dumps({"version": 1, "type": "grid_executor", "holds": [], "levels": []})
+    repo = _Repo([_running_row(checkpoint=checkpoint)])
+    service = _service(monkeypatch, repo, connector)
+    _stubbed_resume(monkeypatch, service, connector)
+    await service.resume_running_executors()
+    text = path.read_text(encoding="utf-8")
+    assert "t-HBOTold" in text and "fresh" in text
+    executor = service._active_executors["grid-a"]
+    assert isinstance(executor, _StartedGrid) and executor.started == 1
+    ledger = executor._order_ledger
+    assert ledger["t-HBOTold"]["filled"] is False and ledger["t-HBOTold"]["gone"] is False
+    assert ledger["t-HBOTold"]["price"] == "105"
+    assert ledger["t-HBOTgone"]["gone"] is False
+    routes = service.__dict__.get("_accounted_routes") or {}
+    assert routes.get("t-HBOTold") == "grid-a" and routes.get("t-HBOTgone") == "grid-a"
+    assert executor.grid_levels == []
+    assert executor.get_open_orders_to_create() == []
+    await service._durable_open("grid-a", executor, _open_level(), {})
+    assert connector.created == []
+    listeners = connector.__dict__.get("_listeners") or {}
+    fill = listeners.get("accounted-fill")
+    cancel = listeners.get("accounted-cancel")
+    assert fill is not None and cancel is not None
+    forwarders = service.__dict__.get("_accounted_forwarders") or {}
+    assert fill is forwarders.get(("main", "gate_io"), (None, None))[0]
+    assert cancel is forwarders.get(("main", "gate_io"), (None, None))[1]
+    fill.callback(1, connector, SimpleNamespace(order_id="t-HBOTold"))
+    assert ledger["t-HBOTold"]["filled"] is True
+    assert executor.get_open_orders_to_create() == executor._proposed
+    cancel.callback(1, connector, SimpleNamespace(order_id="t-HBOTgone"))
+    assert ledger["t-HBOTgone"]["gone"] is True
+
+
+async def test_hold_price_proof_erases_the_line_and_leads_the_live_order(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    fresh = json.dumps({"executor_id": "grid-a", "order_id": "fresh", "ts": time.time()})
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "t-HBOTold", "price": "105", "ts": 1}\n' + fresh + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    _fake_market_events(monkeypatch)
+    connector = _Gate()
+    live = _LiveInflight("t-HBOTold", "105")
+    connector.in_flight_orders = {"t-HBOTold": live}
+    checkpoint = json.dumps({
+        "version": 1,
+        "type": "grid_executor",
+        "holds": [{"order_id": "t-HBOTold", "price": "105", "ts": 1, "filled": True}],
+        "levels": [],
+    })
+    repo = _Repo([_running_row(checkpoint=checkpoint)])
+    service = _service(monkeypatch, repo, connector)
+    _stubbed_resume(monkeypatch, service, connector)
+    await service.resume_running_executors()
+    text = path.read_text(encoding="utf-8")
+    assert "t-HBOTold" not in text and "fresh" in text
+    executor = service._active_executors["grid-a"]
+    assert executor.started == 1
+    row = executor._order_ledger["t-HBOTold"]
+    assert row["order"] == {"client_order_id": "t-HBOTold", "price": "105"}
+    assert row["filled"] is True
+    assert executor.grid_levels == []
+    assert executor.get_open_orders_to_create() == []
+    assert service.__dict__.get("_accounted_routes", {}).get("t-HBOTold") == "grid-a"
+
+
+async def test_column_open_order_without_price_is_not_a_proof(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "t-HBOTold", "price": "105", "ts": 1}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    _fake_market_events(monkeypatch)
+    connector = _Gate()
+    checkpoint = json.dumps({
+        "version": 1,
+        "type": "grid_executor",
+        "holds": [],
+        "levels": [{
+            "id": "L0", "price": "105", "amount_quote": "10", "take_profit": "0.01",
+            "side": "BUY", "open_order_type": "LIMIT", "take_profit_order_type": "LIMIT",
+            "open_order": {"order_id": "t-HBOTold", "filled": False},
+        }],
+    })
+    repo = _Repo([_running_row(checkpoint=checkpoint)])
+    service = _service(monkeypatch, repo, connector)
+    _stubbed_resume(monkeypatch, service, connector)
+    await service.resume_running_executors()
+    assert "t-HBOTold" in path.read_text(encoding="utf-8")
+    executor = service._active_executors["grid-a"]
+    assert executor.started == 1
+    assert getattr(executor.grid_levels[0], "active_open_order", "missing") is None
+    assert executor.get_open_orders_to_create() == []
+
+
+async def test_hold_without_price_keeps_the_line_and_blocks_the_send(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "t-HBOTold", "ts": 1}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    _fake_market_events(monkeypatch)
+    connector = _Gate()
+    checkpoint = json.dumps({
+        "version": 1,
+        "type": "grid_executor",
+        "holds": [{"order_id": "t-HBOTold"}],
+        "levels": [],
+    })
+    repo = _Repo([_running_row(checkpoint=checkpoint)])
+    service = _service(monkeypatch, repo, connector)
+    _stubbed_resume(monkeypatch, service, connector)
+    await service.resume_running_executors()
+    assert "t-HBOTold" in path.read_text(encoding="utf-8")
+    executor = service._active_executors["grid-a"]
+    assert executor.started == 1
+    assert "t-HBOTold" in executor._order_ledger
+    await service._durable_open("grid-a", executor, _open_level(), {})
+    assert connector.created == []
+    # The gate ran: the connector answered the open and finished lists.
+    assert connector.calls
+
+
+async def test_other_executor_hold_is_not_a_proof_and_keeps_the_owner(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "t-HBOTold", "price": "105", "ts": 1}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    _fake_market_events(monkeypatch)
+    empty = json.dumps({"version": 1, "type": "grid_executor", "holds": [], "levels": []})
+    owner_hold_priced = json.dumps({
+        "version": 1,
+        "type": "grid_executor",
+        "holds": [{"order_id": "t-HBOTold", "price": "105"}],
+        "levels": [],
+    })
+    stopped_hold_priced = json.dumps({
+        "version": 1,
+        "type": "grid_executor",
+        "holds": [{"order_id": "t-HBOTold", "price": "105"}],
+        "levels": [],
+    })
+    for owner_checkpoint, line_kept in ((empty, True), (owner_hold_priced, False)):
+        connector = _Gate()
+        rows_all = [
+            _running_row(checkpoint=owner_checkpoint),
+            {**_running_row("grid-s", checkpoint=stopped_hold_priced), "status": "TERMINATED"},
+        ]
+        repo = _Repo(rows_all)
+
+        async def _running_only():
+            return [row for row in rows_all if row.get("status") == "RUNNING"]
+
+        repo.get_running_for_resume = _running_only
+        service = _service(monkeypatch, repo, connector)
+        _stubbed_resume(monkeypatch, service, connector)
+        await service.resume_running_executors()
+        text = path.read_text(encoding="utf-8")
+        assert ("t-HBOTold" in text) is line_kept
+        assert service.__dict__.get("_accounted_routes", {}).get("t-HBOTold") == "grid-a"
+        assert "t-HBOTold" in service._active_executors["grid-a"]._order_ledger
+        # The stopped prover neither starts nor holds the route.
+        assert "grid-s" not in service._active_executors
+        path.write_text(
+            '{"executor_id": "grid-a", "order_id": "t-HBOTold", "price": "105", "ts": 1}\n',
+            encoding="utf-8",
+        )
+
+
+async def test_non_started_row_claims_rollback_to_the_starter(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text(
+        '{"executor_id": "grid-x", "order_id": "t-HBOTold", "price": "105", "ts": 1}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    _fake_market_events(monkeypatch)
+    connector = _Gate()
+    live = _LiveInflight("t-HBOTold", "105")
+    connector.in_flight_orders = {"t-HBOTold": live}
+    hold_priced = json.dumps({
+        "version": 1,
+        "type": "grid_executor",
+        "holds": [{"order_id": "t-HBOTold", "price": "105"}],
+        "levels": [],
+    })
+    broken_row = _running_row("grid-x", checkpoint=json.dumps({"version": 1, "type": "grid_executor", "holds": [], "levels": []}))
+    broken_row["config"] = ""
+    repo = _Repo([broken_row, _running_row(checkpoint=hold_priced)])
+    service = _service(monkeypatch, repo, connector)
+    _stubbed_resume(monkeypatch, service, connector)
+    await service.resume_running_executors()
+    executor = service._active_executors["grid-a"]
+    assert executor.started == 1
+    assert service.__dict__.get("_accounted_routes", {}).get("t-HBOTold") == "grid-a"
+    row = executor._order_ledger["t-HBOTold"]
+    assert row["order"] == {"client_order_id": "t-HBOTold", "price": "105"}
+    assert executor.grid_levels == []
+    assert executor.get_open_orders_to_create() == []
+    # grid-x returned before start(); its claim did not survive the loop.
+    assert "grid-x" not in {value for value in service.__dict__.get("_accounted_routes", {}).values()}
+    # The line belongs to grid-x, which has no priced hold of its own: it stays.
+    assert "t-HBOTold" in path.read_text(encoding="utf-8")
+
+
+async def test_ledger_price_proofs_require_the_own_hold_with_a_price(tmp_path, monkeypatch):
+    box = tmp_path / "bots"
+    (box / "data").mkdir(parents=True)
+    path = box / "data" / "order-ledger.jsonl"
+    fresh = json.dumps({"executor_id": "grid-a", "order_id": "fresh", "ts": time.time()})
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "t-HBOTold", "price": "105", "ts": 1}\n' + fresh + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    connector = _Gate()
+    good = _running_row(checkpoint=json.dumps({
+        "version": 1, "type": "grid_executor",
+        "holds": [{"order_id": "t-HBOTold", "price": "105"}], "levels": [],
+    }))
+    flat_only = _running_row("grid-b", checkpoint=json.dumps({
+        "version": 1, "type": "grid_executor", "holds": [],
+        "levels": [{"open_order": {"price": "105"}}],
+    }))
+    service = _service(monkeypatch, _Repo([good, flat_only]), connector)
+    proven = await service._ledger_price_proofs()
+    assert proven == {("grid-a", "t-HBOTold")}
+    prune_order_ledger(protected=ledger_order_ids(), proven=proven)
+    text = path.read_text(encoding="utf-8")
+    assert "t-HBOTold" not in text and "fresh" in text
+    prices = await service._column_prices("INJ-USDT")
+    assert prices is not None and "105" in prices
+    assert recorded_price_blocks(prices, "105", Decimal("0.01")) is True
+    broken = _running_row("grid-c", checkpoint="{not json")
+    service2 = _service(monkeypatch, _Repo([good, broken]), connector)
+    assert await service2._ledger_price_proofs() is None
+    service3 = _service(monkeypatch, _Repo([_running_row()]), connector)
+    service3.db_manager = None
+    assert await service3._ledger_price_proofs() is None
+
+
+def test_prune_keeps_a_priced_line_without_a_numeric_ts_until_proof(tmp_path, monkeypatch):
+    box = tmp_path / "box"
+    box.mkdir()
+    path = box / "ledger.jsonl"
+    path.write_text(
+        '{"executor_id": "ex", "order_id": "priced", "price": "105"}\n'
+        '{"executor_id": "ex", "order_id": "bare"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    replaced = []
+    real_replace = os.replace
+
+    def tracking_replace(src, dst):
+        replaced.append((src, dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", tracking_replace)
+    prune_order_ledger(protected=ledger_order_ids())
+    text = path.read_text(encoding="utf-8")
+    assert "priced" in text and "bare" not in text
+    assert replaced
+    prune_order_ledger(protected=ledger_order_ids(), proven=set())
+    assert "priced" in path.read_text(encoding="utf-8")
+    prune_order_ledger(protected=ledger_order_ids(), proven={("ex", "priced")})
+    assert "priced" not in path.read_text(encoding="utf-8")
+
+
+async def test_column_read_failure_keeps_every_line_and_starts(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    fresh = json.dumps({"executor_id": "grid-a", "order_id": "fresh", "ts": time.time()})
+    path.write_text(
+        '{"executor_id": "grid-a", "order_id": "t-HBOTold", "price": "105", "ts": 1}\n' + fresh + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    _fake_market_events(monkeypatch)
+    connector = _Gate()
+    checkpoint = json.dumps({
+        "version": 1,
+        "type": "grid_executor",
+        "holds": [{"order_id": "t-HBOTold", "price": "105"}],
+        "levels": [],
+    })
+    repo = _Repo([_running_row(checkpoint=checkpoint)])
+
+    async def _boom():
+        raise OSError("column unread")
+
+    repo.get_checkpoint_rows = _boom
+    service = _service(monkeypatch, repo, connector)
+    _stubbed_resume(monkeypatch, service, connector)
+    replaced = []
+    monkeypatch.setattr(os, "replace", lambda *args: replaced.append(args))
+    before = path.read_bytes()
+    await service.resume_running_executors()
+    assert replaced == []
+    assert path.read_bytes() == before
+    executor = service._active_executors["grid-a"]
+    assert executor.started == 1
+    assert "t-HBOTold" in executor._order_ledger
+
+
+async def test_saved_id_of_a_starter_gets_the_listener_route(tmp_path, monkeypatch):
+    parent = tmp_path / "bots"
+    (parent / "data").mkdir(parents=True)
+    path = parent / "data" / "order-ledger.jsonl"
+    path.write_text(
+        '{"executor_id": "grid-z", "order_id": "t-HBOTold", "price": "105", "ts": 1}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(path))
+    reset_ledger_process_state()
+    _fake_market_events(monkeypatch)
+    connector = _Gate()
+    saved_checkpoint = json.dumps({
+        "version": 1,
+        "type": "grid_executor",
+        "holds": [],
+        "levels": [{
+            "id": "L0", "price": "105", "amount_quote": "10", "take_profit": "0.01",
+            "side": "BUY", "open_order_type": "LIMIT", "take_profit_order_type": "LIMIT",
+            "open_order": {"order_id": "t-HBOTold", "filled": False},
+        }],
+    })
+    repo = _Repo([_running_row(checkpoint=saved_checkpoint)])
+    service = _service(monkeypatch, repo, connector)
+    _stubbed_resume(monkeypatch, service, connector)
+    await service.resume_running_executors()
+    executor = service._active_executors["grid-a"]
+    assert executor.started == 1
+    assert service.__dict__.get("_accounted_routes", {}).get("t-HBOTold") == "grid-a"
+    assert "grid-z" not in {value for value in service.__dict__.get("_accounted_routes", {}).values()}
+    # Not seated by price: _attach has no live and no filled snapshot.
+    assert getattr(executor.grid_levels[0], "active_open_order", "missing") is None
+    # No proof erases the line: the hold of grid-z does not exist.
+    assert "t-HBOTold" in path.read_text(encoding="utf-8")
+    listeners = connector.__dict__.get("_listeners") or {}
+    fill = listeners.get("accounted-fill")
+    assert fill is not None
+    fill.callback(1, connector, SimpleNamespace(order_id="t-HBOTold"))
+    assert executor._order_ledger["t-HBOTold"]["filled"] is True

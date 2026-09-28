@@ -414,12 +414,18 @@ def remember_open_before_send(
         return _fsync_live_name()
 
 
-def prune_order_ledger(protected: Optional[set] = None) -> None:
+def prune_order_ledger(protected: Optional[set] = None, proven: Optional[set] = None) -> None:
     """Drop ids older than the keep window once, before resume places again.
 
-    Not on the place path. The same keep rule as the old rewrite: a row with no
-    numeric ts is not kept, and ts below the cutoff is not kept. A failed read
-    must not replace the live file.
+    Not on the place path. A row with no ts and no price is not kept, as
+    today. Every other old row — numeric ts below the cutoff, or a missing
+    ts with a price — is kept unless the started owner proved its price ban:
+    ``proven`` carries (executor_id, order_id) pairs whose started executor
+    already leads the id and whose committed checkpoint holds the same order
+    id with a price, so the send gate keeps blocking that price without the
+    file. ``protected`` is neither permission nor proof: an unproven old row
+    stays whether or not it is listed there. A failed read must not replace
+    the live file.
     """
     path = order_ledger_path()
     with LEDGER_LOCK:
@@ -444,15 +450,23 @@ def prune_order_ledger(protected: Optional[set] = None) -> None:
         cutoff = time.time() - LEDGER_KEEP_SECONDS
         kept = []
         for item in existing:
+            raw_ts = item.get("ts")
+            no_ts = raw_ts in (None, "")
             try:
-                ts = float(item.get("ts") or 0)
+                ts = 0.0 if no_ts else float(raw_ts)
             except (TypeError, ValueError):
-                continue
-            if protected and item.get("order_id") in protected:
-                kept.append(item)
-                continue
+                no_ts = True
+                ts = 0.0
             if ts >= cutoff:
                 kept.append(item)
+                continue
+            if proven is not None and (item.get("executor_id"), item.get("order_id")) in proven:
+                continue
+            if no_ts and item.get("price") in (None, ""):
+                # Today's garbage rule: no ts and no price holds nothing.
+                continue
+            # An old line with a ts, and a priced line with no ts, wait for proof.
+            kept.append(item)
         if len(kept) == len(existing):
             return
         _write_ledger(kept)
@@ -850,6 +864,65 @@ def recent_order_ids(executor_id: str) -> List[str]:
             continue
         latest[str(row["order_id"])] = ts
     return list(latest)
+
+
+def accounted_orders(executor_id: str, checkpoint: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Order ids this executor must keep leading, with a price when one is known.
+
+    Two independent reads: this executor's journal rows of any age, and the
+    committed column holds of the same executor. Not a seating rule: no level
+    is chosen here and the resume seating inputs are not fed.
+    """
+    if not executor_id:
+        return {}
+    found: Dict[str, Any] = {}
+    try:
+        rows = _read_ledger()
+    except _LedgerReadError:
+        logger.warning("order ledger unreadable during resume; holds still lead")
+        rows = []
+    for row in rows:
+        if row.get("executor_id") != executor_id or not row.get("order_id"):
+            continue
+        order_id = str(row["order_id"])
+        price = row.get("price")
+        if order_id not in found or (found[order_id] in (None, "") and price not in (None, "")):
+            found[order_id] = price
+    for hold in (checkpoint or {}).get("holds") or []:
+        order_id = hold.get("order_id")
+        if not order_id:
+            continue
+        order_id = str(order_id)
+        price = hold.get("price")
+        if order_id not in found or (found[order_id] in (None, "") and price not in (None, "")):
+            found[order_id] = price
+    return found
+
+
+def seed_accounted_orders(executor: Any, accounted: Dict[str, Any], connector: Any = None) -> None:
+    """Put accounted ids into the executor's ledger before start().
+
+    A live in-flight object is bound to the number's accounting, not to a level
+    slot chosen by price. The connector listener writes filled and gone into
+    these rows.
+    """
+    ledger = order_ledger(executor)
+    inflight = getattr(connector, "in_flight_orders", None)
+    if not isinstance(inflight, dict):
+        inflight = {}
+    for order_id, price in (accounted or {}).items():
+        if not order_id:
+            continue
+        row = ledger.setdefault(order_id, {
+            "order_id": order_id,
+            "filled": False,
+            "gone": False,
+        })
+        if price not in (None, ""):
+            row.setdefault("price", price)
+        live = inflight.get(order_id)
+        if live is not None and hasattr(live, "to_json"):
+            row["order"] = live.to_json()
 
 
 def note_placed(executor: Any, order_id: Optional[str]) -> None:
@@ -2209,8 +2282,14 @@ def install_occupied_open_brake(
     foreign_ids_fn: Any,
     own_ids: Optional[set] = None,
     prior_tracker_ids: Optional[set] = None,
+    own_prices: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Block a second open at a price the exchange or the book still holds."""
+    """Block a second open at a price the exchange or the book still holds.
+
+    ``own_prices`` maps an accounted order id to its recorded price. While that
+    id is neither filled nor gone, its tick stays blocked even when the
+    exchange list was read and is empty.
+    """
     original = executor.get_open_orders_to_create
     if not isinstance(exchange_pass, dict):
         exchange_pass = new_exchange_slot()
@@ -2218,6 +2297,7 @@ def install_occupied_open_brake(
         "exchange": exchange_pass,
         "foreign_ids_fn": foreign_ids_fn,
         "own_ids": set(own_ids or []),
+        "own_prices": dict(own_prices or {}),
         "prior": set(prior_tracker_ids or []),
         "released": set(),
         "held": set(),
@@ -2269,13 +2349,37 @@ def _filter_occupied_opens(executor: Any, proposed: List[Any], state: Dict[str, 
     tick = _positive_tick(executor)
     if tick is None:
         return []
+    banned = _own_price_bans(executor, state)
     allowed = []
     for level in proposed:
         placement = _open_placement(executor, getattr(level, "price", None))
         if placement is None or _held_matches(exchange, book, state, placement, tick, side):
             continue
+        if _price_is_banned(placement, tick, banned):
+            continue
         allowed.append(level)
     return allowed
+
+
+def _own_price_bans(executor: Any, state: Dict[str, Any]) -> List[Any]:
+    """Prices of accounted ids that are still neither filled nor gone."""
+    prices = []
+    ledger = order_ledger(executor)
+    for order_id, price in (state.get("own_prices") or {}).items():
+        if price in (None, ""):
+            continue
+        row = ledger.get(order_id) or {}
+        if row.get("filled") or row.get("gone"):
+            continue
+        prices.append(price)
+    return prices
+
+
+def _price_is_banned(placement: Decimal, tick: Optional[Decimal], prices: List[Any]) -> bool:
+    for price in prices:
+        if _same_tick(price, placement, tick) is not False:
+            return True
+    return False
 
 
 def _read_active_book(executor: Any) -> Optional[Dict[str, Any]]:

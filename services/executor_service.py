@@ -48,6 +48,7 @@ from models.executors import PositionHold
 from services.gateway_client import get_native_gas_token
 from services.trading_service import AccountTradingInterface, TradingService
 from utils.executor_checkpoint import (
+    accounted_orders,
     apply_checkpoint,
     can_resume,
     capture_executor,
@@ -60,6 +61,7 @@ from utils.executor_checkpoint import (
     note_placed,
     parse_checkpoint,
     recent_order_ids,
+    seed_accounted_orders,
     blank_grid_cap,
     conservative_grid_cap,
     install_grid_resume_cap,
@@ -980,6 +982,66 @@ class ExecutorService:
         finally:
             current_executor_id.reset(token)
 
+    def _install_accounted_listener(self, connector, account: str = "", connector_name: str = "") -> None:
+        """Record fill and cancel for accounted ids the level slots do not hold.
+
+        The instance wrappers of process_order_* never see these events: the
+        base executor binds its forwarders in __init__ and register_events()
+        plants them at start(). This listener hangs on the connector itself,
+        the way services/orders_recorder.py does, and only writes the accounted
+        rows. note_gone is not called. PubSub keeps listeners by weak reference,
+        so the forwarders live on the service, or they die on return.
+        """
+        if connector is None or getattr(connector, "_accounted_listener_installed", False):
+            return
+        if not hasattr(connector, "add_listener"):
+            return
+        try:
+            from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
+            from hummingbot.core.event.events import MarketEvent
+        except Exception:
+            logger.warning("accounted order listener was not installed", exc_info=True)
+            return
+        fill_event = getattr(MarketEvent, "OrderFilled", None)
+        cancel_event = getattr(MarketEvent, "OrderCancelled", None)
+        if fill_event is None or cancel_event is None:
+            return
+        service = self
+        routes = self.__dict__.setdefault("_accounted_routes", {})
+
+        def _did_fill(event_tag: int, market: Any, event: Any) -> None:
+            order_id = getattr(event, "order_id", None)
+            executor = service._active_executors.get(routes.get(order_id) or "")
+            if executor is None:
+                return
+            note_filled(executor, order_id, None)
+
+        def _did_cancel(event_tag: int, market: Any, event: Any) -> None:
+            order_id = getattr(event, "order_id", None)
+            executor = service._active_executors.get(routes.get(order_id) or "")
+            if executor is None:
+                return
+            from utils.executor_checkpoint import _order_still_open, order_ledger
+            row = order_ledger(executor).get(order_id)
+            if row is None or row.get("filled"):
+                return
+            if _order_still_open(executor, order_id):
+                return
+            row["gone"] = True
+
+        fill_forwarder = SourceInfoEventForwarder(_did_fill)
+        cancel_forwarder = SourceInfoEventForwarder(_did_cancel)
+        # A strong reference on the service: add_listener alone keeps a weakref.
+        forwarders = self.__dict__.setdefault("_accounted_forwarders", {})
+        forwarders[(account or "", connector_name or "")] = (fill_forwarder, cancel_forwarder)
+        try:
+            connector.add_listener(fill_event, fill_forwarder)
+            connector.add_listener(cancel_event, cancel_forwarder)
+        except Exception:
+            logger.warning("accounted order listener was not added", exc_info=True)
+            return
+        connector._accounted_listener_installed = True
+
     def _install_checkpoint_hook(self, executor_id: str, executor: ExecutorBase) -> None:
         """Write the id when the order is placed, and the fill when the fill event arrives."""
         if getattr(executor, "_checkpoint_hooked", False):
@@ -1446,6 +1508,53 @@ class ExecutorService:
             is_auth_required=True,
         )
         return True
+
+    async def _ledger_price_proofs(self):
+        """(executor_id, order_id) pairs whose price ban survives without the file.
+
+        Proof: the committed checkpoint of this very executor holds the order id
+        with a price, and that price is in the pair's column price list. A flat
+        price of another executor, a hold without a price, and an unreadable
+        column are not proofs: the caller then keeps every old line.
+        """
+        if not self.db_manager:
+            return None
+        try:
+            async with self.db_manager.get_session_context() as session:
+                rows = await ExecutorRepository(session).get_checkpoint_rows()
+        except Exception:
+            return None
+        parsed_rows = []
+        pair_prices: Dict[str, set] = {}
+        for row in rows or []:
+            text = row.get("checkpoint") or ""
+            parsed = parse_checkpoint(text)
+            if text and parsed is None:
+                return None
+            parsed_rows.append((row, parsed))
+            prices = pair_prices.setdefault(row.get("trading_pair"), set())
+            for hold in (parsed or {}).get("holds") or []:
+                if hold.get("price") not in (None, ""):
+                    prices.add(str(hold.get("price")))
+            for saved in (parsed or {}).get("retained_orders") or []:
+                if saved.get("price") not in (None, ""):
+                    prices.add(str(saved.get("price")))
+            for level in (parsed or {}).get("levels") or []:
+                for key in ("open_order", "close_order"):
+                    price = (level.get(key) or {}).get("price")
+                    if price not in (None, ""):
+                        prices.add(str(price))
+        proofs = set()
+        for row, parsed in parsed_rows:
+            prices = pair_prices.get(row.get("trading_pair")) or set()
+            for hold in (parsed or {}).get("holds") or []:
+                order_id = hold.get("order_id")
+                price = hold.get("price")
+                if not order_id or price in (None, ""):
+                    continue
+                if str(price) in prices:
+                    proofs.add((row.get("executor_id"), str(order_id)))
+        return proofs
 
     async def _column_prices(self, pair: str):
         if not self.db_manager:
@@ -2027,6 +2136,8 @@ class ExecutorService:
         would open a second trade beside the first.
         """
         # Before any resumed grid can place. A prune failure must not skip resume.
+        # No executor has started yet, so nothing old is erased here: this call
+        # only drops today's garbage (no ts and no price).
         try:
             recover_folder_debt()
             protected = self._ledger_ids_without_column()
@@ -2052,26 +2163,62 @@ class ExecutorService:
         }
         self._resume_rows = rows
         self._resume_ledger_ids = ledger_ids
-        for row in rows:
-            for order_id in saved_order_ids(parse_checkpoint(row.get("checkpoint"))):
-                owned_by.setdefault(order_id, row["executor_id"])
-            for order_id in ledger_ids[row["executor_id"]]:
-                owned_by.setdefault(order_id, row["executor_id"])
 
         resumed = 0
+        started_ids = set()
         for row in rows:
             if row["executor_id"] in self._active_executors:
+                started_ids.add(row["executor_id"])
                 continue
+            # A row's claims publish only when its executor starts. A row that
+            # returns before start() withdraws them before the next row runs,
+            # so a non-started journal line never makes an id foreign to a
+            # starter that holds it.
+            parsed = parse_checkpoint(row.get("checkpoint"))
+            claims = set(saved_order_ids(parsed))
+            claims.update(ledger_ids.get(row["executor_id"]) or [])
+            claims.update(accounted_orders(row["executor_id"], parsed))
+            added = []
+            for order_id in sorted(claims, key=str):
+                if order_id not in owned_by:
+                    owned_by[order_id] = row["executor_id"]
+                    added.append(order_id)
             reason = await self._resume_one(row, owned_by)
             if reason is None:
                 resumed += 1
+                started_ids.add(row["executor_id"])
             else:
+                for order_id in added:
+                    if owned_by.get(order_id) == row["executor_id"]:
+                        owned_by.pop(order_id, None)
                 logger.warning(
                     f"Not resuming {row['executor_id']} ({row['executor_type']} "
                     f"{row['connector_name']} {row['trading_pair']}): {reason}"
                 )
         if resumed:
             logger.info(f"Resumed {resumed} executor(s) after restart")
+        # The one erasure pass, after the loop: only ids whose executor reached
+        # start() in this same resume and already leads the number from its
+        # hold. The column read happens before the prune takes the ledger lock.
+        try:
+            proven = await self._ledger_price_proofs() if self.db_manager else None
+        except Exception:
+            proven = None
+        if proven:
+            from utils.executor_checkpoint import order_ledger
+            erasable = set()
+            for executor_id, order_id in proven:
+                if executor_id not in started_ids:
+                    continue
+                executor = self._active_executors.get(executor_id)
+                if executor is None or order_id not in order_ledger(executor):
+                    continue
+                erasable.add((executor_id, order_id))
+            if erasable:
+                try:
+                    prune_order_ledger(protected=ledger_order_ids(), proven=erasable)
+                except Exception:
+                    logger.exception("order ledger prune after resume failed")
 
     @staticmethod
     def _config_side_name(config: Dict[str, Any]) -> Optional[str]:
@@ -2312,6 +2459,11 @@ class ExecutorService:
     async def _resume_one(self, row: Dict[str, Any], owned_by: Optional[Dict[str, str]] = None) -> Optional[str]:
         """None on success. A string is why this row was left for cleanup."""
         checkpoint = parse_checkpoint(row.get("checkpoint"))
+        accounted = {
+            order_id: price
+            for order_id, price in accounted_orders(row["executor_id"], checkpoint).items()
+            if (owned_by or {}).get(order_id, row["executor_id"]) == row["executor_id"]
+        }
         if must_keep_executor(row["executor_id"], ledger_executor_ids(), row.get("checkpoint")):
             self.__dict__.setdefault("_kept_ids", set()).add(row["executor_id"])
         if not row.get("config"):
@@ -2397,11 +2549,15 @@ class ExecutorService:
             _, executor = self._instantiate_and_register(
                 executor_class, typed_config, trading_interface, metadata, start=False
             )
+            self._install_accounted_listener(connector, account, row["connector_name"])
             if has_exposure(checkpoint):
                 async def _skip_balance_check():
                     return None
                 executor.validate_sufficient_balance = _skip_balance_check
             apply_checkpoint(executor, checkpoint, live_orders)
+            # After apply_checkpoint: its seed_ledger would otherwise replace
+            # this row and drop the bound live object and the price.
+            seed_accounted_orders(executor, accounted, connector)
             notice = None
             if plan:
                 self._install_touch_cap(executor, plan)
@@ -2413,12 +2569,19 @@ class ExecutorService:
                     exchange_pass = await self._exchange_open_pass(account, connector, pair)
                     own_ids = set(saved_order_ids(checkpoint))
                     own_ids.update(recent_order_ids(row["executor_id"]))
+                    own_ids.update(accounted)
+                    own_prices = {
+                        order_id: price
+                        for order_id, price in accounted.items()
+                        if price not in (None, "")
+                    }
                     install_occupied_open_brake(
                         executor,
                         exchange_pass,
                         lambda: self._foreign_ids_now(row["executor_id"], owned_by or {}),
                         own_ids=own_ids,
                         prior_tracker_ids=self._prior_tracker_ids(connector),
+                        own_prices=own_prices,
                     )
                     executor._occupied_pass_key = exchange_pass_key(account, connector, pair)
                 except Exception:
@@ -2429,6 +2592,18 @@ class ExecutorService:
                         logger.exception("could not block new opens; resume still continues")
             self._start_registered_executor(row["executor_id"], executor)
             started = True
+            # Routes publish only after start(): a row that returns early never
+            # holds the listener route. Saved ids this row owns get the route
+            # too — the journal may name an executor outside this resume.
+            led = set(accounted)
+            led.update(
+                order_id for order_id in saved_order_ids(checkpoint)
+                if (owned_by or {}).get(order_id) == row["executor_id"]
+            )
+            if led:
+                routes = self.__dict__.setdefault("_accounted_routes", {})
+                for order_id in led:
+                    routes.setdefault(order_id, row["executor_id"])
             async with self.db_manager.get_session_context() as session:
                 await ExecutorRepository(session).update_executor(
                     executor_id=row["executor_id"],
