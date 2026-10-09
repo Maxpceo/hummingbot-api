@@ -10,6 +10,8 @@ open order fits two levels: that order stays unattached and new orders at its
 price are capped. An order id this checkpoint does not already own is never
 adopted by price.
 """
+import copy
+import hashlib
 import json
 import logging
 import os
@@ -1465,6 +1467,71 @@ def parse_checkpoint(raw: Optional[str]) -> Optional[Dict[str, Any]]:
     if parsed.get("type") not in SUPPORTED_TYPES:
         return None
     return parsed
+
+
+# ── Кэш расшифровки памяти ──────────────────────────────────────────────
+#
+# Тело памяти сетки читается сотни раз за шаг, а расшифровка одного тела
+# стоит десятки миллисекунд. 9 октября 2026 на Tokyo шаг не успевал
+# завершиться: программа стояла на процессоре и не открывала порт.
+# Разбор теперь один на текст — дальше читатели берут готовое.
+#
+# Ключ — хеш полной длины от полного текста. Не номер исполнителя: у
+# погашенных строк executor_id скрыт (остаётся row_executor_id), ключ по
+# номеру склеил бы такие строки в одну расшифровку и потерял бы занятую
+# цену — на ту же цену встала бы вторая заявка.
+
+_CHECKPOINT_CACHE: Dict[str, Any] = {}
+_CHECKPOINT_CACHE_STATS = {"parses": 0, "copies": 0}
+_CHECKPOINT_CACHE_MISS = object()
+
+
+def checkpoint_text_key(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def checkpoint_master(raw: Any) -> Optional[Dict[str, Any]]:
+    """Разобранное тело из кэша, сам мастер. Только для построения наборов:
+    тело общее для всех читателей этого текста, его не правят."""
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return None
+    key = checkpoint_text_key(raw)
+    master = _CHECKPOINT_CACHE.get(key, _CHECKPOINT_CACHE_MISS)
+    if master is _CHECKPOINT_CACHE_MISS:
+        master = parse_checkpoint(raw)
+        _CHECKPOINT_CACHE[key] = master
+        _CHECKPOINT_CACHE_STATS["parses"] += 1
+    return master
+
+
+def parse_checkpoint_cached(raw: Any) -> Optional[Dict[str, Any]]:
+    """Глубокая копия разобранного тела: правка копии не остаётся в кэше."""
+    if isinstance(raw, dict):
+        return copy.deepcopy(raw)
+    master = checkpoint_master(raw)
+    if master is None:
+        return None
+    _CHECKPOINT_CACHE_STATS["copies"] += 1
+    return copy.deepcopy(master)
+
+
+def checkpoint_cache_prune(texts) -> None:
+    """В кэше остаются только тексты текущих строк. Каждая запись тела даёт
+    новый текст, и без срока жизни копии накапливаются в памяти."""
+    keep = {checkpoint_text_key(text) for text in texts or [] if text}
+    for key in [key for key in _CHECKPOINT_CACHE if key not in keep]:
+        _CHECKPOINT_CACHE.pop(key, None)
+
+
+def checkpoint_cache_stats() -> Dict[str, int]:
+    return dict(_CHECKPOINT_CACHE_STATS)
+
+
+def checkpoint_cache_reset_stats() -> None:
+    _CHECKPOINT_CACHE_STATS["parses"] = 0
+    _CHECKPOINT_CACHE_STATS["copies"] = 0
 
 
 def _saved_orders(node: Any) -> List[Dict[str, Any]]:

@@ -108,6 +108,11 @@ from utils.executor_checkpoint import (
     read_merged_ledger,
     strip_close_holds_from_saved,
     is_close_ledger_row,
+    checkpoint_master,
+    checkpoint_cache_prune,
+    checkpoint_cache_reset_stats,
+    checkpoint_cache_stats,
+    parse_checkpoint_cached,
     append_durable_row,
     resolve_close_bans,
     restore_close_memory,
@@ -502,6 +507,7 @@ class ExecutorService:
     async def _control_loop(self):
         """Main control loop that updates all active executors."""
         while self._is_running:
+            step_started = time.monotonic()
             try:
                 # Update timestamps for all trading interfaces via TradingService
                 self._trading_service.update_all_timestamps()
@@ -552,6 +558,19 @@ class ExecutorService:
 
             except Exception as e:
                 logger.error(f"Error in executor control loop: {e}", exc_info=True)
+
+            # Свидетель медленного шага: в журнал процесса, не в журнал номеров,
+            # и без номеров и цен — эти поля в журнале номеров значат владение.
+            step_took = time.monotonic() - step_started
+            if step_took > 5.0:
+                stats = checkpoint_cache_stats()
+                logger.warning(
+                    "slow control step: %.1fs hold_rows=%d parses=%d copies=%d",
+                    step_took,
+                    len(getattr(self, "_hold_rows", None) or []),
+                    stats.get("parses", 0),
+                    stats.get("copies", 0),
+                )
 
             await asyncio.sleep(self.update_interval)
 
@@ -1495,7 +1514,7 @@ class ExecutorService:
             if row.get("trading_pair") != pair:
                 continue
             text = row.get("checkpoint") or ""
-            parsed = parse_checkpoint(text)
+            parsed = checkpoint_master(text)
             held = {
                 str(item.get("order_id"))
                 for item in (parsed or {}).get("holds") or []
@@ -1549,7 +1568,7 @@ class ExecutorService:
         recover_folder_debt()
         self.__dict__["_released_order_ids"] = set()
         self.__dict__["_sweep_failed"] = False
-        self._hold_rows = await self._checkpoint_rows()
+        self._set_hold_rows(await self._checkpoint_rows())
         if self._hold_rows is None:
             self.__dict__["_sweep_failed"] = True
             self._log_silent_exit(
@@ -1658,9 +1677,123 @@ class ExecutorService:
     def _parsed_hold_rows(self):
         for row in getattr(self, "_hold_rows", None) or []:
             raw = row.get("checkpoint")
-            parsed = raw if isinstance(raw, dict) else parse_checkpoint(raw)
+            parsed = raw if isinstance(raw, dict) else parse_checkpoint_cached(raw)
             if isinstance(parsed, dict):
                 yield parsed
+
+    # ── Наборы из тела строк ───────────────────────────────────────────
+    #
+    # Каждый набор повторяет прежнее чтение тела один в один (пробы сверки
+    # в test/ держат это). Наборы считаются один раз на поколение строк и
+    # хранят только то, что лежит в теле: order_is_unsent и отборы по паре
+    # читатель применяет в момент чтения. Писатели идут мимо кэша: тело,
+    # только что записанное в базу, разбирается напрямую.
+
+    def _set_hold_rows(self, rows) -> None:
+        self._hold_rows = rows
+        self.__dict__["_hold_index_cache"] = None
+        try:
+            checkpoint_cache_prune(
+                row.get("checkpoint") for row in (rows or []) if isinstance(row, dict)
+            )
+        except Exception:
+            logger.debug("Could not prune the checkpoint cache.", exc_info=True)
+
+    def _hold_index(self):
+        index = self.__dict__.get("_hold_index_cache")
+        if index is None:
+            index = [self._row_extract(row) for row in (getattr(self, "_hold_rows", None) or [])]
+            self.__dict__["_hold_index_cache"] = index
+        return index
+
+    def _row_extract(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Извлечение из тела одной строки — ровно то, что читатели брали
+        из тела сами, только один раз на поколение строк."""
+        text = row.get("checkpoint") or ""
+        parsed = checkpoint_master(text)
+        body = parsed if isinstance(parsed, dict) else None
+
+        owner_ids: set = set(saved_order_ids(body)) if body is not None else set()
+        column_ids: set = set(owner_ids)
+        seated_ids: set = set()
+        released_ids: set = set()
+        released_texts: set = set()
+        level_close_ids: set = set()
+        level_close_prices: list = []
+        close_price_map: dict = {}
+        close_hold_price_map: dict = {}
+        protected_ids: set = set()
+        close_ids: set = self._checkpoint_close_ids(body, past=True, ends=True)
+        ban_holds: list = []
+
+        if body is not None:
+            for hold in body.get("holds") or []:
+                if not isinstance(hold, dict):
+                    continue
+                if hold.get("order_id"):
+                    owner_ids.add(str(hold.get("order_id")))
+                    seated_ids.add(str(hold.get("order_id")))
+                    column_ids.add(hold.get("order_id"))
+                if hold.get("price") not in (None, ""):
+                    close_hold_price_map[str(hold.get("order_id") or "")] = hold.get("price")
+            for level in body.get("levels") or []:
+                if not isinstance(level, dict):
+                    continue
+                for key in ("open_order", "close_order"):
+                    slot = level.get(key) or {}
+                    if isinstance(slot, dict) and slot.get("order_id"):
+                        owner_ids.add(str(slot.get("order_id")))
+                open_slot = level.get("open_order") or {}
+                if isinstance(open_slot, dict) and open_slot.get("order_id"):
+                    seated_ids.add(str(open_slot.get("order_id")))
+                close = level.get("close_order") or {}
+                if isinstance(close, dict) and close.get("order_id"):
+                    close_id = str(close.get("order_id"))
+                    level_close_ids.add(close_id)
+                    if close.get("price") not in (None, ""):
+                        close_price_map[close_id] = close.get("price")
+                        level_close_prices.append((close_id, close.get("price")))
+                if not partial_level_released(body, str(level.get("id"))):
+                    ids = [
+                        str((level.get("open_order") or {}).get("order_id") or ""),
+                        str((level.get("close_order") or {}).get("order_id") or ""),
+                    ]
+                    ids.extend(
+                        str(item.get("order_id") or "")
+                        for item in level.get("partial_closes") or []
+                        if isinstance(item, dict)
+                    )
+                    protected_ids.update(item for item in ids if item)
+            released_ids = set(partial_released_ids(body))
+            released_texts = {
+                str(item) for item in partial_released_ids(body)
+                if item and not str(item).startswith("level:")
+            }
+
+        price_body = row.get("price_checkpoint")
+        if not isinstance(price_body, dict):
+            price_body = body
+        for hold in (price_body or {}).get("holds") or [] or []:
+            if hold.get("price") not in (None, ""):
+                ban_holds.append((str(hold.get("order_id") or ""), hold.get("price")))
+
+        return {
+            "pair": row.get("trading_pair"),
+            "identity": self._row_identity(row),
+            "unread": bool(text) and body is None,
+            "owner_ids": owner_ids,
+            "column_ids": column_ids,
+            "seated_ids": seated_ids,
+            "released_ids": released_ids,
+            "released_texts": released_texts,
+            "level_close_ids": level_close_ids,
+            "level_close_prices": level_close_prices,
+            "close_price_map": close_price_map,
+            "close_hold_price_map": close_hold_price_map,
+            "protected_ids": protected_ids,
+            "close_ids": close_ids,
+            "ban_holds": ban_holds,
+        }
 
     def _ram_close_ids(self) -> set:
         found = set()
@@ -1676,22 +1809,22 @@ class ExecutorService:
         for a second order at the same price.
         """
         found = self._ram_close_ids()
-        for parsed in self._parsed_hold_rows():
-            found.update(self._checkpoint_close_ids(parsed, past=True, ends=True))
+        for entry in self._hold_index():
+            found.update(entry["close_ids"])
         return found
 
     def _close_price_skip_ids(self) -> set:
         """Ids whose price must not be written into holds, bans, or the journal."""
         found = self._close_cancel_ids()
-        for parsed in self._parsed_hold_rows():
-            found.update(self._checkpoint_close_ids(parsed, past=True, ends=True))
+        for entry in self._hold_index():
+            found.update(entry["close_ids"])
         return found
 
     def _close_recorded_ids(self) -> set:
         """A close the seen-prefix bag must not treat as unrecorded."""
         found = set()
-        for parsed in self._parsed_hold_rows():
-            found.update(self._checkpoint_close_ids(parsed, past=True, ends=True))
+        for entry in self._hold_index():
+            found.update(entry["close_ids"])
         return found
 
     def _seat_close_hold(self, executor: Any, order_id: str) -> None:
@@ -1787,22 +1920,11 @@ class ExecutorService:
         """A hold or an open slot already in the readable column. A close slot is not this."""
         if not text:
             return False
-        for row in getattr(self, "_hold_rows", None) or []:
-            if row.get("trading_pair") not in (None, "", pair):
+        for entry in self._hold_index():
+            if entry["pair"] not in (None, "", pair):
                 continue
-            raw = row.get("checkpoint")
-            parsed = raw if isinstance(raw, dict) else parse_checkpoint(raw)
-            if not isinstance(parsed, dict):
-                continue
-            for hold in parsed.get("holds") or []:
-                if isinstance(hold, dict) and str(hold.get("order_id") or "") == text:
-                    return True
-            for level in parsed.get("levels") or []:
-                if not isinstance(level, dict):
-                    continue
-                slot = level.get("open_order") or {}
-                if isinstance(slot, dict) and str(slot.get("order_id") or "") == text:
-                    return True
+            if text in entry["seated_ids"]:
+                return True
         return False
 
     def _keeps_fresh_open(self, text: str, pair: str, known_commits) -> bool:
@@ -1908,18 +2030,17 @@ class ExecutorService:
             rows = await self._checkpoint_rows()
         if rows is None:
             return None
+        if rows is getattr(self, "_hold_rows", None):
+            entries = self._hold_index()
+        else:
+            entries = [self._row_extract(row) for row in rows]
         found = set()
-        for row in rows:
+        for entry, row in zip(entries, rows):
             if row.get("trading_pair") != pair:
                 continue
-            text = row.get("checkpoint") or ""
-            parsed = parse_checkpoint(text)
-            if text and parsed is None:
+            if entry["unread"]:
                 return None
-            found.update(saved_order_ids(parsed))
-            for hold in (parsed or {}).get("holds") or []:
-                if hold.get("order_id"):
-                    found.add(hold["order_id"])
+            found.update(entry["column_ids"])
         return found
 
     async def _fresh_pair_reads(self):
@@ -1942,7 +2063,7 @@ class ExecutorService:
         return fresh
 
     def _row_proofs_released(self, row: Dict[str, Any], slot: Dict[str, Any]) -> bool:
-        parsed = parse_checkpoint(row.get("checkpoint"))
+        parsed = checkpoint_master(row.get("checkpoint"))
         ids = set(saved_order_ids(parsed))
         for hold in (parsed or {}).get("holds") or []:
             if hold.get("order_id"):
@@ -1963,7 +2084,7 @@ class ExecutorService:
                 continue
             seen = True
             text = row.get("checkpoint") or ""
-            parsed = parse_checkpoint(text)
+            parsed = checkpoint_master(text)
             if text and parsed is None:
                 return None
             found.update(saved_order_ids(parsed))
@@ -2112,7 +2233,7 @@ class ExecutorService:
         pair_prices: Dict[str, set] = {}
         for row in rows or []:
             text = row.get("checkpoint") or ""
-            parsed = parse_checkpoint(text)
+            parsed = checkpoint_master(text)
             if text and parsed is None:
                 return None
             parsed_rows.append((row, parsed))
@@ -2154,16 +2275,16 @@ class ExecutorService:
                 continue
             if "price_checkpoint" not in row:
                 return None
-            if row.get("checkpoint") and parse_checkpoint(row.get("checkpoint")) is None:
+            if row.get("checkpoint") and checkpoint_master(row.get("checkpoint")) is None:
                 return None
             parsed = row.get("price_checkpoint")
             if isinstance(parsed, str):
-                parsed = parse_checkpoint(parsed)
+                parsed = checkpoint_master(parsed)
             released = set()
             for item in rows:
                 if item.get("trading_pair") != pair:
                     continue
-                released.update(partial_released_ids(parse_checkpoint(item.get("checkpoint"))))
+                released.update(partial_released_ids(checkpoint_master(item.get("checkpoint"))))
             fresh = self._tick_fresh(pair)
             feed = self._parsed_without_dead(parsed, fresh) if self._lists_ready(fresh) else parsed
             for hold in (feed or {}).get("holds") or []:
@@ -2251,11 +2372,10 @@ class ExecutorService:
         rows = getattr(self, "_hold_rows", None)
         if rows is None:
             return True
-        for row in rows:
-            if pair and row.get("trading_pair") not in (None, pair):
+        for entry in self._hold_index():
+            if pair and entry["pair"] not in (None, pair):
                 continue
-            text = row.get("checkpoint") or ""
-            if text and parse_checkpoint(text) is None:
+            if entry["unread"]:
                 return True
         return False
 
@@ -2264,25 +2384,12 @@ class ExecutorService:
         if self._checkpoint_unread():
             return None
         wanted = str(order_id)
-        for row in getattr(self, "_hold_rows", None) or []:
-            text = row.get("checkpoint") or ""
-            parsed = parse_checkpoint(text)
-            if text and parsed is None:
+        for entry in self._hold_index():
+            if entry["unread"]:
                 continue
-            ids = set(saved_order_ids(parsed))
-            for hold in (parsed or {}).get("holds") or []:
-                if hold.get("order_id"):
-                    ids.add(str(hold.get("order_id")))
-            for level in (parsed or {}).get("levels") or []:
-                if not isinstance(level, dict):
-                    continue
-                for key in ("open_order", "close_order"):
-                    slot = level.get(key) or {}
-                    if isinstance(slot, dict) and slot.get("order_id"):
-                        ids.add(str(slot.get("order_id")))
-            if wanted not in ids:
+            if wanted not in entry["owner_ids"]:
                 continue
-            identity = self._row_identity(row)
+            identity = entry["identity"]
             if identity:
                 return identity
         return None
@@ -2331,17 +2438,13 @@ class ExecutorService:
                 continue
             if item.get("price") not in (None, ""):
                 items.append((str(item.get("order_id") or ""), item.get("price")))
-        for row in getattr(self, "_hold_rows", None) or []:
-            if row.get("trading_pair") not in (None, "", pair):
+        for entry in self._hold_index():
+            if entry["pair"] not in (None, "", pair):
                 continue
-            parsed = row.get("price_checkpoint")
-            if not isinstance(parsed, dict):
-                parsed = parse_checkpoint(row.get("checkpoint"))
-            for hold in (parsed or {}).get("holds") or []:
-                if order_is_unsent(str(hold.get("order_id") or "")):
+            for hold_id, price in entry["ban_holds"]:
+                if order_is_unsent(hold_id):
                     continue
-                if hold.get("price") not in (None, ""):
-                    items.append((str(hold.get("order_id") or ""), hold.get("price")))
+                items.append((hold_id, price))
         return items
 
     def _feed_prices(self, rows, parsed, fresh):
@@ -2719,7 +2822,7 @@ class ExecutorService:
         for row in rows:
             if row.get("trading_pair") != pair:
                 continue
-            parsed = parse_checkpoint(row.get("checkpoint"))
+            parsed = checkpoint_master(row.get("checkpoint"))
             if row.get("checkpoint") and parsed is None:
                 return True
             fresh = self._tick_fresh(pair)
@@ -2869,7 +2972,7 @@ class ExecutorService:
         for row in getattr(self, "_hold_rows", None) or []:
             if row.get("trading_pair") not in (None, pair):
                 continue
-            parsed = parse_checkpoint(row.get("checkpoint"))
+            parsed = checkpoint_master(row.get("checkpoint"))
             for hold in (parsed or {}).get("holds") or []:
                 add(hold.get("ts"))
         for raw in list(fresh.get("opens") or []) + list(fresh.get("finished") or []):
@@ -3515,7 +3618,7 @@ class ExecutorService:
         if not fresh.get("opens_read") or not fresh.get("opens_done"):
             self._log_silent_exit("durable-open-first", pair, self._silent_exit_flags(fresh), executor_id)
             return
-        self._hold_rows = await self._checkpoint_rows()
+        self._set_hold_rows(await self._checkpoint_rows())
         column_prices = await self._column_prices(pair)
         if column_prices is None:
             self._log_silent_exit("durable-open-column-prices", pair, "column prices unread", executor_id)
@@ -3532,7 +3635,7 @@ class ExecutorService:
         if self._owned_row_lacks_price(connector, fresh, column_ids):
             self._log_silent_exit("durable-open-owned-row-first", pair, "owned row lacks price", executor_id)
             return
-        self._hold_rows = await self._checkpoint_rows()
+        self._set_hold_rows(await self._checkpoint_rows())
         column_ids = await self._column_order_ids(pair)
         if column_ids is None or self._column_hold_lacks_price(pair):
             self._log_silent_exit("durable-open-column-hold-first", pair, "column hold unread or lacks price", executor_id)
@@ -3557,7 +3660,7 @@ class ExecutorService:
             if self._owned_row_lacks_price(connector, fresh, column_ids):
                 self._log_silent_exit("durable-open-owned-row-window", pair, "owned row lacks price in window", executor_id)
                 return
-            self._hold_rows = await self._checkpoint_rows()
+            self._set_hold_rows(await self._checkpoint_rows())
             column_ids = await self._column_order_ids(pair)
             if column_ids is None or self._column_hold_lacks_price(pair):
                 self._log_silent_exit("durable-open-column-hold-window", pair, "column hold unread or lacks price in window", executor_id)
@@ -3612,7 +3715,7 @@ class ExecutorService:
         prices.extend(self._partial_flight_prices(executor))
         prices.extend(self._partial_missing_take_prices(ledger_rows, executor, pair))
         prices.extend(self._partial_live_sell_prices(executor_id, connector, self._partial_parsed(executor_id), pair))
-        self._hold_rows = await self._checkpoint_rows()
+        self._set_hold_rows(await self._checkpoint_rows())
         if self._hold_rows is None:
             self._log_silent_exit("durable-open-hold-rows", pair, "late checkpoint rows unread", executor_id)
             return
@@ -4349,7 +4452,7 @@ class ExecutorService:
             # returns before start() withdraws them before the next row runs,
             # so a non-started journal line never makes an id foreign to a
             # starter that holds it.
-            parsed = parse_checkpoint(row.get("checkpoint"))
+            parsed = parse_checkpoint_cached(row.get("checkpoint"))
             claims = set(saved_order_ids(parsed))
             claims.update(ledger_ids.get(row["executor_id"]) or [])
             claims.update(accounted_orders(row["executor_id"], parsed))
@@ -4627,7 +4730,7 @@ class ExecutorService:
 
     async def _resume_one(self, row: Dict[str, Any], owned_by: Optional[Dict[str, str]] = None) -> Optional[str]:
         """None on success. A string is why this row was left for cleanup."""
-        checkpoint = parse_checkpoint(row.get("checkpoint"))
+        checkpoint = parse_checkpoint_cached(row.get("checkpoint"))
         accounted = {
             order_id: price
             for order_id, price in accounted_orders(row["executor_id"], checkpoint).items()
@@ -4742,7 +4845,7 @@ class ExecutorService:
                     return None
                 executor.validate_sufficient_balance = _skip_balance_check
             await self._partial_copy_five_before_start(row["executor_id"], checkpoint, config)
-            refreshed = parse_checkpoint(
+            refreshed = parse_checkpoint_cached(
                 (await self._partial_column_text(row["executor_id"])) or row.get("checkpoint")
             )
             if refreshed:
@@ -6159,7 +6262,7 @@ class ExecutorService:
         for row in getattr(self, "_hold_rows", None) or []:
             if pair and row.get("trading_pair") not in (None, pair):
                 continue
-            found.update(partial_released_ids(parse_checkpoint(row.get("checkpoint"))))
+            found.update(partial_released_ids(checkpoint_master(row.get("checkpoint"))))
         return found
 
     def _partial_pair_seat_prices(self, pair: str, released: set) -> List[Any]:
@@ -6168,7 +6271,7 @@ class ExecutorService:
         for row in getattr(self, "_hold_rows", None) or []:
             if pair and row.get("trading_pair") not in (None, "", pair):
                 continue
-            parsed = parse_checkpoint(row.get("checkpoint"))
+            parsed = checkpoint_master(row.get("checkpoint"))
             if parsed is None and row.get("checkpoint"):
                 prices.append(None)
                 continue
@@ -6215,7 +6318,7 @@ class ExecutorService:
         rows = getattr(self, "_hold_rows", None) or []
         for row in rows:
             if row.get("executor_id") == executor_id:
-                return parse_checkpoint(row.get("checkpoint"))
+                return parse_checkpoint_cached(row.get("checkpoint"))
         return None
 
     async def _partial_column_text(self, executor_id: str) -> Optional[str]:
@@ -6229,7 +6332,7 @@ class ExecutorService:
         return row.checkpoint if row is not None else None
 
     def _partial_must_keep(self, row: Dict[str, Any]) -> bool:
-        parsed = parse_checkpoint(row.get("checkpoint"))
+        parsed = checkpoint_master(row.get("checkpoint"))
         if partial_exposure(self._partial_rows(), parsed, row.get("executor_id") or ""):
             return True
         for level in (parsed or {}).get("levels") or []:
@@ -6339,7 +6442,7 @@ class ExecutorService:
         for row in getattr(self, "_hold_rows", None) or []:
             if not row.get("executor_id") or row.get("executor_id") != executor_id:
                 continue
-            parsed = parse_checkpoint(row.get("checkpoint"))
+            parsed = checkpoint_master(row.get("checkpoint"))
             for level in (parsed or {}).get("levels") or []:
                 if str(level.get("id")) != str(level_id):
                     continue
@@ -6668,39 +6771,26 @@ class ExecutorService:
         rows = self._partial_rows()
         if rows is None:
             return True
-        parsed_rows = getattr(self, "_hold_rows", None) or []
         released = set()
-        for row in parsed_rows:
-            released.update(partial_released_ids(parse_checkpoint(row.get("checkpoint"))))
+        for entry in self._hold_index():
+            released.update(entry["released_ids"])
         if text in released:
             return False
         for row in rows:
             if str(row.get("order_id") or "") == text and row.get("level_id"):
                 if partial_old_remember(row) or partial_send_marked(rows, text) or partial_has_five(row):
                     return True
-        for row in parsed_rows:
-            parsed = parse_checkpoint(row.get("checkpoint"))
-            for level in (parsed or {}).get("levels") or []:
-                if partial_level_released(parsed, str(level.get("id"))):
-                    continue
-                ids = [
-                    str((level.get("open_order") or {}).get("order_id") or ""),
-                    str((level.get("close_order") or {}).get("order_id") or ""),
-                ]
-                ids.extend(str(item.get("order_id") or "") for item in level.get("partial_closes") or [] if isinstance(item, dict))
-                if text in ids:
-                    return True
+        for entry in self._hold_index():
+            if text in entry["protected_ids"]:
+                return True
         return False
 
     def _released_texts(self, pair: str) -> set:
         found = set()
-        for row in getattr(self, "_hold_rows", None) or []:
-            if row.get("trading_pair") not in (None, "", pair):
+        for entry in self._hold_index():
+            if entry["pair"] not in (None, "", pair):
                 continue
-            found.update(
-                str(item) for item in partial_released_ids(parse_checkpoint(row.get("checkpoint")))
-                if item and not str(item).startswith("level:")
-            )
+            found.update(entry["released_texts"])
         return found
 
     def _price_kept_by_other(self, pair: str, fresh: Optional[Dict[str, Any]], price: Any, released: set) -> bool:
@@ -7291,8 +7381,10 @@ class ExecutorService:
         found = []
         rows = self._partial_rows() or []
         released = set()
-        for row in getattr(self, "_hold_rows", None) or []:
-            released.update(partial_released_ids(parse_checkpoint(row.get("checkpoint"))))
+        level_close_ids = set()
+        for entry in self._hold_index():
+            released.update(entry["released_ids"])
+            level_close_ids.update(entry["level_close_ids"])
         for other in self._active_executors.values():
             other_pair = getattr(getattr(other, "config", None), "trading_pair", None)
             if pair and other_pair and other_pair != pair:
@@ -7336,19 +7428,12 @@ class ExecutorService:
             if owned and row.get("price") not in (None, ""):
                 found.append(row.get("price"))
             if row.get("take_profit_price") not in (None, "") and order_id not in released:
-                if any(
-                    str((level.get("close_order") or {}).get("order_id") or "") == order_id
-                    for parsed_row in getattr(self, "_hold_rows", None) or []
-                    for level in (parse_checkpoint(parsed_row.get("checkpoint")) or {}).get("levels") or []
-                ):
+                if order_id in level_close_ids:
                     found.append(row.get("take_profit_price"))
-        for parsed_row in getattr(self, "_hold_rows", None) or []:
-            parsed = parse_checkpoint(parsed_row.get("checkpoint"))
-            for level in (parsed or {}).get("levels") or []:
-                close = (level or {}).get("close_order") or {}
-                close_id = str(close.get("order_id") or "")
-                if close_id and close_id != ignore and close_id not in released and close.get("price") not in (None, ""):
-                    found.append(close.get("price"))
+        for entry in self._hold_index():
+            for close_id, price in entry["level_close_prices"]:
+                if close_id != ignore and close_id not in released:
+                    found.append(price)
         if include_opens:
             found.extend(self._live_open_prices(executor))
         return found
@@ -7398,16 +7483,12 @@ class ExecutorService:
         for row in rows:
             if str(row.get("order_id") or "") == str(order_id) and row.get("price") not in (None, ""):
                 return True
-        for row in getattr(self, "_hold_rows", None) or []:
-            parsed = parse_checkpoint(row.get("checkpoint"))
-            for level in (parsed or {}).get("levels") or []:
-                close = (level or {}).get("close_order") or {}
-                if str(close.get("order_id") or "") == str(order_id) and close.get("price") not in (None, ""):
-                    return True
-            for item in (parsed or {}).get("close_holds") or []:
-                if isinstance(item, dict) and str(item.get("order_id") or "") == str(order_id):
-                    if item.get("price") not in (None, ""):
-                        return True
+        wanted = str(order_id)
+        for entry in self._hold_index():
+            if entry["close_price_map"].get(wanted) not in (None, ""):
+                return True
+            if entry["close_hold_price_map"].get(wanted) not in (None, ""):
+                return True
         return False
 
     def _close_left_the_book(self, executor: Any, order_id: str) -> bool:
@@ -7507,7 +7588,7 @@ class ExecutorService:
                 parsed = parse_checkpoint(stored)
                 if not visible(parsed):
                     return False
-                self._hold_rows = await repo.get_checkpoint_rows()
+                self._set_hold_rows(await repo.get_checkpoint_rows())
                 return True
         except Exception:
             logger.exception("partial compare-and-swap was not committed")
@@ -7705,7 +7786,7 @@ class ExecutorService:
             return
         self._partial_prepare_sync(executor_id, executor, connector, pair)
         rows = self._partial_rows() or []
-        self._hold_rows = await self._checkpoint_rows()
+        self._set_hold_rows(await self._checkpoint_rows())
         parsed = self._partial_parsed(executor_id)
         inflight = getattr(connector, "in_flight_orders", None) or {}
         lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
@@ -7901,7 +7982,7 @@ class ExecutorService:
         released = set()
         for row in getattr(self, "_hold_rows", None) or []:
             raw = row.get("checkpoint")
-            body = raw if isinstance(raw, dict) else parse_checkpoint(raw)
+            body = raw if isinstance(raw, dict) else checkpoint_master(raw)
             released.update(
                 str(item) for item in partial_released_ids(body)
                 if item and not str(item).startswith("level:")
@@ -7915,7 +7996,7 @@ class ExecutorService:
             if row.get("take_profit_price") not in (None, ""):
                 prices.append(row.get("take_profit_price"))
         for row in getattr(self, "_hold_rows", None) or []:
-            body = parse_checkpoint(row.get("checkpoint"))
+            body = checkpoint_master(row.get("checkpoint"))
             for level in (body or {}).get("levels") or []:
                 close = (level or {}).get("close_order") or {}
                 if str(close.get("order_id") or "") in own:
