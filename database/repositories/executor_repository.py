@@ -17,6 +17,47 @@ from database.repositories.executor_performance_repository import ExecutorPerfor
 logger = logging.getLogger(__name__)
 
 
+def _slot_price(slot: Any, level: Dict[str, Any], allow_level_price: bool):
+    if not isinstance(slot, dict):
+        return None
+    price = slot.get("price")
+    if price in (None, ""):
+        order = slot.get("order")
+        if isinstance(order, dict):
+            price = order.get("price")
+    if price in (None, "") and allow_level_price:
+        price = level.get("price")
+    if price in (None, ""):
+        return None
+    return price
+
+
+def _price_checkpoint(parsed: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Decorated copy. Does not assign the column and does not touch retained_orders."""
+    import copy
+
+    body = copy.deepcopy(parsed) if isinstance(parsed, dict) else {}
+    holds = [item for item in (body.get("holds") or []) if isinstance(item, dict)]
+    known = {str(item.get("order_id")) for item in holds if item.get("order_id")}
+    for level in body.get("levels") or []:
+        if not isinstance(level, dict):
+            continue
+        for key, allow_level in (("open_order", True), ("close_order", False)):
+            slot = level.get(key) or {}
+            if not isinstance(slot, dict):
+                continue
+            order_id = slot.get("order_id")
+            if not order_id or str(order_id) in known:
+                continue
+            price = _slot_price(slot, level, allow_level)
+            if price in (None, ""):
+                continue
+            holds.append({"order_id": order_id, "price": str(price)})
+            known.add(str(order_id))
+    body["holds"] = holds
+    return body
+
+
 class ExecutorRepository:
     """Repository for ExecutorRecord and ExecutorOrder database operations."""
 
@@ -243,16 +284,20 @@ class ExecutorRepository:
             self,
             close_types: List[str],
             executor_type: Optional[str] = None,
+            executor_types: Optional[List[str]] = None,
             limit: Optional[int] = 500,
     ) -> List[ExecutorRecord]:
         """Get executors whose close_type is one of the given values, newest first.
 
-        Filter by executor_type in SQL where possible: applying `limit` to a broad
+        Filter by executor type in SQL where possible: applying `limit` to a broad
         candidate set and filtering in Python can silently drop the very rows the
         caller is looking for once the newest N candidates are all irrelevant.
+        ``executor_types`` is the multi-type form. An empty list matches nothing.
         """
         stmt = select(ExecutorRecord).where(ExecutorRecord.close_type.in_(close_types))
-        if executor_type:
+        if executor_types is not None:
+            stmt = stmt.where(ExecutorRecord.executor_type.in_(executor_types))
+        elif executor_type:
             stmt = stmt.where(ExecutorRecord.executor_type == executor_type)
         stmt = stmt.order_by(desc(ExecutorRecord.created_at))
         if limit is not None:
@@ -265,7 +310,8 @@ class ExecutorRepository:
         """RUNNING rows, copied out of the session so resume can await the exchange.
 
         Reading the ORM object after the session closes raises DetachedInstanceError
-        and the restart would fall through to SYSTEM_CLEANUP.
+        and the restart would fall through to SYSTEM_CLEANUP — the bug this exists
+        to stop.
         """
         stmt = select(ExecutorRecord).where(
             ExecutorRecord.status.in_(["RUNNING", "NOT_STARTED"])
@@ -287,25 +333,38 @@ class ExecutorRepository:
         ]
 
     async def get_checkpoint_rows(self) -> List[Dict[str, Any]]:
-        """Rows with a checkpoint, including ones that are no longer RUNNING.
+        """Every executor row, copied out of the session. Not only the live ones.
 
-        A hold price is still a hold after the status changes. The 48 hour
-        window for an id already in the column is not decided here.
+        RUNNING and NOT_STARTED keep executor_id. Any other status hides that key
+        so pick_owner cannot treat a stopped row as the owner of the whole pair.
+        The id is still on row_executor_id. price_checkpoint is a dict for the
+        caller, not a database column and not written back.
         """
-        stmt = select(ExecutorRecord).where(ExecutorRecord.checkpoint.isnot(None))
-        records = (await self.session.execute(stmt)).scalars().all()
-        return [
-            {
-                "executor_id": record.executor_id,
+        from utils.executor_checkpoint import parse_checkpoint
+
+        records = (await self.session.execute(select(ExecutorRecord))).scalars().all()
+        rows = []
+        for record in records:
+            row = {
                 "executor_type": record.executor_type,
                 "account_name": record.account_name,
                 "connector_name": record.connector_name,
                 "trading_pair": record.trading_pair,
-                "status": record.status,
+                "controller_id": record.controller_id or "main",
+                "created_at": record.created_at,
+                "config": record.config,
                 "checkpoint": record.checkpoint,
             }
-            for record in records
-        ]
+            if record.status in ("RUNNING", "NOT_STARTED"):
+                row["executor_id"] = record.executor_id
+            else:
+                row["row_executor_id"] = record.executor_id
+            text = record.checkpoint
+            parsed = parse_checkpoint(text)
+            if not text or parsed is not None:
+                row["price_checkpoint"] = _price_checkpoint(parsed)
+            rows.append(row)
+        return rows
 
     async def get_active_executors(
             self,
@@ -753,8 +812,9 @@ class ExecutorRepository:
         Returns:
             Number of executors cleaned up
         """
-        # Find executors that are RUNNING but not in the active list
-        conditions = [ExecutorRecord.status == "RUNNING"]
+        # RUNNING is the live mark. NOT_STARTED is the same row written before
+        # start() updated it; if it is not in memory, it is just as orphaned.
+        conditions = [ExecutorRecord.status.in_(["RUNNING", "NOT_STARTED"])]
 
         if active_executor_ids:
             conditions.append(~ExecutorRecord.executor_id.in_(active_executor_ids))

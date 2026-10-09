@@ -16,12 +16,17 @@ import os
 import tempfile
 import threading
 import time
+from contextvars import ContextVar
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 CHECKPOINT_VERSION = 1
+# Not retained_orders: seat_known_opens reads that list and would attach by price.
+CLOSE_HOLD_KEY = "close_holds"
+# Blocks a second close. seat_known_opens and _saved_ids do not read this.
+CLOSE_BAN_KEY = "close_bans"
 
 # Relative price match for an order the checkpoint missed but the connector
 # still tracks. Wider than one tick, narrower than a grid step we would confuse
@@ -85,7 +90,16 @@ def _capture_grid(executor: Any) -> Dict[str, Any]:
             "close_order": capture_tracked(getattr(level, "active_close_order", None)),
         })
     close_order = capture_tracked(getattr(executor, "_close_order", None))
-    return {"levels": levels, "close_order": close_order}
+    bans = set(str(item) for item in (getattr(executor, "_column_close_ids", []) or []) if item)
+    bans.update(
+        str(item) for item in (getattr(executor, "_close_ban_ids", []) or []) if item
+    )
+    return {
+        "levels": levels,
+        "close_order": close_order,
+        CLOSE_HOLD_KEY: list(getattr(executor, "_close_holds", []) or []),
+        CLOSE_BAN_KEY: sorted(bans),
+    }
 
 
 def _capture_position(executor: Any) -> Dict[str, Any]:
@@ -241,6 +255,235 @@ def _fsync_directory(path: str) -> bool:
     return True
 
 
+# Two durable sets beside the ledger, not inside it. "miss" is a number whose
+# send never left this process; "sent" is a number whose place call was entered.
+# A row leaves the hold/price view only in the first and not in the second.
+MISS_LOCK = threading.Lock()
+SENT_LOCK = threading.Lock()
+
+
+def _miss_path() -> str:
+    return os.environ.get(
+        "EXECUTOR_ORDER_MISS",
+        os.path.join(os.path.dirname(order_ledger_path()) or ".", "order-miss.json"),
+    )
+
+
+def _sent_path() -> str:
+    return os.environ.get(
+        "EXECUTOR_ORDER_SENT",
+        os.path.join(os.path.dirname(order_ledger_path()) or ".", "order-sent.json"),
+    )
+
+
+def _load_set_file(path: str) -> Optional[set]:
+    """An absent file over a readable directory is an empty set. Any read error is None.
+
+    os.path.exists is not consulted: a broken stat must not read as an absent
+    file, because an empty sent would drop a live order's journal line and
+    free its price. ENOENT is an absent file only once the directory itself
+    has been read; every other OSError stays an error.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            body = json.load(handle)
+    except FileNotFoundError:
+        try:
+            os.listdir(os.path.dirname(path) or ".")
+        except OSError as exc:
+            logger.warning("order set directory read failed (%s): %s", path, exc)
+            return None
+        return set()
+    except (OSError, ValueError) as exc:
+        logger.warning("order set read failed (%s): %s", path, exc)
+        return None
+    if not isinstance(body, list):
+        logger.warning("order set is not a list (%s)", path)
+        return None
+    return {str(item) for item in body if item}
+
+
+def _durable_write_set(path: str, items) -> bool:
+    """Whole-set replace: temp file, flush and fsync, os.replace, then directory fsync."""
+    directory = os.path.dirname(path) or "."
+    temporary = None
+    descriptor = None
+    try:
+        os.makedirs(directory, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=".order-set-", dir=directory)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            json.dump(sorted(str(item) for item in items), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        return _fsync_directory(path)
+    except OSError as exc:
+        logger.warning("order set write failed (%s): %s", path, exc)
+        return False
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _set_contains(path: str, order_id: str) -> Optional[bool]:
+    """True or False from the live file; None when the read itself failed.
+
+    A failed read must not answer "the number is absent": add_sent_order
+    decides placement on this answer.
+    """
+    current = _load_set_file(path)
+    if current is None:
+        return None
+    return str(order_id) in current
+
+
+def add_miss_order(order_id: str) -> bool:
+    """Durable before the journal line is visible. False: do not remember, release, return.
+
+    A failed write rolls the previous set back the same durable way, so a
+    half-published number does not linger. False is safe here even when the
+    rollback also fails: no journal line exists yet, and the next attempt mints
+    a fresh number.
+    """
+    if not order_id:
+        return False
+    with MISS_LOCK:
+        current = _load_set_file(_miss_path())
+        if current is None:
+            return False
+        if str(order_id) in current:
+            return True
+        previous = set(current)
+        current.add(str(order_id))
+        if _durable_write_set(_miss_path(), current):
+            return True
+        try:
+            _durable_write_set(_miss_path(), previous)
+        except Exception:
+            logger.warning("order miss rollback failed", exc_info=True)
+        return False
+
+
+def add_sent_order(order_id: str) -> bool:
+    """Durable before the original place call. False: do not place; stay in miss.
+
+    True only after the live order-sent.json name carries the number and its
+    directory fsync succeeded. A failed directory fsync after a published
+    replace is retried on the same live name first. A still-undurable name is
+    unpublished by rolling the previous set back the same durable way; False
+    is honest only once the live file no longer carries the number. When the
+    rollback cannot unpublish either, one more fsync is tried, and a visible
+    but undurable number is reported as a warned failure: placing on it opens
+    a crash window that drops the journal line beside a live exchange order,
+    and a silent False would free the price to a second order.
+    """
+    if not order_id:
+        return False
+    with SENT_LOCK:
+        current = _load_set_file(_sent_path())
+        if current is None:
+            return False
+        previous = set(current)
+        current.add(str(order_id))
+        if _durable_write_set(_sent_path(), current):
+            return True
+        present = _set_contains(_sent_path(), order_id)
+        if present is False:
+            return False
+        # True requires the live name verified to carry the number and a
+        # successful directory fsync of that name. An unreadable file is
+        # neither "absent" nor "present": it must not green-light a place.
+        if present is True and _fsync_directory(_sent_path()):
+            return True
+        try:
+            _durable_write_set(_sent_path(), previous)
+        except Exception:
+            logger.warning("order sent rollback failed", exc_info=True)
+        present = _set_contains(_sent_path(), order_id)
+        if present is False:
+            return False
+        if present is True and _fsync_directory(_sent_path()):
+            return True
+        logger.warning("order sent mark is not verifiably durable; not placing")
+        return False
+
+
+def remove_miss_order(order_id: str) -> bool:
+    """Only after reached, with sent already durable. Failure is safe: sent keeps the row."""
+    if not order_id:
+        return False
+    with MISS_LOCK:
+        current = _load_set_file(_miss_path())
+        if current is None or str(order_id) not in current:
+            return True
+        current.discard(str(order_id))
+        return _durable_write_set(_miss_path(), current)
+
+
+def remove_sent_order(order_id: str) -> bool:
+    """Unmark a send that provably never reached the place call.
+
+    False keeps the owner: an unreadable sent file, or a write that did not
+    durably land, must not free the level. A live file that already stopped
+    carrying the number answers True even when its directory fsync failed —
+    the rows are already invisible to readers.
+    """
+    if not order_id:
+        return False
+    with SENT_LOCK:
+        current = _load_set_file(_sent_path())
+        if current is None:
+            return False
+        if str(order_id) not in current:
+            return True
+        current.discard(str(order_id))
+        return _durable_write_set(_sent_path(), current)
+
+
+def order_is_unsent(order_id: str) -> bool:
+    """True only in durable miss and not in durable sent: the send never left."""
+    if not order_id:
+        return False
+    miss = _load_set_file(_miss_path())
+    if not miss or str(order_id) not in miss:
+        return False
+    sent = _load_set_file(_sent_path())
+    if sent is None:
+        return False
+    return str(order_id) not in sent
+
+
+def read_ledger_filtered() -> List[Dict[str, Any]]:
+    """View for hold and price readers. Raw _read_ledger stays for debt recovery, prune, rewrite.
+
+    A number in durable miss and not in durable sent never reached the exchange,
+    so its line holds neither a level nor a tick. An unreadable sent keeps every
+    line; an unreadable miss drops nothing.
+    """
+    rows = _read_ledger()
+    miss = _load_set_file(_miss_path())
+    if not miss:
+        return rows
+    sent = _load_set_file(_sent_path())
+    if sent is None:
+        return rows
+    return [
+        row for row in rows
+        if str(row.get("order_id") or "") not in miss
+        or str(row.get("order_id") or "") in sent
+    ]
+
+
 # One ledger path owes a directory entry until that fsync is seen to succeed.
 # A different path does not inherit the debt. The durable debt is the marker file.
 _LEDGER_NAME_FSYNC_OWED: Optional[str] = None
@@ -311,7 +554,11 @@ def _write_ledger(rows: List[Dict[str, Any]]) -> None:
 
 
 def _append_ledger_line(row: Dict[str, Any], *, marker_ready: bool = False) -> bool:
-    """Append one id. False means this line is not durable and must not be sent."""
+    """Append one id. False means this line is not durable and must not be sent.
+
+    True only when this call's file fsync and owed directory fsyncs succeeded.
+    A name or parent debt left by this process is not a success.
+    """
     global _LEDGER_NAME_FSYNC_OWED, _LEDGER_PARENT_FSYNC_OWED
     _bind_process_to_ledger_path()
     path = order_ledger_path()
@@ -345,7 +592,7 @@ def _append_ledger_line(row: Dict[str, Any], *, marker_ready: bool = False) -> b
         os.write(descriptor, (json.dumps(row) + "\n").encode("utf-8"))
         os.fsync(descriptor)
         file_synced = True
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
         logger.warning("order ledger append failed: %s", exc)
     finally:
         if descriptor is not None:
@@ -366,6 +613,109 @@ def _append_ledger_line(row: Dict[str, Any], *, marker_ready: bool = False) -> b
     ):
         _release_marker_if_journal_has_owed()
     return file_synced and not _LEDGER_NAME_FSYNC_OWED and not _LEDGER_PARENT_FSYNC_OWED
+
+
+def append_durable_row(row: Dict[str, Any]) -> bool:
+    """Append one close line. False means do not send.
+
+    Today's append return is not a signal. This flag is True only after the file
+    fsync of this call and after any name or parent-directory debt is cleared.
+    The lock stays outside _append_ledger_line: that function does not take it.
+    """
+    with LEDGER_LOCK:
+        try:
+            return _append_ledger_line(row)
+        except (OSError, TypeError, ValueError):
+            return False
+
+
+def numeric_ts(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def merge_ledger_lines(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """One view per order_id. sent=true on any durable line wins. executor_id only if a line has it."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        order_id = row.get("order_id")
+        if not order_id or numeric_ts(row.get("ts")) is None:
+            continue
+        item = merged.setdefault(str(order_id), {"order_id": str(order_id)})
+        if row.get("executor_id"):
+            item["executor_id"] = row["executor_id"]
+        if row.get("price") not in (None, ""):
+            item["price"] = row["price"]
+        if row.get("role"):
+            item["role"] = row["role"]
+        if row.get("level_id"):
+            item["level_id"] = row["level_id"]
+        if row.get("sent") is True or row.get("sent") == "true":
+            item["sent"] = True
+        elif row.get("sent") is False and item.get("sent") is not True:
+            item["sent"] = False
+        item["ts"] = numeric_ts(row.get("ts"))
+    return merged
+
+
+def is_proven_close_row(item: Dict[str, Any]) -> bool:
+    """A close we may keep out of entry seating. A role-less line is not this."""
+    return item.get("role") in ("close", "market_close", "close_order")
+
+
+def is_close_ledger_row(item: Dict[str, Any]) -> bool:
+    """Whether a line may block a second close.
+
+    A remember_order_now line has executor_id and no role. That is still an
+    entry until the side is read as a close. It must stay seatable.
+    """
+    role = item.get("role")
+    if role in ("open", "open_order"):
+        return False
+    if is_proven_close_row(item):
+        return True
+    if item.get("executor_id"):
+        return False
+    return bool(item.get("order_id")) and numeric_ts(item.get("ts")) is not None
+
+
+def read_merged_ledger() -> Dict[str, Dict[str, Any]]:
+    """Full lines. A read error is raised, not an empty book."""
+    return merge_ledger_lines(read_ledger_filtered())
+
+
+def _hold_role(checkpoint: Dict[str, Any], order_id: str) -> Optional[str]:
+    for item in checkpoint.get(CLOSE_HOLD_KEY) or []:
+        if isinstance(item, dict) and str(item.get("order_id")) == str(order_id):
+            return item.get("role")
+    return None
+
+
+def close_hold_ids(checkpoint: Optional[Dict[str, Any]]) -> set:
+    if not checkpoint:
+        return set()
+    found = set()
+    for item in checkpoint.get(CLOSE_HOLD_KEY) or []:
+        if isinstance(item, dict) and item.get("order_id"):
+            found.add(str(item["order_id"]))
+        elif item:
+            found.add(str(item))
+    return found
+
+
+def strip_close_holds_from_saved(checkpoint: Dict[str, Any]) -> None:
+    """A hold must not be an open the next resume seats by price."""
+    held = close_hold_ids(checkpoint)
+    if not held:
+        return
+    retained = []
+    for saved in checkpoint.get("retained_orders") or []:
+        if saved.get("order_id") not in held:
+            retained.append(saved)
+    checkpoint["retained_orders"] = retained
+    # An entry already on a level stays. A close hold is not seated by clearing it.
 
 
 def remember_order_now(executor_id: str, order_id: Optional[str]) -> None:
@@ -482,6 +832,8 @@ def reset_ledger_process_state() -> None:
     """Drop this process's memory of the ledger. The marker file stays."""
     global _MARKER_FD, _MARKER_FD_PATH, _MARKER_NAME_SYNCED, _MARKER_UNLINK_DIR_OWED
     global _LEDGER_NAME_FSYNC_OWED, _LEDGER_PARENT_FSYNC_OWED, _BOUND_LEDGER_PATH
+    global _PARTIAL_ABSENT
+    _PARTIAL_ABSENT = set()
     if _MARKER_FD is not None:
         try:
             os.close(_MARKER_FD)
@@ -516,12 +868,38 @@ def _bind_marker_fd() -> None:
     _MARKER_FD_PATH = path
 
 
+# Ids a full read proved the exchange never accepted. The marker file is not rewritten.
+_PARTIAL_ABSENT: set = set()
+
+
+def note_partial_absent(order_id: Optional[str]) -> None:
+    """Skip one owed id on read. Do not unlink or rewrite the marker file."""
+    if order_id:
+        _PARTIAL_ABSENT.add(str(order_id))
+
+
+def _marker_debt_is_only_absent() -> bool:
+    if not _PARTIAL_ABSENT or not os.path.exists(ledger_debt_marker()):
+        return False
+    owed = owed_records()
+    if owed is None:
+        return False
+    return not any(str(item.get("order_id") or "") not in _PARTIAL_ABSENT for item in owed)
+
+
 def buy_blocked() -> bool:
     """A live marker, or a directory entry not yet durable, is not permission to buy."""
     _bind_process_to_ledger_path()
     if _MARKER_UNLINK_DIR_OWED or _LEDGER_NAME_FSYNC_OWED or _LEDGER_PARENT_FSYNC_OWED:
         return True
-    return os.path.exists(ledger_debt_marker())
+    if not os.path.exists(ledger_debt_marker()):
+        return False
+    if not _PARTIAL_ABSENT:
+        return True
+    owed = owed_records()
+    if owed is None:
+        return True
+    return any(str(item.get("order_id") or "") not in _PARTIAL_ABSENT for item in owed)
 
 
 def _marker_name_synced() -> bool:
@@ -759,15 +1137,19 @@ def _recover_folder_debt_locked() -> bool:
 def ledger_order_ids() -> Optional[set]:
     """Every id still in the file. None means the file was not read or marker debt survived."""
     _bind_process_to_ledger_path()
-    if os.path.exists(ledger_debt_marker()) or _MARKER_UNLINK_DIR_OWED:
+    if _LEDGER_NAME_FSYNC_OWED or _LEDGER_PARENT_FSYNC_OWED or _MARKER_UNLINK_DIR_OWED:
         return None
-    if _LEDGER_NAME_FSYNC_OWED or _LEDGER_PARENT_FSYNC_OWED:
+    if os.path.exists(ledger_debt_marker()) and not _marker_debt_is_only_absent():
         return None
     try:
         rows = _read_ledger()
     except _LedgerReadError:
         return None
-    return {item.get("order_id") for item in rows if item.get("order_id")}
+    return {
+        item.get("order_id")
+        for item in rows
+        if item.get("order_id") and str(item.get("order_id")) not in _PARTIAL_ABSENT
+    }
 
 
 def owed_records() -> Optional[List[Dict[str, Any]]]:
@@ -847,7 +1229,7 @@ def recent_order_ids(executor_id: str) -> List[str]:
     if not executor_id:
         return []
     try:
-        rows = _read_ledger()
+        rows = read_ledger_filtered()
     except _LedgerReadError:
         logger.warning("order ledger unreadable during resume; no extra ids")
         return []
@@ -877,7 +1259,7 @@ def accounted_orders(executor_id: str, checkpoint: Optional[Dict[str, Any]] = No
         return {}
     found: Dict[str, Any] = {}
     try:
-        rows = _read_ledger()
+        rows = read_ledger_filtered()
     except _LedgerReadError:
         logger.warning("order ledger unreadable during resume; holds still lead")
         rows = []
@@ -1035,8 +1417,13 @@ def merge_ledger(body: Dict[str, Any], ledger: Dict[str, Dict[str, Any]]) -> Dic
                     fresher = ledger.get(item["order_id"])
                     if fresher and fresher.get("filled"):
                         level[key] = _saved_order_payload(fresher)
+        marked = {
+            str(item.get("order_id"))
+            for item in body.get("holds") or []
+            if isinstance(item, dict) and item.get("status") == "canceled" and item.get("base") == "0"
+        }
         for row in kept:
-            if row["order_id"] in used:
+            if row["order_id"] in used or str(row["order_id"]) in marked:
                 continue
             role = row.get("role") if row.get("role") in ("open_order", "close_order") else "open_order"
             target = next((level for level in body.get("levels") or [] if level.get("id") == row.get("level_id")), None)
@@ -1183,7 +1570,10 @@ def _saved_ids(checkpoint: Dict[str, Any]) -> set:
     for saved in checkpoint.get("retained_orders") or []:
         if saved.get("order_id"):
             claimed.add(saved["order_id"])
-    return claimed
+    return claimed - {
+        item for item in close_hold_ids(checkpoint)
+        if _hold_role(checkpoint, item) in ("close", "market_close", "close_order")
+    }
 
 
 def merge_recent_ids(checkpoint: Dict[str, Any], order_ids: List[str]) -> Dict[str, Any]:
@@ -1251,6 +1641,78 @@ def _side_name(raw: Any) -> Optional[str]:
     return None
 
 
+def resolve_close_bans(
+    checkpoint: Dict[str, Any],
+    live_orders: List[Any],
+    side_name: Optional[str],
+    column_ids: Optional[set] = None,
+) -> set:
+    """A role-less line is an entry only when the fresh list says so.
+
+    Moves ids whose side reads as the grid entry side into retained_orders and
+    returns the bans that stay. column_ids, when given, loses those ids too, so
+    a read entry does not block every level's first close forever.
+    """
+    bans = [str(item) for item in checkpoint.get(CLOSE_BAN_KEY) or [] if item]
+    if not bans:
+        return set()
+    live_by_id = {}
+    for order in live_orders:
+        order_id = getattr(order, "client_order_id", None) or _order_id(order)
+        if order_id:
+            live_by_id[str(order_id)] = order
+    kept = []
+    entries = []
+    for order_id in bans:
+        order = live_by_id.get(order_id)
+        side = _order_side(order) if order is not None else None
+        if side is not None and side_name is not None and side == side_name:
+            entries.append(order_id)
+        else:
+            kept.append(order_id)
+    if entries:
+        retained = list(checkpoint.get("retained_orders") or [])
+        known = {item.get("order_id") for item in retained if isinstance(item, dict)}
+        for order_id in entries:
+            if order_id not in known:
+                retained.append({
+                    "order_id": order_id, "filled": False, "order": None, "role": "open_order",
+                })
+        checkpoint["retained_orders"] = retained
+        checkpoint[CLOSE_BAN_KEY] = kept
+        if column_ids is not None:
+            column_ids.difference_update(entries)
+    return set(kept)
+
+
+def restore_close_memory(executor: Any, checkpoint: Dict[str, Any], restore_ids: List[str]) -> None:
+    """Put the post-resolve ban back after a thrown seating.
+
+    restore_ids are the bans resolve left (a read entry is not among them).
+    Ids a partial apply already added to the checkpoint stay: the ban list is
+    merged, never replaced. The snapshot after start keeps every id.
+    """
+    target = {str(item) for item in restore_ids if item}
+    target.update(
+        str(item) for item in checkpoint.get(CLOSE_BAN_KEY) or [] if item
+    )
+    checkpoint[CLOSE_BAN_KEY] = sorted(target)
+    holds = list(getattr(executor, "_close_holds", []) or [])
+    known = {item.get("order_id") for item in holds}
+    for item in checkpoint.get(CLOSE_HOLD_KEY) or []:
+        order_id = item.get("order_id") if isinstance(item, dict) else None
+        if order_id and order_id not in known:
+            holds.append(item if isinstance(item, dict) else {"order_id": order_id})
+            known.add(order_id)
+    executor._close_holds = holds
+    bans = set(getattr(executor, "_close_ban_ids", set()) or set())
+    bans.update(target)
+    executor._close_ban_ids = bans
+    column_ids = set(getattr(executor, "_column_close_ids", set()) or set())
+    column_ids.update(bans)
+    executor._column_close_ids = column_ids
+
+
 def _order_side(order: Any) -> Optional[str]:
     if isinstance(order, dict):
         return _side_name(order.get("side") or order.get("trade_type"))
@@ -1291,6 +1753,8 @@ def seat_known_opens(
     for order in live_orders:
         order_id = _order_id(order)
         if not order_id or order_id not in allowed_ids or order_id in claimed or not _is_open(order):
+            continue
+        if order_id in _close_slot_ids(levels):
             continue
         side = _order_side(order)
         if side is None:
@@ -1497,6 +1961,7 @@ def apply_checkpoint(executor: Any, checkpoint: Dict[str, Any], live_orders: Lis
     kind = checkpoint.get("type")
 
     if kind == "grid_executor":
+        strip_close_holds_from_saved(checkpoint)
         seat_known_opens(
             checkpoint.get("levels") or [],
             live_orders,
@@ -1514,10 +1979,33 @@ def apply_checkpoint(executor: Any, checkpoint: Dict[str, Any], live_orders: Lis
                 take_profit_order_type=OrderType[raw["take_profit_order_type"]],
             )
             level.active_open_order = _attach(raw.get("open_order"), live_by_id)
-            level.active_close_order = _attach(raw.get("close_order"), live_by_id)
+            close_raw = raw.get("close_order") or {}
+            partial_close = (
+                close_raw.get("order_id")
+                and close_raw.get("level_id")
+                and close_raw.get("price") not in (None, "")
+            )
+            if partial_close:
+                level.active_close_order = _attach_close_slot(close_raw, live_by_id)
+            elif level.active_open_order is not None:
+                level.active_close_order = _attach(raw.get("close_order"), live_by_id)
+            else:
+                bare = close_raw.get("order_id")
+                if bare:
+                    bans = list(checkpoint.get(CLOSE_BAN_KEY) or [])
+                    if bare not in bans:
+                        bans.append(bare)
+                    checkpoint[CLOSE_BAN_KEY] = bans
             restored.append(level)
         executor.grid_levels = restored
         executor._close_order = _attach(checkpoint.get("close_order"), live_by_id)
+        if executor._close_order is None:
+            for item in checkpoint.get(CLOSE_HOLD_KEY) or []:
+                if isinstance(item, dict) and item.get("role") == "market_close" and item.get("order_id"):
+                    executor._close_order = _attach({"order_id": item["order_id"]}, live_by_id)
+                    break
+        executor._close_holds = list(checkpoint.get(CLOSE_HOLD_KEY) or [])
+        executor._partial_seated = True
         if hasattr(executor, "update_grid_levels"):
             executor.update_grid_levels()
         seed_ledger(executor, checkpoint)
@@ -2657,12 +3145,112 @@ def history_covers_ts(request: Optional[Dict[str, Any]], ts: Any, page: Optional
         return True
     params = (request or {}).get("params") or {}
     if "from" not in params or "to" not in params:
-        return False
+        return _okx_window_covers(params, ts)
     try:
         moment = float(ts)
     except (TypeError, ValueError):
         return False
     return float(params["from"]) <= moment <= float(params["to"])
+
+
+def _okx_window_covers(params: Dict[str, Any], ts: Any) -> bool:
+    """OKX begin/end are milliseconds. The mark is seconds. Gate has neither key."""
+    if "begin" not in params or "end" not in params:
+        return False
+    try:
+        moment = float(ts)
+        begin = int(params["begin"]) / 1000
+        end = int(params["end"]) / 1000
+    except (TypeError, ValueError):
+        return False
+    return begin <= moment <= end
+
+
+_OKX_CLOSED_STATES = {"filled", "canceled", "mmp_canceled"}
+OKX_HISTORY_MS = 7 * 24 * 60 * 60 * 1000
+OKX_ARCHIVE_MS = 90 * 24 * 60 * 60 * 1000
+
+
+def okx_closed_request(
+    symbol: str,
+    after: Optional[str] = None,
+    now: Optional[float] = None,
+    begin: Optional[str] = None,
+    end: Optional[str] = None,
+    inst_type: str = "SWAP",
+    archive: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Full 7-day closed list. begin is never a known mark."""
+    if not symbol:
+        return None
+    if begin is None or end is None:
+        moment = time.time() if now is None else float(now)
+        end_ms = int(moment * 1000)
+        begin = str(end_ms - OKX_HISTORY_MS)
+        end = str(end_ms)
+    params = {
+        "instType": inst_type,
+        "instId": symbol,
+        "limit": str(OPEN_PAGE_LIMIT),
+        "begin": str(begin),
+        "end": str(end),
+    }
+    if after:
+        params["after"] = str(after)
+    return {
+        "path": "/api/v5/trade/orders-history-archive" if archive else "/api/v5/trade/orders-history",
+        "params": params,
+        "is_auth_required": True,
+    }
+
+
+def parse_okx_closed_page(body: Any, begin_ms: int, end_ms: int) -> Dict[str, Any]:
+    """Closed page. Do not use the open parser: it drops filled and canceled."""
+    if not isinstance(body, dict) or str(body.get("code")) != "0" or not isinstance(body.get("data"), list):
+        return _unread_page()
+    data = body["data"]
+    orders = []
+    for row in data:
+        if not isinstance(row, dict):
+            return _unread_page()
+        px = row.get("px")
+        if px in (None, ""):
+            continue
+        state = str(row.get("state") or "")
+        if state not in _OKX_CLOSED_STATES:
+            return _unread_page()
+        try:
+            created = int(str(row.get("cTime")))
+        except (TypeError, ValueError):
+            return _unread_page()
+        if created < int(begin_ms) or created > int(end_ms):
+            return _unread_page()
+        client_id = row.get("clOrdId")
+        fill_raw = str(row.get("accFillSz") or "0")
+        try:
+            float(fill_raw)
+            fill_size = fill_raw
+        except (TypeError, ValueError):
+            fill_size = "0"
+        item = {
+            "order_id": "" if not client_id else str(client_id),
+            "price": str(px),
+            "side": _exchange_side(row.get("side")),
+            "unknown_side": _exchange_side(row.get("side")) is None,
+            "ts": created,
+            "state": state,
+            "fill_size": fill_size,
+        }
+        if client_id:
+            item["text"] = str(client_id)
+        orders.append(item)
+    if len(data) >= OPEN_PAGE_LIMIT:
+        last = data[-1]
+        cursor = last.get("ordId") if isinstance(last, dict) else None
+        if not cursor:
+            return _unread_page()
+        return _page(orders, done=False, cursor=str(cursor))
+    return _page(orders, done=True, cursor=None)
 
 
 def gate_delete_request(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2737,6 +3325,59 @@ def checkpoint_keeping_holds(read_text: Optional[str], captured: Dict[str, Any])
                 holds.append(item)
         if holds:
             body["holds"] = holds
+        for key in ("close_holds", "close_bans"):
+            current = list(body.get(key) or [])
+            known = set()
+            for item in current:
+                if isinstance(item, dict) and item.get("order_id"):
+                    known.add(str(item.get("order_id")))
+                elif item:
+                    known.add(str(item))
+            for item in previous.get(key) or []:
+                token = str(item.get("order_id")) if isinstance(item, dict) else str(item or "")
+                if token and token not in known:
+                    current.append(item)
+                    known.add(token)
+            if current:
+                body[key] = current
+        marked = {
+            str(item.get("order_id"))
+            for item in holds
+            if isinstance(item, dict) and item.get("status") == "canceled" and item.get("base") == "0"
+        }
+        for level in body.get("levels") or []:
+            if not isinstance(level, dict):
+                continue
+            open_id = str((level.get("open_order") or {}).get("order_id") or "")
+            if open_id and open_id in marked:
+                level["open_order"] = {}
+        apply_partial_keep(body, previous)
+        for key in ("close_holds", "close_bans"):
+            current = list(body.get(key) or [])
+            known = set()
+            for item in current:
+                if isinstance(item, dict) and item.get("order_id"):
+                    known.add(str(item.get("order_id")))
+                elif item:
+                    known.add(str(item))
+            for item in previous.get(key) or []:
+                token = str(item.get("order_id")) if isinstance(item, dict) else str(item or "")
+                if token and token not in known:
+                    current.append(item)
+                    known.add(token)
+            if current:
+                body[key] = current
+        marked = {
+            str(item.get("order_id"))
+            for item in holds
+            if isinstance(item, dict) and item.get("status") == "canceled" and item.get("base") == "0"
+        }
+        for level in body.get("levels") or []:
+            if not isinstance(level, dict):
+                continue
+            open_id = str((level.get("open_order") or {}).get("order_id") or "")
+            if open_id and open_id in marked:
+                level["open_order"] = {}
     return json.dumps(body, sort_keys=True)
 
 
@@ -2769,3 +3410,1181 @@ def _merge_without_dropping(read_text: Optional[str], captured: Dict[str, Any]) 
     if read_text and not _keeps_previous_fields(base, merged):
         return None
     return json.dumps(merged, sort_keys=True)
+
+
+def _pending_absent(pages: Any, order_id: str) -> bool:
+    """True only when a finished pending read does not contain this id."""
+    if not isinstance(pages, list) or not pages:
+        return False
+    for index, page in enumerate(pages):
+        if not isinstance(page, dict) or str(page.get("code")) != "0":
+            return False
+        data = page.get("data")
+        if not isinstance(data, list):
+            return False
+        if any(not isinstance(row, dict) or row.get("px") in (None, "") for row in data):
+            return False
+        if len(data) >= 100 and index == len(pages) - 1:
+            return False
+        if any(str(row.get("clOrdId") or "") == order_id for row in data):
+            return False
+    return True
+
+
+def okx_mark_if_proven(
+    read_text: Optional[str],
+    order_id: str,
+    level_id: str,
+    raw: Any,
+    pages: Any,
+    in_flight: bool,
+    in_lost: bool,
+    connector_name: str = "okx_perpetual",
+) -> Optional[str]:
+    """Add a cancel hold beside the still-present open id. None means do not write."""
+    if connector_name != "okx_perpetual":
+        return None
+    if not order_id or in_flight or in_lost or not _pending_absent(pages, order_id):
+        return None
+    if not isinstance(raw, dict) or str(raw.get("code")) != "0":
+        return None
+    data = raw.get("data")
+    if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+        return None
+    row = data[0]
+    if str(row.get("clOrdId") or "") != order_id:
+        return None
+    if str(row.get("state") or "") not in ("canceled", "mmp_canceled"):
+        return None
+    if "accFillSz" not in row or str(row.get("accFillSz")) != "0":
+        return None
+    if row.get("px") in (None, ""):
+        return None
+    try:
+        current = json.loads(read_text) if read_text else {}
+    except (json.JSONDecodeError, TypeError):
+        return None
+    owns = False
+    for level in current.get("levels") or []:
+        if str(level.get("id") or "") != str(level_id):
+            continue
+        if str((level.get("open_order") or {}).get("order_id") or "") == order_id:
+            owns = True
+    if not owns:
+        return None
+    holds = [item for item in current.get("holds") or [] if isinstance(item, dict)]
+    marked = False
+    for item in holds:
+        if str(item.get("order_id") or "") != order_id:
+            continue
+        item["status"] = "canceled"
+        item["base"] = "0"
+        item["price"] = str(row.get("px"))
+        item["level_id"] = level_id
+        marked = True
+    if not marked:
+        holds.append({
+            "order_id": order_id,
+            "level_id": level_id,
+            "status": "canceled",
+            "base": "0",
+            "price": str(row.get("px")),
+        })
+    current["holds"] = holds
+    encoded = json.dumps(current, sort_keys=True)
+    if not _mark_kept(encoded, order_id, level_id):
+        return None
+    return encoded
+
+
+def _mark_kept(text: Optional[str], order_id: str, level_id: str) -> bool:
+    try:
+        body = json.loads(text or "")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    holds = body.get("holds") or []
+    mark = next((item for item in holds if str(item.get("order_id") or "") == order_id), None)
+    if not mark or mark.get("status") != "canceled" or mark.get("base") != "0":
+        return False
+    if not mark.get("price") or str(mark.get("level_id") or "") != str(level_id):
+        return False
+    found = False
+    for level in body.get("levels") or []:
+        if str(level.get("id") or "") != str(level_id):
+            continue
+        found = True
+        if str((level.get("open_order") or {}).get("order_id") or "") != order_id:
+            return False
+    if not found:
+        return False
+    return True
+
+
+async def write_okx_mark(db, executor_id, order_id, level_id, raw, pages, in_flight, in_lost, slot_id, connector_name="okx_perpetual"):
+    """One compare-and-swap, then a new session. Never clears the slot or sends."""
+    from database.repositories.executor_repository import ExecutorRepository
+
+    async def _finish(slot):
+        send = getattr(db, "send", None)
+        if send is not None and getattr(send, "calls", None):
+            raise RuntimeError("this piece must not send")
+        return slot
+
+    async with db.get_session_context() as session:
+        repo = session if hasattr(session, "replace_checkpoint_if_unchanged") else ExecutorRepository(session)
+        row = await repo.get_executor_by_id(executor_id)
+        seen = None if row is None else row.checkpoint
+        body = okx_mark_if_proven(
+            seen, order_id, level_id, raw, pages, in_flight, in_lost, connector_name,
+        )
+        if body is None:
+            return await _finish(slot_id)
+        changed = await repo.replace_checkpoint_if_unchanged(executor_id, seen, body)
+        if changed != 1:
+            raise RuntimeError("checkpoint compare-and-swap changed no row")
+    async with db.get_session_context() as session:
+        reader = session if hasattr(session, "get_executor_by_id") else ExecutorRepository(session)
+        fresh = await reader.get_executor_by_id(executor_id)
+    visible = None if fresh is None else fresh.checkpoint
+    if visible != body or not _mark_kept(visible, order_id, level_id):
+        raise RuntimeError("new session does not see the mark")
+    return await _finish(slot_id)
+
+
+def visible_cancel_ids(text: Optional[str]) -> set:
+    """Order ids whose cancel mark a new session can already see."""
+    try:
+        body = json.loads(text or "")
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    found = set()
+    for item in body.get("holds") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("status") == "canceled" and item.get("base") == "0" and item.get("price") and item.get("order_id") and item.get("level_id"):
+            found.add((str(item.get("level_id")), str(item.get("order_id"))))
+    return found
+
+
+def unhold_body(read_text: Optional[str], level_id: str) -> Optional[str]:
+    """Drop only the open id that matches this level's visible cancel mark."""
+    marks = {order_id for marked_level, order_id in visible_cancel_ids(read_text) if marked_level == str(level_id)}
+    if not marks:
+        return None
+    try:
+        body = json.loads(read_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    changed = False
+    for level in body.get("levels") or []:
+        if str(level.get("id") or "") != str(level_id):
+            continue
+        open_id = str((level.get("open_order") or {}).get("order_id") or "")
+        if open_id and open_id in marks:
+            level["open_order"] = {}
+            changed = True
+    if not changed:
+        return None
+    return json.dumps(body, sort_keys=True)
+
+
+def _open_id_matching_mark(text: Optional[str], level_id: str) -> Optional[str]:
+    marks = {order_id for marked_level, order_id in visible_cancel_ids(text) if marked_level == str(level_id)}
+    try:
+        body = json.loads(text or "")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    for level in body.get("levels") or []:
+        if str(level.get("id") or "") != str(level_id):
+            continue
+        open_id = str((level.get("open_order") or {}).get("order_id") or "")
+        if open_id and open_id in marks:
+            return open_id
+    return None
+
+
+def _mark_visible_and_open_gone(text: Optional[str], level_id: str, order_id: str) -> bool:
+    if not order_id or not any(mark == (str(level_id), order_id) for mark in visible_cancel_ids(text)):
+        return False
+    try:
+        body = json.loads(text or "")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    for level in body.get("levels") or []:
+        if str(level.get("id") or "") != str(level_id):
+            continue
+        return str((level.get("open_order") or {}).get("order_id") or "") != order_id
+    return False
+
+
+async def write_unhold(db, executor_id, level_id, slot):
+    """Clear one slot only after a new session sees the mark and the emptied open."""
+    from database.repositories.executor_repository import ExecutorRepository
+
+    async with db.get_session_context() as session:
+        repo = session if hasattr(session, "replace_checkpoint_if_unchanged") else ExecutorRepository(session)
+        row = await repo.get_executor_by_id(executor_id)
+        seen = None if row is None else row.checkpoint
+        current_id = str(getattr(getattr(slot, "active_open_order", None), "order_id", None) or getattr(slot, "active_open_order", "") or "")
+        removed = _open_id_matching_mark(seen, level_id)
+        if removed and current_id and current_id != removed:
+            return slot
+        if removed is None:
+            if _mark_visible_and_open_gone(seen, level_id, current_id) and slot is not None:
+                slot.active_open_order = None
+            return slot
+        body = unhold_body(seen, level_id)
+        if body is None:
+            return slot
+        changed = await repo.replace_checkpoint_if_unchanged(executor_id, seen, body)
+        if changed != 1:
+            raise RuntimeError("checkpoint compare-and-swap changed no row")
+    async with db.get_session_context() as session:
+        reader = session if hasattr(session, "get_executor_by_id") else ExecutorRepository(session)
+        fresh = await reader.get_executor_by_id(executor_id)
+    visible = None if fresh is None else fresh.checkpoint
+    if visible != body or not any(mark[0] == str(level_id) for mark in visible_cancel_ids(visible)):
+        raise RuntimeError("new session does not see the unhold")
+    if slot is not None and current_id == removed and _mark_visible_and_open_gone(visible, level_id, removed):
+        slot.active_open_order = None
+    send = getattr(db, "send", None)
+    if send is not None and getattr(send, "calls", None):
+        raise RuntimeError("this piece must not send")
+    return slot
+
+
+def install_unhold_guard(executor, read_column) -> None:
+    """After the open shell. A visible mark returns before send."""
+    original_open = getattr(executor, "get_open_orders_to_create", None)
+    original_adjust = getattr(executor, "adjust_and_place_open_order", None)
+
+    def wrapped_open():
+        text = read_column()
+        offered = original_open() if original_open is not None else []
+        if text is None:
+            return offered
+        return skip_marked_levels(offered, text)
+
+    def wrapped_adjust(level, *args, **kwargs):
+        text = read_column()
+        level_id = str(getattr(level, "id", "") or "")
+        if text is not None and any(mark[0] == level_id for mark in visible_cancel_ids(text)):
+            return None
+        if original_adjust is None:
+            return None
+        return original_adjust(level, *args, **kwargs)
+
+    if original_open is not None:
+        executor.get_open_orders_to_create = wrapped_open
+    if original_adjust is not None:
+        executor.adjust_and_place_open_order = wrapped_adjust
+
+
+def skip_marked_levels(levels, text: Optional[str]):
+    """Do not offer a level whose cancel mark a new session can see."""
+    marked = {level_id for level_id, _order_id in visible_cancel_ids(text)}
+    if text is None:
+        return []
+    return [level for level in levels if str(getattr(level, "id", "") or "") not in marked]
+
+
+# One channel for this close call. Empty means the connector mints its own id.
+_RESERVED_CLOSE_ID: ContextVar[Optional[str]] = ContextVar("reserved_close_id", default=None)
+_WRAPPED_CONNECTORS: set = set()
+
+
+def durable_sent_true(order_id: str) -> bool:
+    merged = read_merged_ledger().get(str(order_id)) or {}
+    return merged.get("sent") is True
+
+
+def line_for_send(
+    executor_id: str,
+    order_id: str,
+    role: str,
+    level_id: Optional[str] = None,
+    sent: bool = False,
+    price: Any = None,
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "executor_id": executor_id,
+        "order_id": order_id,
+        "ts": time.time(),
+        "role": role,
+        "sent": sent,
+    }
+    if level_id:
+        row["level_id"] = level_id
+    if price not in (None, ""):
+        row["price"] = str(price)
+    return row
+
+
+def install_connector_close_channel(connector: Any) -> None:
+    """One wrapper per connector for the process. An empty channel still mints."""
+    if connector is None or id(connector) in _WRAPPED_CONNECTORS:
+        return
+    _WRAPPED_CONNECTORS.add(id(connector))
+
+    def _wrap(name: str) -> None:
+        original = getattr(connector, name, None)
+        if original is None or getattr(original, "_close_channel", False):
+            return
+
+        def wrapped(*args, **kwargs):
+            reserved = _RESERVED_CLOSE_ID.get()
+            if not reserved:
+                return original(*args, **kwargs)
+            create = getattr(connector, "_create_order", None)
+            if create is None:
+                return reserved
+            try:
+                from hummingbot.core.utils.async_utils import safe_ensure_future
+                trade = "BUY" if name == "buy" else "SELL"
+                safe_ensure_future(create(
+                    trade_type=trade,
+                    order_id=reserved,
+                    trading_pair=args[0] if args else kwargs.get("trading_pair"),
+                    amount=args[1] if len(args) > 1 else kwargs.get("amount"),
+                    order_type=args[2] if len(args) > 2 else kwargs.get("order_type"),
+                    price=args[3] if len(args) > 3 else kwargs.get("price"),
+                ))
+            except Exception:
+                logger.exception("close channel could not queue _create_order")
+                return reserved
+            return reserved
+
+        wrapped._close_channel = True
+        setattr(connector, name, wrapped)
+
+    _wrap("buy")
+    _wrap("sell")
+
+
+def hold_ids_of(executor: Any) -> set:
+    found = set()
+    for item in getattr(executor, "_close_holds", []) or []:
+        if isinstance(item, dict) and item.get("order_id"):
+            found.add(str(item["order_id"]))
+    return found
+
+
+def remember_hold(executor: Any, order_id: str, **fields: Any) -> None:
+    holds = list(getattr(executor, "_close_holds", []) or [])
+    for item in holds:
+        if item.get("order_id") == order_id:
+            item.update({key: value for key, value in fields.items() if value is not None})
+            executor._close_holds = holds
+            return
+    row = {"order_id": order_id}
+    row.update({key: value for key, value in fields.items() if value is not None})
+    holds.append(row)
+    executor._close_holds = holds
+
+
+def place_level_close(executor: Any, executor_id: str, level: Any) -> Optional[str]:
+    """One level close. No True, no exchange call."""
+    from hummingbot.core.data_type.common import OrderType, TradeType
+
+    level_id = getattr(level, "id", None)
+    if not level_id or getattr(level, "active_open_order", None) is None:
+        return None
+    refuse_bare = getattr(executor, "_refuse_unpriced_close", None)
+    if refuse_bare is not None and refuse_bare():
+        return None
+    refuse = getattr(executor, "_refuse_close_price", None)
+    if refuse is not None and refuse(getattr(level, "price", None)):
+        return None
+    owns = getattr(executor, "_partial_owns_level", None)
+    if owns is not None and owns(level):
+        return None
+    connector = getattr(getattr(executor, "_strategy", None), "connectors", None)
+    order_id = getattr(executor, "_next_close_id", None)
+    if order_id is None:
+        try:
+            from hummingbot.connector.utils import get_new_client_order_id
+            market = _executor_connector(executor)
+            order_id = get_new_client_order_id(
+                is_buy=False,
+                trading_pair=executor.config.trading_pair,
+                hbot_order_id_prefix=getattr(market, "client_order_id_prefix", ""),
+                max_id_len=getattr(market, "client_order_id_max_length", 32),
+            )
+        except Exception:
+            return None
+    price = getattr(level, "price", None)
+    quiet = line_for_send(executor_id, order_id, "close", level_id=str(level_id), sent=False, price=price)
+    if not append_durable_row(quiet):
+        return None
+    sent = line_for_send(executor_id, order_id, "close", level_id=str(level_id), sent=True, price=price)
+    if not append_durable_row(sent):
+        return None
+    token = _RESERVED_CLOSE_ID.set(order_id)
+    try:
+        market = _executor_connector(executor)
+        install_connector_close_channel(market)
+        side = getattr(level, "side", None)
+        if refuse_bare is not None and refuse_bare():
+            return None
+        method = market.buy if side == TradeType.SELL else market.sell
+        method(
+            executor.config.trading_pair,
+            getattr(level, "amount_quote", 0),
+            OrderType.LIMIT,
+            getattr(level, "price", 0),
+        )
+    finally:
+        _RESERVED_CLOSE_ID.reset(token)
+    remember_hold(executor, order_id, role="close", level_id=str(level_id), price=price)
+    tracked = type("Tracked", (), {})()
+    tracked.order_id = order_id
+    tracked.order = None
+    tracked.price = price
+    level.active_close_order = tracked
+    return order_id
+
+
+def _mint_close_id(executor: Any, is_buy: bool) -> Optional[str]:
+    market = _executor_connector(executor)
+    config = getattr(executor, "config", None)
+    pair = getattr(config, "trading_pair", None)
+    if market is None or not pair:
+        return None
+    try:
+        from hummingbot.connector.utils import get_new_client_order_id
+        return get_new_client_order_id(
+            is_buy=is_buy,
+            trading_pair=pair,
+            hbot_order_id_prefix=getattr(market, "client_order_id_prefix", ""),
+            max_id_len=getattr(market, "client_order_id_max_length", 32),
+        )
+    except Exception:
+        return None
+
+
+def place_market_close(executor: Any, executor_id: str) -> Optional[str]:
+    """One market flatten. Original place_order is not called."""
+    refuse_market = getattr(executor, "_refuse_market_close", None)
+    if refuse_market is not None and refuse_market():
+        return None
+    refuse_bare = getattr(executor, "_refuse_unpriced_close", None)
+    if refuse_bare is not None and refuse_bare():
+        return None
+    order_id = getattr(executor, "_next_close_id", None) or _mint_close_id(executor, is_buy=False)
+    if not order_id:
+        return None
+    quiet = line_for_send(executor_id, order_id, "market_close", sent=False)
+    if not append_durable_row(quiet):
+        return None
+    if not append_durable_row(line_for_send(executor_id, order_id, "market_close", sent=True)):
+        return None
+    token = _RESERVED_CLOSE_ID.set(order_id)
+    try:
+        market = _executor_connector(executor)
+        if market is not None:
+            install_connector_close_channel(market)
+            market.sell(executor.config.trading_pair, 1, None, None)
+    finally:
+        _RESERVED_CLOSE_ID.reset(token)
+    remember_hold(executor, order_id, role="market_close")
+    tracked = type("Tracked", (), {})()
+    tracked.order_id = order_id
+    tracked.order = None
+    executor._close_order = tracked
+    return order_id
+
+
+def _executor_connector(executor: Any) -> Any:
+    strategy = getattr(executor, "_strategy", None)
+    name = getattr(getattr(executor, "config", None), "connector_name", None)
+    if strategy is None or name is None:
+        return None
+    getter = getattr(strategy, "connectors", None)
+    if isinstance(getter, dict):
+        return getter.get(name)
+    return None
+
+
+def install_close_without_level(executor: Any, executor_id: str) -> bool:
+    """Fail-closed brake. False means start must not run.
+
+    Occupied-open only wraps get_open_orders_to_create. This one wraps closes.
+    """
+    if getattr(executor, "_close_brake", False):
+        return True
+    original_get = getattr(executor, "get_close_orders_to_create", None)
+    original_control = getattr(executor, "control_close_order", None)
+    original_shutdown = getattr(executor, "control_shutdown_process", None)
+    original_adjust = getattr(executor, "adjust_and_place_close_order", None)
+    original_market = getattr(executor, "place_close_order_and_cancel_open_orders", None)
+    original_loop = getattr(executor, "control_loop", None)
+    if original_get is None or original_control is None or original_shutdown is None:
+        return False
+
+    def blocked() -> bool:
+        if not getattr(executor, "_close_seat_ready", False):
+            return True
+        if not getattr(executor, "_close_list_ready", False):
+            return True
+        if hold_ids_of(executor) or getattr(executor, "_close_ban_ids", None):
+            return True
+        if getattr(executor, "_column_close_ids", None):
+            return True
+        close = getattr(executor, "_close_order", None)
+        if getattr(close, "order_id", None):
+            return True
+        for level in getattr(executor, "grid_levels", []) or []:
+            seated = getattr(level, "active_close_order", None)
+            if getattr(seated, "order_id", None):
+                return True
+        return False
+
+    def get_close(*args, **kwargs):
+        if blocked():
+            return []
+        return original_get(*args, **kwargs)
+
+    async def control_close(*args, **kwargs):
+        if blocked():
+            return None
+        return await original_control(*args, **kwargs)
+
+    async def control_shutdown(*args, **kwargs):
+        if blocked():
+            return None
+        return await original_shutdown(*args, **kwargs)
+
+    def adjust(level, *args, **kwargs):
+        if blocked():
+            return None
+        owns = getattr(executor, "_partial_owns_level", None)
+        if owns is not None and owns(level):
+            return None
+        refuse = getattr(executor, "_refuse_close_price", None)
+        if refuse is not None and refuse(getattr(level, "price", None)):
+            return None
+        return place_level_close(executor, executor_id, level)
+
+    async def control_loop(*args, **kwargs):
+        try:
+            return await original_loop(*args, **kwargs)
+        except Exception:
+            if hold_ids_of(executor) or not getattr(executor, "_close_seat_ready", False):
+                logger.exception("close hold kept the executor after on_start failed")
+                return None
+            raise
+
+    executor.get_close_orders_to_create = get_close
+    executor.control_close_order = control_close
+    executor.control_shutdown_process = control_shutdown
+    def market(*args, **kwargs):
+        if blocked():
+            return None
+        return place_market_close(executor, executor_id)
+
+    if original_adjust is not None:
+        executor.adjust_and_place_close_order = adjust
+    if original_market is not None:
+        executor.place_close_order_and_cancel_open_orders = market
+    original_stop = getattr(executor, "stop", None)
+
+    def stop(*args, **kwargs):
+        if blocked():
+            return None
+        if original_stop is None:
+            return None
+        return original_stop(*args, **kwargs)
+
+    if original_stop is not None:
+        executor.stop = stop
+    if original_loop is not None:
+        executor.control_loop = control_loop
+    executor._close_brake = True
+    executor._close_seat_ready = False
+    if not hasattr(executor, "_close_holds"):
+        executor._close_holds = []
+    return True
+
+_PARTIAL_FIVE = ("trading_pair", "order_type", "trade_type", "leverage", "position")
+
+
+def _close_slot_ids(levels: List[Dict[str, Any]]) -> set:
+    found = set()
+    for level in levels or []:
+        order_id = (level.get("close_order") or {}).get("order_id")
+        if order_id:
+            found.add(str(order_id))
+        for item in level.get("partial_closes") or []:
+            if isinstance(item, dict) and item.get("order_id"):
+                found.add(str(item.get("order_id")))
+    return found
+
+
+def _attach_close_slot(saved: Optional[Dict[str, Any]], live_by_id: Dict[str, Any]) -> Any:
+    """Seat a committed close by its text. A flat number is not a seat."""
+    tracked = _attach(saved, live_by_id)
+    if tracked is not None or not isinstance(saved, dict) or not saved.get("order_id"):
+        return tracked
+    if not saved.get("level_id") or saved.get("price") in (None, ""):
+        return None
+    from hummingbot.strategy_v2.models.executors import TrackedOrder
+    return TrackedOrder(order_id=str(saved["order_id"]))
+
+
+def partial_has_five(row: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    return all(row.get(key) not in (None, "") for key in _PARTIAL_FIVE)
+
+
+def partial_lines(rows: Optional[List[Dict[str, Any]]], order_id: str) -> List[Dict[str, Any]]:
+    return [row for row in rows or [] if str(row.get("order_id") or "") == str(order_id)]
+
+
+def partial_send_marked(rows: Optional[List[Dict[str, Any]]], order_id: str) -> bool:
+    """The second line, not a lone five-field row, is the send mark."""
+    lines = partial_lines(rows, order_id)
+    if len(lines) < 2:
+        return False
+    return any(partial_has_five(row) for row in lines[1:])
+
+
+def partial_old_remember(row: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if not row.get("order_id") or not row.get("level_id") or partial_has_five(row):
+        return False
+    return True
+
+
+def partial_annotation_line(row: Optional[Dict[str, Any]]) -> bool:
+    """A repeat annotation: the take-profit tick without any sending record."""
+    if not isinstance(row, dict):
+        return False
+    if not row.get("order_id") or not row.get("level_id"):
+        return False
+    if partial_has_five(row):
+        return False
+    if row.get("account_name") not in (None, "") or row.get("connector") not in (None, ""):
+        return False
+    return row.get("take_profit_price") not in (None, "")
+
+
+def partial_close_send_line(row: Optional[Dict[str, Any]]) -> bool:
+    """A close-send line: its price is already the take-profit tick, not a placement."""
+    if not isinstance(row, dict):
+        return False
+    if not row.get("order_id") or not row.get("level_id"):
+        return False
+    if partial_has_five(row):
+        return False
+    if row.get("account_name") not in (None, "") or row.get("connector") not in (None, ""):
+        return False
+    return row.get("take_profit_price") in (None, "")
+
+
+def partial_holding_ids(rows: Optional[List[Dict[str, Any]]], executor_id: str) -> set:
+    """Old remember and a successful send mark hold. A lone five-field row does not.
+
+    An annotation line is not its own holder when a remember or send-mark line
+    of the same id already holds it; alone, it still holds.
+    """
+    found = set()
+    if rows is None:
+        return found
+    for row in rows:
+        if row.get("executor_id") not in (None, "", executor_id):
+            continue
+        order_id = row.get("order_id")
+        level_id = row.get("level_id")
+        if not order_id or not level_id:
+            continue
+        if row.get("role") in ("close", "market_close"):
+            continue
+        if partial_send_marked(rows, str(order_id)):
+            found.add(str(order_id))
+            continue
+        if not partial_old_remember(row):
+            continue
+        if partial_annotation_line(row) and any(
+            partial_old_remember(item) and not partial_annotation_line(item)
+            for item in partial_lines(rows, str(order_id))
+            if item is not row
+        ):
+            continue
+        found.add(str(order_id))
+    return found
+
+
+def partial_hold_kinds(
+    rows: Optional[List[Dict[str, Any]]],
+    parsed: Optional[Dict[str, Any]],
+    executor_id: str,
+) -> Dict[str, str]:
+    """For each held id without a visible end: which kind of line holds it."""
+    kinds: Dict[str, str] = {}
+    if rows is None:
+        return kinds
+    for order_id in partial_holding_ids(rows, executor_id):
+        if parsed is not None and partial_end_visible(parsed, str(order_id)):
+            continue
+        if partial_send_marked(rows, str(order_id)):
+            kinds[str(order_id)] = "send-mark"
+        elif any(
+            partial_old_remember(item) and not partial_annotation_line(item)
+            for item in partial_lines(rows, str(order_id))
+        ):
+            kinds[str(order_id)] = "remember"
+        else:
+            kinds[str(order_id)] = "annotation-only"
+    return kinds
+
+
+def partial_column_hold_levels(parsed: Optional[Dict[str, Any]]) -> List[str]:
+    """Level ids whose open or close slot still holds without a release mark."""
+    found: List[str] = []
+    for level in (parsed or {}).get("levels") or []:
+        if not isinstance(level, dict) or not level.get("id"):
+            continue
+        if partial_level_released(parsed, str(level.get("id"))):
+            continue
+        slot = level.get("open_order") or {}
+        close = level.get("close_order") or {}
+        if slot.get("order_id") and slot.get("level_id") and not partial_end_visible(parsed, str(slot.get("order_id"))):
+            found.append(str(level.get("id")))
+        elif close.get("order_id") and close.get("level_id"):
+            found.append(str(level.get("id")))
+    return found
+
+
+def partial_released_ids(parsed: Optional[Dict[str, Any]]) -> set:
+    ends = (parsed or {}).get("partial_ends") or {}
+    found = set(str(key) for key in ends)
+    for mark in ends.values():
+        if isinstance(mark, dict):
+            found.update(str(item) for item in (mark.get("order_ids") or []) if item)
+            if mark.get("level_id"):
+                found.add("level:" + str(mark.get("level_id")))
+    return found
+
+
+def partial_end_visible(parsed: Optional[Dict[str, Any]], order_id: str) -> bool:
+    ends = (parsed or {}).get("partial_ends") or {}
+    mark = ends.get(str(order_id))
+    return isinstance(mark, dict) and bool(mark.get("kind")) and "price" not in mark
+
+
+def partial_level_released(parsed: Optional[Dict[str, Any]], level_id: str) -> bool:
+    return "level:" + str(level_id) in partial_released_ids(parsed)
+
+
+def _level_by_id(parsed: Optional[Dict[str, Any]], level_id: str) -> Optional[Dict[str, Any]]:
+    for level in (parsed or {}).get("levels") or []:
+        if isinstance(level, dict) and str(level.get("id")) == str(level_id):
+            return level
+    return None
+
+
+def partial_seat_readable(slot: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(slot, dict):
+        return False
+    order = slot.get("order")
+    return bool(
+        slot.get("order_id")
+        and slot.get("filled") is True
+        and slot.get("level_id")
+        and isinstance(order, dict)
+        and order.get("client_order_id")
+    )
+
+
+def partial_seating_visible(parsed: Optional[Dict[str, Any]], order_id: str) -> bool:
+    """Visible only together with the take-profit quant. Rowcount is not this."""
+    for level in (parsed or {}).get("levels") or []:
+        if not isinstance(level, dict):
+            continue
+        slot = level.get("open_order") or {}
+        if str(slot.get("order_id") or "") != str(order_id):
+            continue
+        if not partial_seat_readable(slot):
+            continue
+        if level.get("take_profit_price") in (None, ""):
+            return False
+        return True
+    return False
+
+
+def partial_feed_prices(
+    rows: Optional[List[Dict[str, Any]]],
+    parsed: Optional[Dict[str, Any]],
+    extra_released: Optional[set] = None,
+) -> List[Any]:
+    """Placement feeds until the seat is visible. The take-profit field feeds until the end mark."""
+    if rows is None:
+        return [None]
+    released = partial_released_ids(parsed)
+    if extra_released:
+        released.update(str(item) for item in extra_released)
+    prices: List[Any] = []
+    for row in rows:
+        order_id = str(row.get("order_id") or "")
+        if not order_id or order_id in released:
+            continue
+        lines = partial_lines(rows, order_id)
+        lone_five = partial_has_five(row) and not partial_send_marked(rows, order_id) and not any(
+            partial_old_remember(item) for item in lines
+        )
+        if lone_five:
+            continue
+        if row.get("price") not in (None, "") and not partial_seating_visible(parsed, order_id):
+            prices.append(row.get("price"))
+        if row.get("take_profit_price") not in (None, ""):
+            prices.append(row.get("take_profit_price"))
+    for level in (parsed or {}).get("levels") or []:
+        if not isinstance(level, dict) or partial_level_released(parsed, str(level.get("id"))):
+            continue
+        level_ids = {
+            str((level.get("open_order") or {}).get("order_id") or ""),
+            str((level.get("close_order") or {}).get("order_id") or ""),
+        }
+        level_ids.discard("")
+        if level_ids and level_ids & released:
+            continue
+        if level.get("take_profit_price") not in (None, ""):
+            prices.append(level.get("take_profit_price"))
+        close = level.get("close_order") or {}
+        if close.get("price") not in (None, "") and str(close.get("order_id") or "") not in released:
+            prices.append(close.get("price"))
+        slot = level.get("open_order") or {}
+        if (
+            slot.get("price") not in (None, "")
+            and not partial_seat_readable(slot)
+            and str(slot.get("order_id") or "") not in released
+        ):
+            prices.append(slot.get("price"))
+    return prices
+
+
+def partial_column_prices(
+    parsed: Optional[Dict[str, Any]],
+    extra_released: Optional[set] = None,
+) -> List[Any]:
+    return partial_feed_prices([], parsed, extra_released)
+
+
+def partial_held_level_ids(
+    rows: Optional[List[Dict[str, Any]]],
+    parsed: Optional[Dict[str, Any]],
+    executor_id: str,
+) -> set:
+    if rows is None:
+        return {"*"}
+    found = set()
+    for order_id in partial_holding_ids(rows, executor_id):
+        if partial_end_visible(parsed, order_id):
+            continue
+        for row in partial_lines(rows, order_id):
+            if row.get("level_id"):
+                found.add(str(row.get("level_id")))
+    for level in (parsed or {}).get("levels") or []:
+        if not isinstance(level, dict) or not level.get("id"):
+            continue
+        if partial_level_released(parsed, str(level.get("id"))):
+            continue
+        slot = level.get("open_order") or {}
+        if slot.get("level_id") and slot.get("order_id"):
+            found.add(str(level.get("id")))
+        close = level.get("close_order") or {}
+        if close.get("order_id") and close.get("level_id"):
+            found.add(str(level.get("id")))
+    return found
+
+
+def partial_exposure(rows: Optional[List[Dict[str, Any]]], parsed: Optional[Dict[str, Any]], executor_id: str) -> bool:
+    if rows is None:
+        return True
+    if partial_holding_ids(rows, executor_id):
+        return True
+    for level in (parsed or {}).get("levels") or []:
+        slot = (level or {}).get("open_order") or {}
+        if slot.get("order_id") and slot.get("level_id"):
+            return True
+    return False
+
+
+def partial_stop_forbidden(
+    rows: Optional[List[Dict[str, Any]]],
+    parsed: Optional[Dict[str, Any]],
+    executor_id: str,
+    *,
+    proof_ready: bool,
+) -> bool:
+    """Unread history is not permission to stop. A lone five-field row does not hold."""
+    if rows is None:
+        return partial_exposure(None, parsed, executor_id)
+    holding = partial_holding_ids(rows, executor_id)
+    column_holds = False
+    for level in (parsed or {}).get("levels") or []:
+        slot = (level or {}).get("open_order") or {}
+        close = (level or {}).get("close_order") or {}
+        if slot.get("order_id") and slot.get("level_id") and not partial_end_visible(parsed, str(slot.get("order_id"))):
+            column_holds = True
+        if close.get("order_id") and close.get("level_id") and not partial_level_released(parsed, str(level.get("id"))):
+            column_holds = True
+    if not holding and not column_holds:
+        return False
+    if not proof_ready:
+        return True
+    for order_id in holding:
+        if not partial_end_visible(parsed, order_id):
+            return True
+    if column_holds:
+        return True
+    return False
+
+
+def partial_decimal(value: Any) -> Optional[Decimal]:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+    if parsed.is_nan():
+        return None
+    return parsed
+
+
+def partial_raw_base(raw: Optional[Dict[str, Any]]) -> Optional[Decimal]:
+    """amount minus left. A missing field is not zero. filled_total is not the base."""
+    if not isinstance(raw, dict) or "amount" not in raw or "left" not in raw:
+        return None
+    amount = partial_decimal(raw.get("amount"))
+    left = partial_decimal(raw.get("left"))
+    if amount is None or left is None:
+        return None
+    return amount - left
+
+
+def partial_base_zero(raw: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(raw, dict) or "amount" not in raw or "left" not in raw:
+        return False
+    amount = partial_decimal(raw.get("amount"))
+    left = partial_decimal(raw.get("left"))
+    return amount is not None and left is not None and left == amount
+
+
+def partial_is_closed_cancel(raw: Optional[Dict[str, Any]]) -> bool:
+    return isinstance(raw, dict) and raw.get("status") == "closed" and raw.get("finish_as") == "cancelled"
+
+
+def partial_fill_base(raw: Optional[Dict[str, Any]]) -> Optional[Decimal]:
+    if not partial_is_closed_cancel(raw):
+        return None
+    base = partial_raw_base(raw)
+    amount = partial_decimal((raw or {}).get("amount"))
+    if base is None or amount is None or base <= 0 or base >= amount:
+        return None
+    return base
+
+
+def partial_full_fill(raw: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(raw, dict) or raw.get("finish_as") != "filled":
+        return False
+    base = partial_raw_base(raw)
+    amount = partial_decimal(raw.get("amount"))
+    return base is not None and amount is not None and base == amount
+
+
+def partial_text_in(rows: Optional[List[Dict[str, Any]]], text: str) -> bool:
+    return any(str(row.get("text") or "") == str(text) for row in rows or [])
+
+
+def partial_find_text(rows: Optional[List[Dict[str, Any]]], text: str) -> Optional[Dict[str, Any]]:
+    for row in rows or []:
+        if str(row.get("text") or "") == str(text):
+            return row
+    return None
+
+
+def partial_lists_cover(fresh: Optional[Dict[str, Any]], ts: Any) -> bool:
+    """A short page without the row ts is not proof the text is gone."""
+    if not isinstance(fresh, dict) or ts is None:
+        return False
+    if not fresh.get("opens_read") or not fresh.get("opens_done"):
+        return False
+    if not fresh.get("finished_read") or not fresh.get("finished_done"):
+        return False
+    request = fresh.get("finished_request") or {}
+    params = request.get("params") or {}
+    if "from" not in params or "to" not in params:
+        return False
+    return history_covers_ts(request, ts, {"read": True, "done": True})
+
+
+def partial_same_tick(left: Any, right: Any, tick: Optional[Decimal]) -> bool:
+    return _same_tick(left, right, tick) is True
+
+
+def partial_take_profit_quant(
+    connector: Any,
+    pair: str,
+    price: Any,
+    take_profit: Any,
+    side: str,
+) -> Optional[str]:
+    """Quantize from the row price and the level take-profit. Do not store the raw product."""
+    base = partial_decimal(price)
+    profit = partial_decimal(take_profit)
+    if base is None or profit is None or connector is None or not hasattr(connector, "quantize_order_price"):
+        return None
+    factor = Decimal("1") - profit if side == "SELL" else Decimal("1") + profit
+    try:
+        quant = connector.quantize_order_price(pair, base * factor)
+    except Exception:
+        return None
+    if quant in (None, ""):
+        return None
+    return str(quant)
+
+
+def partial_order_body(
+    *,
+    client_order_id: str,
+    trading_pair: Any,
+    order_type: Any,
+    trade_type: Any,
+    amount: Any,
+    price: Any,
+    exchange_order_id: Any,
+    leverage: Any,
+    position: Any,
+    executed_base: Any,
+    executed_quote: Any,
+) -> Optional[Dict[str, Any]]:
+    """Body for from_json. A missing field is not zero."""
+    fields = {
+        "client_order_id": client_order_id,
+        "trading_pair": trading_pair,
+        "order_type": order_type,
+        "trade_type": trade_type,
+        "amount": amount,
+        "price": price,
+        "exchange_order_id": exchange_order_id,
+        "last_state": "5",
+        "leverage": leverage,
+        "position": position,
+        "executed_amount_base": executed_base,
+        "executed_amount_quote": executed_quote,
+    }
+    if any(value in (None, "") for value in fields.values()):
+        return None
+    try:
+        from hummingbot.core.data_type.in_flight_order import InFlightOrder
+        InFlightOrder.from_json(dict(fields))
+    except Exception:
+        return None
+    return fields
+
+
+def partial_commit_body(read_text: Optional[str], mutate: Any, target_id: Optional[str] = None) -> Optional[str]:
+    """Full copy plus one level change. Other levels disappearing is not success."""
+    if read_text:
+        try:
+            base = json.loads(read_text)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(base, dict):
+            return None
+    else:
+        base = {"version": 1, "type": "grid_executor", "levels": [], "holds": []}
+    body = json.loads(json.dumps(base))
+    before = {
+        level.get("id"): level
+        for level in body.get("levels") or []
+        if isinstance(level, dict)
+    }
+    try:
+        mutate(body)
+    except Exception:
+        return None
+    after = {
+        level.get("id"): level
+        for level in body.get("levels") or []
+        if isinstance(level, dict)
+    }
+    for level_id, level in before.items():
+        if level_id not in after:
+            return None
+        if target_id is not None and str(level_id) == str(target_id):
+            continue
+        if after[level_id] != level:
+            return None
+    return json.dumps(body, sort_keys=True)
+
+
+def partial_ensure_level(body: Dict[str, Any], level_id: str, seed: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    levels = body.setdefault("levels", [])
+    for level in levels:
+        if isinstance(level, dict) and str(level.get("id")) == str(level_id):
+            return level
+    if not seed or not seed.get("id"):
+        return None
+    levels.append(json.loads(json.dumps(seed)))
+    return levels[-1]
+
+
+def apply_partial_keep(body: Dict[str, Any], previous: Dict[str, Any]) -> None:
+    """Copy an end mark forward. Do not restore a released take-profit price."""
+    ends = previous.get("partial_ends") or {}
+    if ends:
+        body["partial_ends"] = json.loads(json.dumps(ends))
+    released = partial_released_ids(previous)
+    holds = []
+    for item in body.get("holds") or []:
+        if isinstance(item, dict) and str(item.get("order_id") or "") in released:
+            continue
+        holds.append(item)
+    if holds or body.get("holds"):
+        body["holds"] = holds
+    previous_levels = {
+        level.get("id"): level
+        for level in previous.get("levels") or []
+        if isinstance(level, dict)
+    }
+    for level in body.get("levels") or []:
+        if not isinstance(level, dict):
+            continue
+        prev = previous_levels.get(level.get("id"))
+        if not isinstance(prev, dict):
+            continue
+        if partial_level_released(previous, str(level.get("id"))):
+            level.pop("take_profit_price", None)
+            level.pop("partial_closes", None)
+            if not (level.get("close_order") or {}).get("price"):
+                level["close_order"] = None
+            continue
+        slot = level.get("open_order") or {}
+        prev_slot = prev.get("open_order") or {}
+        incomplete = (
+            not slot.get("price")
+            and not level.get("take_profit_price")
+        ) or not slot.get("level_id") or "partial_closes" not in level
+        if prev.get("take_profit_price") and not level.get("take_profit_price"):
+            level["take_profit_price"] = prev.get("take_profit_price")
+        if prev.get("partial_closes") and not level.get("partial_closes"):
+            level["partial_closes"] = json.loads(json.dumps(prev.get("partial_closes")))
+        if partial_seat_readable(prev_slot) and not partial_seat_readable(slot):
+            level["open_order"] = json.loads(json.dumps(prev_slot))
+        prev_close = prev.get("close_order") or {}
+        close = level.get("close_order") or {}
+        rich_close = (
+            prev_close.get("order_id")
+            and prev_close.get("level_id")
+            and prev_close.get("price") not in (None, "")
+        )
+        flat_close = not close.get("level_id") or close.get("price") in (None, "")
+        if rich_close and flat_close:
+            level["close_order"] = json.loads(json.dumps(prev_close))
+        if incomplete and prev.get("take_profit_price"):
+            level["take_profit_price"] = prev.get("take_profit_price")
