@@ -613,6 +613,23 @@ def test_many_levels_with_orders_is_fast_and_matches():
     )
 
 
+# ── 11. цена освобождается, когда тело обновили без close-слота ───────────────
+
+
+def test_price_released_when_body_drops_the_close_slot():
+    body_with = _grid([_close_level("L0", "100", "close-a", "101")])
+    body_without = _grid([_level("L0", "100")])
+    rows = [_dead_row("dead-a", json.dumps(body_with))]
+    service = _bare_service(rows)
+    prices = [str(item) for item in service._occupied_close_prices(_fake_executor())]
+    assert "101" in prices
+
+    service._set_hold_rows([_dead_row("dead-a", json.dumps(body_without))])
+    prices = [str(item) for item in service._occupied_close_prices(_fake_executor())]
+    assert "101" not in prices, "цена снятого закрытия осталась занятой"
+    assert service._close_price_known("close-a") is False
+
+
 # ── кэш не копит старые тела ───────────────────────────────────────────────
 
 
@@ -623,7 +640,7 @@ def test_cache_prune_drops_old_texts():
     second = json.dumps(_grid([_level("L0", "200")]))
     parse_checkpoint_cached(first)
     parse_checkpoint_cached(second)
-    checkpoint_cache_prune([second])
+    checkpoint_cache_prune([second, {"не текст": True}, None])
     checkpoint_cache_reset_stats()
     parse_checkpoint_cached(first)
     assert checkpoint_cache_stats()["parses"] == 1, "старый текст остался в кэше"

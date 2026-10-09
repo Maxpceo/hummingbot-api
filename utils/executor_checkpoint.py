@@ -1520,7 +1520,7 @@ def parse_checkpoint_cached(raw: Any) -> Optional[Dict[str, Any]]:
 def checkpoint_cache_prune(texts) -> None:
     """В кэше остаются только тексты текущих строк. Каждая запись тела даёт
     новый текст, и без срока жизни копии накапливаются в памяти."""
-    keep = {checkpoint_text_key(text) for text in texts or [] if text}
+    keep = {checkpoint_text_key(text) for text in texts or [] if isinstance(text, str) and text}
     for key in [key for key in _CHECKPOINT_CACHE if key not in keep]:
         _CHECKPOINT_CACHE.pop(key, None)
 
