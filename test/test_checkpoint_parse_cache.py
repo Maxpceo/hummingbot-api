@@ -545,8 +545,13 @@ def test_unsent_order_does_not_ban_the_price(monkeypatch, tmp_path):
     row = _dead_row("dead-a", json.dumps(body))
     row["price_checkpoint"] = _price_checkpoint(parse_checkpoint(row.get("checkpoint")))
     service = _bare_service([row])
+    service._partial_rows = lambda: []
 
-    assert add_miss_order("open-unsent") is True
+    # Сначала чтение — наборы построены с номером как живым.
+    pairs = service._ban_pairs("INJ-USDT", {"opens": [], "finished": []})
+    assert ("open-unsent", "100") in [(str(a), str(b)) for a, b in pairs]
+
+    add_miss_order("open-unsent")
     assert order_is_unsent("open-unsent") is True
 
     pairs = service._ban_pairs("INJ-USDT", {"opens": [], "finished": []})
