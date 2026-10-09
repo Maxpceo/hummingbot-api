@@ -508,6 +508,7 @@ class ExecutorService:
         """Main control loop that updates all active executors."""
         while self._is_running:
             step_started = time.monotonic()
+            step_stats = checkpoint_cache_stats()
             try:
                 # Update timestamps for all trading interfaces via TradingService
                 self._trading_service.update_all_timestamps()
@@ -568,8 +569,8 @@ class ExecutorService:
                     "slow control step: %.1fs hold_rows=%d parses=%d copies=%d",
                     step_took,
                     len(getattr(self, "_hold_rows", None) or []),
-                    stats.get("parses", 0),
-                    stats.get("copies", 0),
+                    stats.get("parses", 0) - step_stats.get("parses", 0),
+                    stats.get("copies", 0) - step_stats.get("copies", 0),
                 )
 
             await asyncio.sleep(self.update_interval)
@@ -1734,8 +1735,14 @@ class ExecutorService:
                     owner_ids.add(str(hold.get("order_id")))
                     seated_ids.add(str(hold.get("order_id")))
                     column_ids.add(hold.get("order_id"))
-                if hold.get("price") not in (None, ""):
-                    close_hold_price_map[str(hold.get("order_id") or "")] = hold.get("price")
+            # Цены держателей берутся из close_holds — ровно как читал прежний
+            # _close_price_known. Источник holds сюда не подмешивается: запись
+            # holds с ценой — это запрет цены, а не «сохранённая цена закрытия».
+            for item in body.get("close_holds") or []:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("price") not in (None, ""):
+                    close_hold_price_map[str(item.get("order_id") or "")] = item.get("price")
             for level in body.get("levels") or []:
                 if not isinstance(level, dict):
                     continue

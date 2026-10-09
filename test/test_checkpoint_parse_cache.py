@@ -25,6 +25,8 @@ from test.test_executor_checkpoint import (
 mod = _load_executor_service()
 ExecutorService = mod.ExecutorService
 
+from database.repositories.executor_repository import _price_checkpoint  # noqa: E402
+
 from utils.executor_checkpoint import (  # noqa: E402
     checkpoint_cache_reset_stats,
     checkpoint_cache_stats,
@@ -140,6 +142,63 @@ def _old_partial_text_protected(service, rows, text, partial_rows):
             if text in ids:
                 return True
     return False
+
+
+def _old_close_price_known(rows, order_id):
+    wanted = str(order_id)
+    for row in rows:
+        parsed = parse_checkpoint(row.get("checkpoint"))
+        for level in (parsed or {}).get("levels") or []:
+            close = (level or {}).get("close_order") or {}
+            if str(close.get("order_id") or "") == wanted and close.get("price") not in (None, ""):
+                return True
+        for item in (parsed or {}).get("close_holds") or []:
+            if isinstance(item, dict) and str(item.get("order_id") or "") == wanted:
+                if item.get("price") not in (None, ""):
+                    return True
+    return False
+
+
+def _old_ban_holds(rows, pair):
+    items = []
+    for row in rows:
+        if row.get("trading_pair") not in (None, "", pair):
+            continue
+        parsed = row.get("price_checkpoint")
+        if not isinstance(parsed, dict):
+            parsed = parse_checkpoint(row.get("checkpoint"))
+        for hold in (parsed or {}).get("holds") or []:
+            if hold.get("price") not in (None, ""):
+                items.append((str(hold.get("order_id") or ""), hold.get("price")))
+    return items
+
+
+def _old_released_texts(rows, pair):
+    found = set()
+    for row in rows:
+        if row.get("trading_pair") not in (None, "", pair):
+            continue
+        found.update(
+            str(item) for item in partial_released_ids(parse_checkpoint(row.get("checkpoint")))
+            if item and not str(item).startswith("level:")
+        )
+    return found
+
+
+def _old_column_ids(rows, pair):
+    found = set()
+    for row in rows:
+        if row.get("trading_pair") != pair:
+            continue
+        text = row.get("checkpoint") or ""
+        parsed = parse_checkpoint(text)
+        if text and parsed is None:
+            return None
+        found.update(saved_order_ids(parsed))
+        for hold in (parsed or {}).get("holds") or []:
+            if hold.get("order_id"):
+                found.add(hold["order_id"])
+    return found
 
 
 # ── каркас ─────────────────────────────────────────────────────────────────
@@ -356,6 +415,64 @@ def test_readers_match_the_old_body_reading():
     assert service._checkpoint_unread() == _old_unread(service, rows)
 
 
+async def test_more_readers_match_the_old_body_reading(monkeypatch, tmp_path):
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(tmp_path / "data" / "order-ledger.jsonl"))
+    reset_ledger_process_state()
+    level = _close_level("L0", "100", "close-a", "102")
+    level["take_profit_price"] = "103"
+    body = _grid([level])
+    body["holds"] = [{"order_id": "hold-a", "price": "99"}]
+    body["close_holds"] = [{"order_id": "hold-close", "price": "105"}]
+    body["partial_ends"] = {"L0": {"order_ids": ["ended-a"]}}
+    rows = [
+        _dead_row("dead-a", json.dumps(body)),
+        _dead_row("dead-b", json.dumps(_grid([_level("L2", "200")]))),
+    ]
+    for row in rows:
+        row["price_checkpoint"] = _price_checkpoint(parse_checkpoint(row.get("checkpoint")))
+    service = _bare_service(rows)
+    service._partial_rows = lambda: []
+
+    for text in ("close-a", "hold-close", "hold-a", "ended-a", "absent"):
+        assert service._close_price_known(text) == _old_close_price_known(rows, text), (
+            f"известность цены закрытия {text} разошлась со старым чтением"
+        )
+    assert service._released_texts("INJ-USDT") == _old_released_texts(rows, "INJ-USDT")
+    assert await service._column_order_ids("INJ-USDT") == _old_column_ids(rows, "INJ-USDT")
+    fresh = {"opens": [], "finished": []}
+    assert sorted(service._ban_pairs("INJ-USDT", fresh)) == sorted(_old_ban_holds(rows, "INJ-USDT"))
+    assert (
+        sorted(str(item) for item in service._occupied_close_prices(_fake_executor()))
+        == sorted(str(item) for item in _old_occupied_close_prices(service, rows))
+    )
+
+
+def _old_occupied_close_prices(service, rows):
+    found = []
+    released = set()
+    for row in rows:
+        released.update(partial_released_ids(parse_checkpoint(row.get("checkpoint"))))
+    for row in service._partial_rows() or []:
+        order_id = str(row.get("order_id") or "")
+        if not order_id or order_id in released:
+            continue
+        if row.get("take_profit_price") not in (None, "") and order_id not in released:
+            if any(
+                str((level.get("close_order") or {}).get("order_id") or "") == order_id
+                for parsed_row in rows
+                for level in (parse_checkpoint(parsed_row.get("checkpoint")) or {}).get("levels") or []
+            ):
+                found.append(row.get("take_profit_price"))
+    for parsed_row in rows:
+        parsed = parse_checkpoint(parsed_row.get("checkpoint"))
+        for level in (parsed or {}).get("levels") or []:
+            close = (level or {}).get("close_order") or {}
+            close_id = str(close.get("order_id") or "")
+            if close_id and close_id not in released and close.get("price") not in (None, ""):
+                found.append(close.get("price"))
+    return found
+
+
 # ── 6. номер из журнала закрытий не снимается ──────────────────────────────
 
 
@@ -391,6 +508,25 @@ def test_seated_slot_price_still_bans_the_price():
     pairs = service._ban_pairs("INJ-USDT", {"opens": [], "finished": []})
     assert ("open-a", "100") in [(str(a), str(b)) for a, b in pairs], (
         "цена сидящего заявления перестала попадать в запрет"
+    )
+
+
+# ── 8. цена close-номера узнаётся по close_holds, а не по holds ──────────────────
+
+
+def test_close_price_known_reads_close_holds_and_not_holds():
+    """Ровно два случая из вердикта код-ревью: holds с ценой — это запрет
+    цены, close_holds с ценой — сохранённая цена закрытия."""
+    body = _grid([_level("L0", "100")])
+    body["holds"] = [{"order_id": "x-ban", "price": "105"}]
+    body["close_holds"] = [{"order_id": "x-close", "price": "106"}]
+    rows = [_dead_row("dead-a", json.dumps(body))]
+    service = _bare_service(rows)
+    assert service._close_price_known("x-close") is True, (
+        "цену close-номера из close_holds перестали узнавать — закроются все отправки на паре"
+    )
+    assert service._close_price_known("x-ban") is False, (
+        "holds с ценой начали считать сохранённой ценой — отпустится тормоз и встанет вторая заявка"
     )
 
 
