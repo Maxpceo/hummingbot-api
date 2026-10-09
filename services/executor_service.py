@@ -1780,7 +1780,9 @@ class ExecutorService:
         price_body = row.get("price_checkpoint")
         if not isinstance(price_body, dict):
             price_body = body
-        for hold in (price_body or {}).get("holds") or [] or []:
+        for hold in (price_body or {}).get("holds") or []:
+            if not isinstance(hold, dict):
+                continue
             if hold.get("price") not in (None, ""):
                 ban_holds.append((str(hold.get("order_id") or ""), hold.get("price")))
 
