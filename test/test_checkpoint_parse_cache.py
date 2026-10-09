@@ -28,6 +28,7 @@ ExecutorService = mod.ExecutorService
 from database.repositories.executor_repository import _price_checkpoint  # noqa: E402
 
 from utils.executor_checkpoint import (  # noqa: E402
+    checkpoint_cache_prune,
     checkpoint_cache_reset_stats,
     checkpoint_cache_stats,
     parse_checkpoint,
@@ -551,6 +552,64 @@ def test_unsent_order_does_not_ban_the_price(monkeypatch, tmp_path):
     pairs = service._ban_pairs("INJ-USDT", {"opens": [], "finished": []})
     assert ("open-unsent", "100") not in [(str(a), str(b)) for a, b in pairs], (
         "номер, не дошедший до книги, снова держит цену в запрете"
+    )
+
+
+# ── 10. сетка из многих уровней с заявками: шаг быстрый, ответы те же ────────
+
+
+def test_many_levels_with_orders_is_fast_and_matches():
+    """Та форма, что уронила Tokyo: сетка на 51 уровень с заявками в каждой и
+    тяжёлые тела погашенных строк. Считаем шаг и сверяем со старым чтением."""
+    levels = []
+    for i in range(51):
+        level = _level(f"L{i}", str(100 + i))
+        level["open_order"] = {"order_id": f"open-{i}", "level_id": f"L{i}", "price": str(100 + i)}
+        level["close_order"] = {"order_id": f"close-{i}", "level_id": f"L{i}", "price": str(101 + i)}
+        level["partial_closes"] = [
+            {"order_id": f"pclose-{i}-a", "price": str(101 + i)},
+            {"order_id": f"pclose-{i}-b", "price": str(102 + i)},
+        ]
+        level["take_profit_price"] = str(103 + i)
+        levels.append(level)
+    live = _grid(levels)
+    live["holds"] = [{"order_id": f"hold-{i}", "price": str(90 + i)} for i in range(20)]
+    live["close_holds"] = [{"order_id": f"chold-{i}", "price": str(110 + i)} for i in range(10)]
+    live["partial_ends"] = {"L0": {"order_ids": ["ended-0", "ended-1"]}}
+    rows = [_running_row("grid-live", checkpoint=json.dumps(live))]
+    for i in range(18):
+        rows.append(_dead_row(f"dead-{i}", json.dumps(_heavy_body([_level("L0", str(200 + i))], retained=2200))))
+    for row in rows:
+        row["price_checkpoint"] = _price_checkpoint(parse_checkpoint(row.get("checkpoint")))
+    service = _bare_service(rows)
+    service._partial_rows = lambda: []
+
+    checkpoint_cache_prune([])
+    checkpoint_cache_reset_stats()
+    service._set_hold_rows(rows)
+    started = time.monotonic()
+    for _ in range(10):
+        service._close_cancel_ids()
+        service._checkpoint_order_owner("close-7")
+        service._seated_open_id("open-9", "INJ-USDT")
+        service._checkpoint_unread()
+        service._partial_text_protected("pclose-3-a")
+        service._occupied_close_prices(_fake_executor())
+        service._ban_pairs("INJ-USDT", {"opens": [], "finished": []})
+        service._close_price_known("chold-2")
+        service._released_texts("INJ-USDT")
+    took = time.monotonic() - started
+
+    assert checkpoint_cache_stats()["parses"] == len(rows), "разбор один на каждый текст"
+    assert took < 1.0, f"шаг с 51 уровнем держал {took:.2f}s — снова встанет"
+
+    for text in ("open-9", "close-7", "hold-3", "chold-2", "ended-0", "pclose-3-a", "absent"):
+        assert service._checkpoint_order_owner(text) == _old_order_owner(service, rows, text)
+        assert service._seated_open_id(text, "INJ-USDT") == _old_seated_open_id(rows, text, "INJ-USDT")
+        assert service._close_price_known(text) == _old_close_price_known(rows, text)
+    assert service._close_cancel_ids() == _old_close_ids(service, rows)
+    assert sorted(str(item) for item in service._occupied_close_prices(_fake_executor())) == sorted(
+        str(item) for item in _old_occupied_close_prices(service, rows)
     )
 
 
