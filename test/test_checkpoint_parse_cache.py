@@ -530,6 +530,30 @@ def test_close_price_known_reads_close_holds_and_not_holds():
     )
 
 
+# ── 9. снятый номер не держит цену в запрете ─────────────────────────────────────
+
+
+def test_unsent_order_does_not_ban_the_price(monkeypatch, tmp_path):
+    from utils.executor_checkpoint import add_miss_order, order_is_unsent
+
+    monkeypatch.setenv("EXECUTOR_ORDER_LEDGER", str(tmp_path / "data" / "order-ledger.jsonl"))
+    (tmp_path / "data").mkdir()
+    reset_ledger_process_state()
+    level = _level("L0", "100", open_order={"order_id": "open-unsent", "level_id": "L0", "price": "100"})
+    body = _grid([level])
+    row = _dead_row("dead-a", json.dumps(body))
+    row["price_checkpoint"] = _price_checkpoint(parse_checkpoint(row.get("checkpoint")))
+    service = _bare_service([row])
+
+    assert add_miss_order("open-unsent") is True
+    assert order_is_unsent("open-unsent") is True
+
+    pairs = service._ban_pairs("INJ-USDT", {"opens": [], "finished": []})
+    assert ("open-unsent", "100") not in [(str(a), str(b)) for a, b in pairs], (
+        "номер, не дошедший до книги, снова держит цену в запрете"
+    )
+
+
 # ── кэш не копит старые тела ───────────────────────────────────────────────
 
 
