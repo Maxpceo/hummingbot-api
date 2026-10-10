@@ -56,7 +56,7 @@ def _old_send_marked(rows, order_id):
 def _old_lone_five(rows, order_id):
     if not order_id or _old_send_marked(rows, order_id):
         return False
-    lines = [row for row in rows or [] if str(row.get("order_id") or "") == str(order_id)]
+    lines = [row for row in rows or [] if str(row.get("order_id") or "") == order_id]
     if any(partial_old_remember(row) for row in lines):
         return False
     return any(partial_has_five(row) for row in lines)
@@ -330,6 +330,31 @@ def test_readers_match_the_old_journal_reading(monkeypatch, tmp_path):
     for answer in (None, []):
         assert partial_lines(answer, "n1") == _old_lines(answer, "n1")
         assert partial_holding_ids(answer, "ex") == _old_holding_ids(answer, "ex")
+
+
+# ── проба 2б: держатели и виды готовые, строки при запросе не пересчитываются ─────
+
+
+def test_holders_are_ready_not_recomputed(monkeypatch, tmp_path):
+    _boot(
+        monkeypatch,
+        tmp_path / "data" / "order-ledger.jsonl",
+        [_annotation("n1"), _five("n1", level_id="L1"), _remember("n2")],
+    )
+    journal = read_ledger_filtered()
+    expected = partial_holding_ids(journal, "ex")
+    expected_kinds = partial_hold_kinds(journal, None, "ex")
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("снимок обязан отдавать готовых держателей, а не пересчитывать строки")
+
+    monkeypatch.setattr(ledger_mod, "partial_old_remember", boom)
+    monkeypatch.setattr(ledger_mod, "partial_has_five", boom)
+    monkeypatch.setattr(ledger_mod, "partial_annotation_line", boom)
+    assert partial_holding_ids(journal, "ex") == expected
+    assert partial_hold_kinds(journal, None, "ex") == expected_kinds
+    assert partial_send_marked(journal, "n1")
+    assert partial_lone_five(journal, "n2") is False
 
 
 # ── проба 3: писатель идёт мимо кэша ──────────────────────────────────────────

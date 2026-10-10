@@ -488,10 +488,15 @@ def read_ledger_filtered() -> List[Dict[str, Any]]:
 # записанная строка видна тому же шагу. Устаревший снимок при сбое чтения не
 # подставляется: сбой чтения журнала так же кидает _LedgerReadError.
 
-_LEDGER_CACHE_LOCK = threading.Lock()
+_LEDGER_CACHE_LOCK = threading.RLock()
 _LEDGER_CACHE_VERSION = 0
 _LEDGER_SNAPSHOT: Optional[Dict[str, Any]] = None
 _LEDGER_CACHE_STATS = {"reads": 0, "lookups": 0}
+_EMPTY_VIEW: Dict[str, Any] = {
+    "orders": {},
+    "holding_anon": set(),
+    "holding_by_executor": {},
+}
 
 
 def ledger_cache_stats() -> Dict[str, int]:
@@ -505,7 +510,8 @@ def ledger_cache_reset_stats() -> None:
 
 def _bump_ledger_version() -> None:
     global _LEDGER_CACHE_VERSION
-    _LEDGER_CACHE_VERSION += 1
+    with _LEDGER_CACHE_LOCK:
+        _LEDGER_CACHE_VERSION += 1
 
 
 def _ledger_file_key(path: str) -> Optional[tuple]:
@@ -586,10 +592,10 @@ def _ledger_snapshot() -> Dict[str, Any]:
         return snap
 
 
-def _rows_answers(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
-    """Per-order answers for these rows. The snapshot's own lists are cached."""
+def _rows_answers(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Per-order answers and ready holding sets for these rows. Snapshot's lists are cached."""
     if rows is None:
-        return {}
+        return _EMPTY_VIEW
     snap = _LEDGER_SNAPSHOT
     if snap is not None and rows is snap["rows"]:
         _LEDGER_CACHE_STATS["lookups"] += 1
@@ -4229,13 +4235,13 @@ def partial_lines(rows: Optional[List[Dict[str, Any]]], order_id: str) -> List[D
     Shallow copies out: the snapshot's rows are shared and read-only, a reader
     that edits its line edits its own copy.
     """
-    item = _rows_answers(rows).get(str(order_id))
+    item = _rows_answers(rows)["orders"].get(str(order_id))
     return [dict(row) for row in item["lines"]] if item else []
 
 
 def partial_send_marked(rows: Optional[List[Dict[str, Any]]], order_id: str) -> bool:
     """The second line, not a lone five-field row, is the send mark."""
-    item = _rows_answers(rows).get(str(order_id))
+    item = _rows_answers(rows)["orders"].get(str(order_id))
     return bool(item and item["send_marked"])
 
 
@@ -4273,21 +4279,25 @@ def partial_close_send_line(row: Optional[Dict[str, Any]]) -> bool:
     return row.get("take_profit_price") in (None, "")
 
 
-def _answers_for_rows(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
-    """Lines of each number in journal order and its answers, by the same predicates.
+def _answers_for_rows(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """One pass over the rows: per-number answers, ready holders and kinds.
 
-    Each answer is the same expression the readers ran over all rows, computed
+    Every answer is the same expression the readers ran over all rows, computed
     once over the same lines in the same order: nothing added, nothing lost.
     `old_remember_plain` is the «remember, not an annotation» rule, whose
     `item is not row` guard is a no-op: the guarded rule only runs on an
     annotation line, which never satisfies `not partial_annotation_line(row)`.
+
+    Holders are grouped by the row's executor_id: the query answer is the
+    anonymous group (rows without an executor) union the queried group — the
+    same `executor_id not in (None, "", executor_id)` filter as before.
     """
-    answers: Dict[str, Dict[str, Any]] = {}
+    orders: Dict[str, Dict[str, Any]] = {}
     for row in rows or []:
         key = str(row.get("order_id") or "")
-        item = answers.setdefault(key, {"lines": []})
+        item = orders.setdefault(key, {"lines": []})
         item["lines"].append(row)
-    for item in answers.values():
+    for item in orders.values():
         lines = item["lines"]
         item["send_marked"] = len(lines) >= 2 and any(partial_has_five(row) for row in lines[1:])
         item["old_remember"] = any(partial_old_remember(row) for row in lines)
@@ -4296,14 +4306,43 @@ def _answers_for_rows(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[st
         )
         item["has_five"] = any(partial_has_five(row) for row in lines)
         item["lone_five"] = item["has_five"] and not item["send_marked"] and not item["old_remember"]
-    return answers
+        if item["send_marked"]:
+            item["kind"] = "send-mark"
+        elif item["old_remember_plain"]:
+            item["kind"] = "remember"
+        else:
+            item["kind"] = "annotation-only"
+    holding_anon: set = set()
+    holding_by_executor: Dict[Any, set] = {}
+    for row in rows or []:
+        order_id = row.get("order_id")
+        level_id = row.get("level_id")
+        if not order_id or not level_id:
+            continue
+        if row.get("role") in ("close", "market_close"):
+            continue
+        item = orders.get(str(order_id)) or {}
+        if item.get("send_marked"):
+            pass
+        elif not partial_old_remember(row):
+            continue
+        elif partial_annotation_line(row) and item.get("old_remember_plain"):
+            continue
+        holder = row.get("executor_id")
+        bucket = holding_anon if holder in (None, "") else holding_by_executor.setdefault(holder, set())
+        bucket.add(str(order_id))
+    return {
+        "orders": orders,
+        "holding_anon": holding_anon,
+        "holding_by_executor": holding_by_executor,
+    }
 
 
 def partial_lone_five(rows: Optional[List[Dict[str, Any]]], order_id: str) -> bool:
     """A lone five-field row: five fields, but neither send-mark nor old remember."""
     if not order_id:
         return False
-    item = _rows_answers(rows).get(str(order_id))
+    item = _rows_answers(rows)["orders"].get(str(order_id))
     return bool(item and item["lone_five"])
 
 
@@ -4312,29 +4351,14 @@ def partial_holding_ids(rows: Optional[List[Dict[str, Any]]], executor_id: str) 
 
     An annotation line is not its own holder when a remember or send-mark line
     of the same id already holds it; alone, it still holds.
+
+    Ready holders from the snapshot: the anonymous group plus the queried one.
     """
-    found = set()
     if rows is None:
-        return found
-    answers = _rows_answers(rows)
-    for row in rows:
-        if row.get("executor_id") not in (None, "", executor_id):
-            continue
-        order_id = row.get("order_id")
-        level_id = row.get("level_id")
-        if not order_id or not level_id:
-            continue
-        if row.get("role") in ("close", "market_close"):
-            continue
-        item = answers.get(str(order_id)) or {}
-        if item.get("send_marked"):
-            found.add(str(order_id))
-            continue
-        if not partial_old_remember(row):
-            continue
-        if partial_annotation_line(row) and item.get("old_remember_plain"):
-            continue
-        found.add(str(order_id))
+        return set()
+    view = _rows_answers(rows)
+    found = set(view["holding_anon"])
+    found |= view["holding_by_executor"].get(executor_id) or set()
     return found
 
 
@@ -4347,17 +4371,12 @@ def partial_hold_kinds(
     kinds: Dict[str, str] = {}
     if rows is None:
         return kinds
-    answers = _rows_answers(rows)
+    orders = _rows_answers(rows)["orders"]
     for order_id in partial_holding_ids(rows, executor_id):
         if parsed is not None and partial_end_visible(parsed, str(order_id)):
             continue
-        item = answers.get(str(order_id)) or {}
-        if item.get("send_marked"):
-            kinds[str(order_id)] = "send-mark"
-        elif item.get("old_remember_plain"):
-            kinds[str(order_id)] = "remember"
-        else:
-            kinds[str(order_id)] = "annotation-only"
+        item = orders.get(str(order_id)) or {}
+        kinds[str(order_id)] = item.get("kind") or "annotation-only"
     return kinds
 
 
