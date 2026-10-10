@@ -940,3 +940,23 @@ def test_mixed_ts_types_do_not_break_the_snapshot(monkeypatch, tmp_path):
     service = _bare_service([])
     monkeypatch.setattr(mod, "owed_records", lambda: [])
     assert service._oldest_ts({"pair": "DOGE-USDT"}) == ledger_min_ts()
+    monkeypatch.setattr(
+        mod, "owed_records", lambda: [{"trading_pair": "DOGE-USDT", "ts": "owed"}]
+    )
+    assert service._oldest_ts({"pair": "DOGE-USDT"}) in (3.0, "later", "owed"), (
+        "смешанный ts в owed_records обрывает _oldest_ts и шаг sweep"
+    )
+
+
+def test_copy_counter_counts_only_made_copies(monkeypatch, tmp_path):
+    _boot(monkeypatch, tmp_path / "data" / "order-ledger.jsonl", [])
+    stats = checkpoint_cache_stats()["copies"]
+    assert parse_checkpoint_cached("") is None
+    assert parse_checkpoint_cached("{not json") is None
+    assert checkpoint_cache_stats()["copies"] == stats, (
+        "счётчик копий считает копии, которых не было"
+    )
+    assert parse_checkpoint_cached(json.dumps(_body_forms()[1])) is not None
+    assert checkpoint_cache_stats()["copies"] == stats + 1
+    assert parse_checkpoint_cached(_body_forms()[1]) is not None
+    assert checkpoint_cache_stats()["copies"] == stats + 2

@@ -1654,7 +1654,19 @@ class ExecutorService:
             return None
         if ledger_ts is not None:
             found.append(ledger_ts)
-        return min(found) if found else None
+        best = None
+        for value in found:
+            if best is None:
+                best = value
+                continue
+            try:
+                if value < best:
+                    best = value
+            except TypeError:
+                # Несопоставимые типы ts не обрывают шаг sweep (та же защита,
+                # что в сборке снимка — minor вердикта 20261010-232605-72948).
+                pass
+        return best
 
     def _ids_of(self, items) -> set:
         found = set()

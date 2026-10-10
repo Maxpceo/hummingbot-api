@@ -1689,12 +1689,13 @@ def parse_checkpoint_cached(raw: Any) -> Optional[Dict[str, Any]]:
 
     Остаётся для читателей, которые правят тело (путь старта и восстановления).
     Читающий читатель берёт checkpoint_view без копии."""
-    note_checkpoint_copy()
     if isinstance(raw, dict):
+        note_checkpoint_copy()
         return copy.deepcopy(raw)
     master = checkpoint_master(raw)
     if master is None:
         return None
+    note_checkpoint_copy()
     return copy.deepcopy(master)
 
 
