@@ -112,6 +112,14 @@ from utils.executor_checkpoint import (
     checkpoint_cache_prune,
     checkpoint_cache_reset_stats,
     checkpoint_cache_stats,
+    checkpoint_view,
+    ledger_close_price_taken,
+    ledger_journal_mark,
+    ledger_min_ts,
+    ledger_price_known,
+    ledger_raw_rows,
+    ledger_unowned_ids,
+    note_checkpoint_copy,
     parse_checkpoint_cached,
     append_durable_row,
     resolve_close_bans,
@@ -1621,8 +1629,7 @@ class ExecutorService:
                 self.__dict__["_hold_pending"].pop(order_id, None)
                 self._clear_unresolved(order_id)
         try:
-            from utils.executor_checkpoint import _read_ledger
-            ledger = _read_ledger()
+            ledger = ledger_raw_rows()
         except Exception:
             ledger = []
         for row in ledger or []:
@@ -1642,12 +1649,11 @@ class ExecutorService:
             if item.get("trading_pair") == target["pair"] and item.get("ts") is not None:
                 found.append(item.get("ts"))
         try:
-            from utils.executor_checkpoint import _read_ledger
-            for row in _read_ledger():
-                if row.get("ts") is not None:
-                    found.append(row.get("ts"))
+            ledger_ts = ledger_min_ts()
         except Exception:
             return None
+        if ledger_ts is not None:
+            found.append(ledger_ts)
         return min(found) if found else None
 
     def _ids_of(self, items) -> set:
@@ -1684,7 +1690,7 @@ class ExecutorService:
     def _parsed_hold_rows(self):
         for row in getattr(self, "_hold_rows", None) or []:
             raw = row.get("checkpoint")
-            parsed = raw if isinstance(raw, dict) else parse_checkpoint_cached(raw)
+            parsed = raw if isinstance(raw, dict) else checkpoint_view(raw)
             if isinstance(parsed, dict):
                 yield parsed
 
@@ -2285,6 +2291,11 @@ class ExecutorService:
         except Exception:
             return None
         prices = []
+        released = set()
+        for item in rows:
+            if item.get("trading_pair") != pair:
+                continue
+            released.update(partial_released_ids(checkpoint_master(item.get("checkpoint"))))
         for row in rows:
             if row.get("trading_pair") != pair:
                 continue
@@ -2295,11 +2306,6 @@ class ExecutorService:
             parsed = row.get("price_checkpoint")
             if isinstance(parsed, str):
                 parsed = checkpoint_master(parsed)
-            released = set()
-            for item in rows:
-                if item.get("trading_pair") != pair:
-                    continue
-                released.update(partial_released_ids(checkpoint_master(item.get("checkpoint"))))
             fresh = self._tick_fresh(pair)
             feed = self._parsed_without_dead(parsed, fresh) if self._lists_ready(fresh) else parsed
             for hold in (feed or {}).get("holds") or []:
@@ -2484,34 +2490,16 @@ class ExecutorService:
 
     def _raw_unowned_ids(self):
         try:
-            from utils.executor_checkpoint import _read_ledger
-            rows = _read_ledger()
+            return ledger_unowned_ids()
         except Exception:
             return set()
-        return {
-            str(row.get("order_id"))
-            for row in rows or []
-            if row.get("order_id") and not row.get("executor_id")
-        }
 
     def _journal_mark(self, order_id: str):
         """owned, unowned, absent, or unread. A line without executor_id is not an owner."""
         try:
-            from utils.executor_checkpoint import _read_ledger
-            rows = _read_ledger()
+            return ledger_journal_mark(order_id)
         except Exception:
             return "unread", None
-        found = False
-        owner = None
-        for row in rows or []:
-            if str(row.get("order_id") or "") != str(order_id):
-                continue
-            found = True
-            if row.get("executor_id"):
-                owner = row.get("executor_id")
-        if owner:
-            return "owned", owner
-        return ("unowned", None) if found else ("absent", None)
 
     def _owed_owner(self, order_id: str, account: str, connector: str, pair: str):
         owed = owed_records()
@@ -2636,9 +2624,28 @@ class ExecutorService:
 
     def _parsed_without_dead(self, parsed, fresh):
         import copy
-        body = copy.deepcopy(parsed) if isinstance(parsed, dict) else parsed
-        if not isinstance(body, dict) or not self._lists_ready(fresh):
+        if not isinstance(parsed, dict) or not self._lists_ready(fresh):
             return parsed
+        dead = False
+        for level in parsed.get("levels") or []:
+            if not isinstance(level, dict):
+                continue
+            for key in ("open_order", "close_order"):
+                slot = level.get(key) or {}
+                if isinstance(slot, dict) and slot.get("order_id") and self._proven_dead(str(slot.get("order_id")), fresh):
+                    dead = True
+                    break
+            if dead:
+                break
+        if not dead:
+            for item in parsed.get("holds") or []:
+                if isinstance(item, dict) and self._proven_dead(str(item.get("order_id") or ""), fresh):
+                    dead = True
+                    break
+        if not dead:
+            return parsed
+        note_checkpoint_copy()
+        body = copy.deepcopy(parsed)
         levels = []
         for level in body.get("levels") or []:
             if not isinstance(level, dict):
@@ -4467,7 +4474,7 @@ class ExecutorService:
             # returns before start() withdraws them before the next row runs,
             # so a non-started journal line never makes an id foreign to a
             # starter that holds it.
-            parsed = parse_checkpoint_cached(row.get("checkpoint"))
+            parsed = checkpoint_view(row.get("checkpoint"))
             claims = set(saved_order_ids(parsed))
             claims.update(ledger_ids.get(row["executor_id"]) or [])
             claims.update(accounted_orders(row["executor_id"], parsed))
@@ -6326,10 +6333,14 @@ class ExecutorService:
             return None
 
     def _partial_parsed(self, executor_id: str) -> Optional[Dict[str, Any]]:
+        """Тело строки этого исполнителя: общий взгляд, только чтение.
+
+        Правящий читатель берёт свою копию (parse_checkpoint_cached или
+        copy.deepcopy): правка взгляда не должна остаться в кэше."""
         rows = getattr(self, "_hold_rows", None) or []
         for row in rows:
             if row.get("executor_id") == executor_id:
-                return parse_checkpoint_cached(row.get("checkpoint"))
+                return checkpoint_view(row.get("checkpoint"))
         return None
 
     async def _partial_column_text(self, executor_id: str) -> Optional[str]:
@@ -7451,17 +7462,9 @@ class ExecutorService:
 
     def _ledger_close_price_taken(self, price: Any, ignore_id: str = "") -> bool:
         try:
-            rows = _read_ledger()
+            return ledger_close_price_taken(price, ignore_id)
         except Exception:
             return True
-        for row in rows or []:
-            if str(row.get("order_id") or "") == str(ignore_id or ""):
-                continue
-            if row.get("role") not in ("close", "market_close"):
-                continue
-            if row.get("price") not in (None, "") and str(row.get("price")) == str(price):
-                return True
-        return False
 
     def _unpriced_close_blocks(self, executor: Any) -> bool:
         """A close id without a stored price blocks every send on this pair."""
@@ -7488,12 +7491,11 @@ class ExecutorService:
     def _close_price_known(self, order_id: str) -> bool:
         """Journal or a checkpoint the send reads. RAM ban prices are not this."""
         try:
-            rows = _read_ledger() or []
+            known = ledger_price_known(order_id)
         except Exception:
             return False
-        for row in rows:
-            if str(row.get("order_id") or "") == str(order_id) and row.get("price") not in (None, ""):
-                return True
+        if known:
+            return True
         wanted = str(order_id)
         for entry in self._hold_index():
             if entry["close_price_map"].get(wanted) not in (None, ""):

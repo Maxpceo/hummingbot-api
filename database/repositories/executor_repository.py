@@ -18,44 +18,16 @@ logger = logging.getLogger(__name__)
 
 
 def _slot_price(slot: Any, level: Dict[str, Any], allow_level_price: bool):
-    if not isinstance(slot, dict):
-        return None
-    price = slot.get("price")
-    if price in (None, ""):
-        order = slot.get("order")
-        if isinstance(order, dict):
-            price = order.get("price")
-    if price in (None, "") and allow_level_price:
-        price = level.get("price")
-    if price in (None, ""):
-        return None
-    return price
+    from utils.executor_checkpoint import slot_price
+
+    return slot_price(slot, level, allow_level_price)
 
 
 def _price_checkpoint(parsed: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Decorated copy. Does not assign the column and does not touch retained_orders."""
-    import copy
+    from utils.executor_checkpoint import decorate_checkpoint_copy
 
-    body = copy.deepcopy(parsed) if isinstance(parsed, dict) else {}
-    holds = [item for item in (body.get("holds") or []) if isinstance(item, dict)]
-    known = {str(item.get("order_id")) for item in holds if item.get("order_id")}
-    for level in body.get("levels") or []:
-        if not isinstance(level, dict):
-            continue
-        for key, allow_level in (("open_order", True), ("close_order", False)):
-            slot = level.get(key) or {}
-            if not isinstance(slot, dict):
-                continue
-            order_id = slot.get("order_id")
-            if not order_id or str(order_id) in known:
-                continue
-            price = _slot_price(slot, level, allow_level)
-            if price in (None, ""):
-                continue
-            holds.append({"order_id": order_id, "price": str(price)})
-            known.add(str(order_id))
-    body["holds"] = holds
-    return body
+    return decorate_checkpoint_copy(parsed)
 
 
 class ExecutorRepository:
@@ -340,7 +312,7 @@ class ExecutorRepository:
         The id is still on row_executor_id. price_checkpoint is a dict for the
         caller, not a database column and not written back.
         """
-        from utils.executor_checkpoint import parse_checkpoint
+        from utils.executor_checkpoint import checkpoint_decorated, checkpoint_master
 
         records = (await self.session.execute(select(ExecutorRecord))).scalars().all()
         rows = []
@@ -360,9 +332,9 @@ class ExecutorRepository:
             else:
                 row["row_executor_id"] = record.executor_id
             text = record.checkpoint
-            parsed = parse_checkpoint(text)
+            parsed = checkpoint_master(text)
             if not text or parsed is not None:
-                row["price_checkpoint"] = _price_checkpoint(parsed)
+                row["price_checkpoint"] = checkpoint_decorated(text)
             rows.append(row)
         return rows
 

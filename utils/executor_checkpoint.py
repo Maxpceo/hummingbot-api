@@ -496,6 +496,9 @@ _EMPTY_VIEW: Dict[str, Any] = {
     "orders": {},
     "holding_anon": set(),
     "holding_by_executor": {},
+    "unowned_ids": set(),
+    "close_price_ids": {},
+    "min_ts": None,
 }
 
 
@@ -604,6 +607,55 @@ def _rows_answers(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
         _LEDGER_CACHE_STATS["lookups"] += 1
         return snap["answers_raw"]
     return _answers_for_rows(rows)
+
+
+# ── Ответы прямых читателей журнала (план durable-open-hotspots) ─────────────
+#
+# Шесть читателей сервиса читали _read_ledger() напрямую — файл и разбор всех
+# строк на каждое обращение, а _close_price_known звался на каждый номер
+# закрытия на каждый уровень. Теперь они берут готовые ответы снимка: те же
+# формулы над теми же сырыми строками (без фильтра наборов — читатели и раньше
+# читали сырой журнал). Писатели идут мимо кэша как прежде: версия в finally.
+
+def ledger_raw_rows() -> List[Dict[str, Any]]:
+    """Сырой взгляд снимка ровно как _read_ledger(): строки только на чтение."""
+    return _ledger_snapshot()["raw"]
+
+
+def ledger_price_known(order_id: Any) -> bool:
+    """Есть ли строка номера с ценой (та же формула, что петля _close_price_known)."""
+    item = _rows_answers(ledger_raw_rows())["orders"].get(str(order_id)) or {}
+    return bool(item.get("price_known"))
+
+
+def ledger_journal_mark(order_id: Any) -> tuple:
+    """owned/unowned/absent как петля _journal_mark: владелец — последняя
+    строка номера с исполнителем, поздняя строка без исполнителя его не сбрасывает."""
+    item = _rows_answers(ledger_raw_rows())["orders"].get(str(order_id))
+    if item is None:
+        return "absent", None
+    owner = item.get("mark_owner")
+    if owner:
+        return "owned", owner
+    return "unowned", None
+
+
+def ledger_close_price_taken(price: Any, ignore_id: Any = "") -> bool:
+    """Занята ли цена строки role=close/market_close: та же вычитающая форма
+    петли _ledger_close_price_taken (строка без номера и пустой ignore_id отсекают
+    друг друга)."""
+    ids = _rows_answers(ledger_raw_rows())["close_price_ids"].get(str(price)) or set()
+    return bool(ids - {str(ignore_id or "")})
+
+
+def ledger_unowned_ids() -> set:
+    """Номера строк с order_id и без executor_id (как _raw_unowned_ids)."""
+    return set(_rows_answers(ledger_raw_rows())["unowned_ids"])
+
+
+def ledger_min_ts() -> Any:
+    """Меньший ts строк журнала (как петля _oldest_ts над _read_ledger())."""
+    return _rows_answers(ledger_raw_rows())["min_ts"]
 
 
 # One ledger path owes a directory entry until that fsync is seen to succeed.
@@ -1607,6 +1659,7 @@ def parse_checkpoint(raw: Optional[str]) -> Optional[Dict[str, Any]]:
 # цену — на ту же цену встала бы вторая заявка.
 
 _CHECKPOINT_CACHE: Dict[str, Any] = {}
+_CHECKPOINT_DECORATED: Dict[str, Any] = {}
 _CHECKPOINT_CACHE_STATS = {"parses": 0, "copies": 0}
 _CHECKPOINT_CACHE_MISS = object()
 
@@ -1632,14 +1685,94 @@ def checkpoint_master(raw: Any) -> Optional[Dict[str, Any]]:
 
 
 def parse_checkpoint_cached(raw: Any) -> Optional[Dict[str, Any]]:
-    """Глубокая копия разобранного тела: правка копии не остаётся в кэше."""
+    """Глубокая копия разобранного тела: правка копии не остаётся в кэше.
+
+    Остаётся для читателей, которые правят тело (путь старта и восстановления).
+    Читающий читатель берёт checkpoint_view без копии."""
+    note_checkpoint_copy()
     if isinstance(raw, dict):
         return copy.deepcopy(raw)
     master = checkpoint_master(raw)
     if master is None:
         return None
-    _CHECKPOINT_CACHE_STATS["copies"] += 1
     return copy.deepcopy(master)
+
+
+def checkpoint_view(raw: Any) -> Optional[Dict[str, Any]]:
+    """Разобранное тело без копии: общий для читателей, только чтение.
+
+    Правящий читатель берёт copy.deepcopy(view) или parse_checkpoint_cached."""
+    return checkpoint_master(raw)
+
+
+def slot_price(slot: Any, level: Dict[str, Any], allow_level_price: bool):
+    """Цена слота: сам слот, его запись заявки, для открытия — цена уровня."""
+    if not isinstance(slot, dict):
+        return None
+    price = slot.get("price")
+    if price in (None, ""):
+        order = slot.get("order")
+        if isinstance(order, dict):
+            price = order.get("price")
+    if price in (None, "") and allow_level_price:
+        price = level.get("price")
+    if price in (None, ""):
+        return None
+    return price
+
+
+def decorate_checkpoint_body(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Декор прежнего _price_checkpoint по уже своей копии тела: держатели
+    дополняются ценами слотов; колонка не назначается и retained_orders не трогаются."""
+    holds = [item for item in (body.get("holds") or []) if isinstance(item, dict)]
+    known = {str(item.get("order_id")) for item in holds if item.get("order_id")}
+    for level in body.get("levels") or []:
+        if not isinstance(level, dict):
+            continue
+        for key, allow_level in (("open_order", True), ("close_order", False)):
+            slot = level.get(key) or {}
+            if not isinstance(slot, dict):
+                continue
+            order_id = slot.get("order_id")
+            if not order_id or str(order_id) in known:
+                continue
+            price = slot_price(slot, level, allow_level)
+            if price in (None, ""):
+                continue
+            holds.append({"order_id": order_id, "price": str(price)})
+            known.add(str(order_id))
+    body["holds"] = holds
+    return body
+
+
+def decorate_checkpoint_copy(parsed: Any) -> Dict[str, Any]:
+    """Прежний _price_checkpoint: декорированная копия своего тела."""
+    note_checkpoint_copy()
+    body = copy.deepcopy(parsed) if isinstance(parsed, dict) else {}
+    return decorate_checkpoint_body(body)
+
+
+def checkpoint_decorated(raw: Any) -> Dict[str, Any]:
+    """Декорированное тело — один раз на текст, общий для читателей: не правится.
+
+    Ответ ровно decorate_checkpoint_copy(parse_checkpoint(raw)). Срок кэша тот же,
+    что у мастера: чистит checkpoint_cache_prune — каждая запись тела даёт новый
+    текст, и без чистки копии копились бы в памяти. Правящий читатель берёт
+    copy.deepcopy."""
+    if isinstance(raw, dict) or not raw:
+        return decorate_checkpoint_copy(raw)
+    key = checkpoint_text_key(raw)
+    hit = _CHECKPOINT_DECORATED.get(key, _CHECKPOINT_CACHE_MISS)
+    if hit is _CHECKPOINT_CACHE_MISS:
+        master = checkpoint_master(raw)
+        hit = decorate_checkpoint_copy(master)
+        _CHECKPOINT_DECORATED[key] = hit
+    return hit
+
+
+def note_checkpoint_copy() -> None:
+    """Счётчик копий тела для свидетеля шага: все копии, не только parse_checkpoint_cached."""
+    _CHECKPOINT_CACHE_STATS["copies"] += 1
 
 
 def checkpoint_cache_prune(texts) -> None:
@@ -1648,6 +1781,8 @@ def checkpoint_cache_prune(texts) -> None:
     keep = {checkpoint_text_key(text) for text in texts or [] if isinstance(text, str) and text}
     for key in [key for key in _CHECKPOINT_CACHE if key not in keep]:
         _CHECKPOINT_CACHE.pop(key, None)
+    for key in [key for key in _CHECKPOINT_DECORATED if key not in keep]:
+        _CHECKPOINT_DECORATED.pop(key, None)
 
 
 def checkpoint_cache_stats() -> Dict[str, int]:
@@ -4293,10 +4428,20 @@ def _answers_for_rows(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
     same `executor_id not in (None, "", executor_id)` filter as before.
     """
     orders: Dict[str, Dict[str, Any]] = {}
+    unowned_ids: set = set()
+    close_price_ids: Dict[str, set] = {}
+    min_ts: Any = None
     for row in rows or []:
         key = str(row.get("order_id") or "")
         item = orders.setdefault(key, {"lines": []})
         item["lines"].append(row)
+        if row.get("order_id") and not row.get("executor_id"):
+            unowned_ids.add(str(row.get("order_id")))
+        if row.get("role") in ("close", "market_close") and row.get("price") not in (None, ""):
+            close_price_ids.setdefault(str(row.get("price")), set()).add(str(row.get("order_id") or ""))
+        ts = row.get("ts")
+        if ts is not None and (min_ts is None or ts < min_ts):
+            min_ts = ts
     for item in orders.values():
         lines = item["lines"]
         item["send_marked"] = len(lines) >= 2 and any(partial_has_five(row) for row in lines[1:])
@@ -4306,6 +4451,10 @@ def _answers_for_rows(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
         )
         item["has_five"] = any(partial_has_five(row) for row in lines)
         item["lone_five"] = item["has_five"] and not item["send_marked"] and not item["old_remember"]
+        item["price_known"] = any(row.get("price") not in (None, "") for row in lines)
+        item["mark_owner"] = next(
+            (row.get("executor_id") for row in reversed(lines) if row.get("executor_id")), None
+        )
         if item["send_marked"]:
             item["kind"] = "send-mark"
         elif item["old_remember_plain"]:
@@ -4335,6 +4484,9 @@ def _answers_for_rows(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
         "orders": orders,
         "holding_anon": holding_anon,
         "holding_by_executor": holding_by_executor,
+        "unowned_ids": unowned_ids,
+        "close_price_ids": close_price_ids,
+        "min_ts": min_ts,
     }
 
 
