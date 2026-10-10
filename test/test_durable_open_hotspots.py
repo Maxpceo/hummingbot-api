@@ -624,9 +624,17 @@ async def test_column_prices_matches_the_old_nested_pass(monkeypatch, tmp_path):
     service = _column_service(monkeypatch, rows)
     fresh = await service._column_prices("DOGE-USDT")
     assert fresh == _old_column_prices(service, rows, "DOGE-USDT"), (
-        "hoist released изменил список цен колонки"
+        "список цен колонки разошёлся с прежним вложенным пересчётом"
     )
     assert fresh, "форма пустая: сверка ничего не держит"
+
+    def _bomb(*_args, **_kwargs):
+        raise AssertionError("мёртвый набор released снова считается в _column_prices")
+
+    monkeypatch.setattr(mod, "partial_released_ids", _bomb)
+    assert await service._column_prices("DOGE-USDT") == fresh, (
+        "список цен колонки изменился после удаления мёртвого набора"
+    )
 
 
 # ── проба 7: читающий путь не делает копий тела и не читает файл заново ───────
@@ -891,6 +899,11 @@ async def test_column_gate_closes_on_a_broken_text(monkeypatch, tmp_path):
     service = _column_service(monkeypatch, rows)
     assert await service._column_prices("DOGE-USDT") is None, (
         "битый текст в базе перестал закрывать гейт column prices unread"
+    )
+    rows[-1] = dict(rows[-1], price_checkpoint={"holds": []})
+    service = _column_service(monkeypatch, rows)
+    assert await service._column_prices("DOGE-USDT") is None, (
+        "битый текст с ключом прошёл гейт: гейт держит только отсутствие ключа"
     )
 
 

@@ -2303,11 +2303,6 @@ class ExecutorService:
         except Exception:
             return None
         prices = []
-        released = set()
-        for item in rows:
-            if item.get("trading_pair") != pair:
-                continue
-            released.update(partial_released_ids(checkpoint_master(item.get("checkpoint"))))
         for row in rows:
             if row.get("trading_pair") != pair:
                 continue
