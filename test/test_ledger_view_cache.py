@@ -239,11 +239,15 @@ def test_journal_pass_is_not_quadratic(monkeypatch, tmp_path):
     rows = []
     for i in range(1200):
         order_id = "o%04d" % i
-        if i % 2 == 0:
+        if i % 4 == 0:
             rows.append(_annotation(order_id))
-            rows.append(_five(order_id, level_id="L1"))
-        else:
+            rows.append(_five(order_id, level_id="L1", price="0.2"))
+        elif i % 4 == 1:
             rows.append(_remember(order_id))
+        elif i % 4 == 2:
+            rows.append(_five(order_id, price="0.3"))  # одинокая пятиполевая: не держит и мимо цен
+        else:
+            rows.append(_remember(order_id, role="close", price="0.4"))  # не держит, цена занимает
     _boot(monkeypatch, tmp_path / "data" / "order-ledger.jsonl", rows)
     journal = read_ledger_filtered()
 
@@ -254,7 +258,7 @@ def test_journal_pass_is_not_quadratic(monkeypatch, tmp_path):
         key = str(row.get("order_id") or "")
         if key in held:
             continue
-        if _new_lone_five(journal, key):
+        if partial_lone_five(journal, key):
             continue
         if row.get("price") not in (None, ""):
             new_pass.append((key, row.get("price")))
@@ -277,6 +281,7 @@ def test_journal_pass_is_not_quadratic(monkeypatch, tmp_path):
             old_pass.append((key, row.get("take_profit_price")))
     old_time = time.monotonic() - started
 
+    assert new_pass, "проход обязан собирать занятые цены недержимых номеров"
     assert new_pass == old_pass
     assert new_time < old_time
 
