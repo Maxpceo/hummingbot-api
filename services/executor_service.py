@@ -152,6 +152,7 @@ from utils.executor_checkpoint import (
     LEDGER_LOCK,
     add_miss_order,
     add_sent_order,
+    ledger_cache_stats,
     order_is_unsent,
     read_ledger_filtered,
     remove_miss_order,
@@ -509,6 +510,7 @@ class ExecutorService:
         while self._is_running:
             step_started = time.monotonic()
             step_stats = checkpoint_cache_stats()
+            step_ledger = ledger_cache_stats()
             try:
                 # Update timestamps for all trading interfaces via TradingService
                 self._trading_service.update_all_timestamps()
@@ -565,12 +567,15 @@ class ExecutorService:
             step_took = time.monotonic() - step_started
             if step_took > 5.0:
                 stats = checkpoint_cache_stats()
+                ledger = ledger_cache_stats()
                 logger.warning(
-                    "slow control step: %.1fs hold_rows=%d parses=%d copies=%d",
+                    "slow control step: %.1fs hold_rows=%d parses=%d copies=%d ledger_reads=%d ledger_lookups=%d",
                     step_took,
                     len(getattr(self, "_hold_rows", None) or []),
                     stats.get("parses", 0) - step_stats.get("parses", 0),
                     stats.get("copies", 0) - step_stats.get("copies", 0),
+                    ledger.get("reads", 0) - step_ledger.get("reads", 0),
+                    ledger.get("lookups", 0) - step_ledger.get("lookups", 0),
                 )
 
             await asyncio.sleep(self.update_interval)
@@ -6301,7 +6306,7 @@ class ExecutorService:
     def _partial_lone_five(self, rows: List[Dict[str, Any]], order_id: str) -> bool:
         if not order_id or partial_send_marked(rows, order_id):
             return False
-        lines = [row for row in rows if str(row.get("order_id") or "") == order_id]
+        lines = partial_lines(rows, order_id)
         if any(partial_old_remember(row) for row in lines):
             return False
         return any(partial_has_five(row) for row in lines)
@@ -6318,8 +6323,9 @@ class ExecutorService:
         return False
 
     def _partial_rows(self) -> Optional[List[Dict[str, Any]]]:
+        """The snapshot's rows: read-only, a reader that edits takes its own copy."""
         try:
-            return list(read_ledger_filtered())
+            return read_ledger_filtered()
         except Exception:
             return None
 

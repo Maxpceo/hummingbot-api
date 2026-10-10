@@ -325,6 +325,7 @@ def _durable_write_set(path: str, items) -> bool:
         logger.warning("order set write failed (%s): %s", path, exc)
         return False
     finally:
+        _bump_ledger_version()
         if descriptor is not None:
             try:
                 os.close(descriptor)
@@ -471,19 +472,132 @@ def read_ledger_filtered() -> List[Dict[str, Any]]:
     A number in durable miss and not in durable sent never reached the exchange,
     so its line holds neither a level nor a tick. An unreadable sent keeps every
     line; an unreadable miss drops nothing.
+
+    Served from the ledger snapshot: the file is read again only when its key
+    changed (п.1 плана ledger-scan-cache). Rows are read-only for readers — a
+    reader that edits a row takes its own copy first.
     """
-    rows = _read_ledger()
+    return _ledger_snapshot()["rows"]
+
+
+# ── Снимок журнала: одно чтение файла на шаг (план ledger-scan-cache) ─────────
+#
+# Строки снимка для читателей неизменяемы: читатель, которому нужно поправить
+# строку, берёт свою копию. Писатели журнала и наборов идут мимо кэша: в конце
+# записи поднимают версию, и следующее чтение пересобирает снимок — только что
+# записанная строка видна тому же шагу. Устаревший снимок при сбое чтения не
+# подставляется: сбой чтения журнала так же кидает _LedgerReadError.
+
+_LEDGER_CACHE_LOCK = threading.Lock()
+_LEDGER_CACHE_VERSION = 0
+_LEDGER_SNAPSHOT: Optional[Dict[str, Any]] = None
+_LEDGER_CACHE_STATS = {"reads": 0, "lookups": 0}
+
+
+def ledger_cache_stats() -> Dict[str, int]:
+    return dict(_LEDGER_CACHE_STATS)
+
+
+def ledger_cache_reset_stats() -> None:
+    _LEDGER_CACHE_STATS["reads"] = 0
+    _LEDGER_CACHE_STATS["lookups"] = 0
+
+
+def _bump_ledger_version() -> None:
+    global _LEDGER_CACHE_VERSION
+    _LEDGER_CACHE_VERSION += 1
+
+
+def _ledger_file_key(path: str) -> Optional[tuple]:
+    """None means the key could not be built: rebuild by reading, never serve cache.
+
+    A broken stat is not an absent file. Absence is confirmed only when the
+    directory itself can be read — the same discipline as _load_set_file, so a
+    broken stat can never free a live order's price by hiding its line.
+    """
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        try:
+            os.listdir(os.path.dirname(path) or ".")
+        except OSError:
+            return None
+        return ("absent", path)
+    except OSError:
+        return None
+    return ("file", path, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _ledger_cache_key() -> Optional[tuple]:
+    parts = []
+    for path in (order_ledger_path(), _miss_path(), _sent_path()):
+        part = _ledger_file_key(path)
+        if part is None:
+            return None
+        parts.append(part)
+    return (tuple(parts), _LEDGER_CACHE_VERSION)
+
+
+def _build_ledger_snapshot(pre_key: Optional[tuple]) -> Dict[str, Any]:
+    """One read of the file and the sets. pre_key is taken before that read.
+
+    A write landing after this read bumps the version, so the next lookup sees
+    a changed key and rebuilds: the just-written line is never hidden. A
+    snapshot built while a set was unreadable is not cacheable — the filter
+    kept every line only because the set could not be read.
+    """
+    raw = _read_ledger()
     miss = _load_set_file(_miss_path())
+    sent = _load_set_file(_sent_path()) if miss else None
     if not miss:
-        return rows
-    sent = _load_set_file(_sent_path())
-    if sent is None:
-        return rows
-    return [
-        row for row in rows
-        if str(row.get("order_id") or "") not in miss
-        or str(row.get("order_id") or "") in sent
-    ]
+        rows = raw
+    elif sent is None:
+        rows = raw
+    else:
+        rows = [
+            row for row in raw
+            if str(row.get("order_id") or "") not in miss
+            or str(row.get("order_id") or "") in sent
+        ]
+    cacheable = pre_key is not None and miss is not None and (not miss or sent is not None)
+    return {
+        "key": pre_key if cacheable else None,
+        "raw": raw,
+        "rows": rows,
+        "answers": _answers_for_rows(rows),
+        "answers_raw": _answers_for_rows(raw),
+    }
+
+
+def _ledger_snapshot() -> Dict[str, Any]:
+    global _LEDGER_SNAPSHOT
+    with _LEDGER_CACHE_LOCK:
+        pre_key = _ledger_cache_key()
+        snap = _LEDGER_SNAPSHOT
+        if snap is not None and pre_key is not None and snap["key"] == pre_key:
+            return snap
+        _LEDGER_CACHE_STATS["reads"] += 1
+        try:
+            snap = _build_ledger_snapshot(pre_key)
+        except BaseException:
+            _LEDGER_SNAPSHOT = None
+            raise
+        _LEDGER_SNAPSHOT = snap if snap["key"] is not None else None
+        return snap
+
+
+def _rows_answers(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    """Per-order answers for these rows. The snapshot's own lists are cached."""
+    if rows is None:
+        return {}
+    snap = _LEDGER_SNAPSHOT
+    if snap is not None and rows is snap["rows"]:
+        _LEDGER_CACHE_STATS["lookups"] += 1
+        return snap["answers"]
+    if snap is not None and rows is snap["raw"]:
+        _LEDGER_CACHE_STATS["lookups"] += 1
+        return snap["answers_raw"]
+    return _answers_for_rows(rows)
 
 
 # One ledger path owes a directory entry until that fsync is seen to succeed.
@@ -546,6 +660,7 @@ def _write_ledger(rows: List[Dict[str, Any]]) -> None:
     except OSError as exc:
         logger.warning("order ledger write failed: %s", exc)
     finally:
+        _bump_ledger_version()
         if descriptor is not None:
             os.close(descriptor)
         if temporary and not replaced:
@@ -597,6 +712,7 @@ def _append_ledger_line(row: Dict[str, Any], *, marker_ready: bool = False) -> b
     except (OSError, TypeError, ValueError) as exc:
         logger.warning("order ledger append failed: %s", exc)
     finally:
+        _bump_ledger_version()
         if descriptor is not None:
             os.close(descriptor)
     if not file_synced:
@@ -834,8 +950,11 @@ def reset_ledger_process_state() -> None:
     """Drop this process's memory of the ledger. The marker file stays."""
     global _MARKER_FD, _MARKER_FD_PATH, _MARKER_NAME_SYNCED, _MARKER_UNLINK_DIR_OWED
     global _LEDGER_NAME_FSYNC_OWED, _LEDGER_PARENT_FSYNC_OWED, _BOUND_LEDGER_PATH
-    global _PARTIAL_ABSENT
+    global _PARTIAL_ABSENT, _LEDGER_SNAPSHOT
     _PARTIAL_ABSENT = set()
+    _LEDGER_SNAPSHOT = None
+    _bump_ledger_version()
+    ledger_cache_reset_stats()
     if _MARKER_FD is not None:
         try:
             os.close(_MARKER_FD)
@@ -1144,7 +1263,7 @@ def ledger_order_ids() -> Optional[set]:
     if os.path.exists(ledger_debt_marker()) and not _marker_debt_is_only_absent():
         return None
     try:
-        rows = _read_ledger()
+        rows = _ledger_snapshot()["raw"]
     except _LedgerReadError:
         return None
     return {
@@ -4105,15 +4224,19 @@ def partial_has_five(row: Optional[Dict[str, Any]]) -> bool:
 
 
 def partial_lines(rows: Optional[List[Dict[str, Any]]], order_id: str) -> List[Dict[str, Any]]:
-    return [row for row in rows or [] if str(row.get("order_id") or "") == str(order_id)]
+    """The lines of one number in journal order. Same answer, no full-file scan.
+
+    Shallow copies out: the snapshot's rows are shared and read-only, a reader
+    that edits its line edits its own copy.
+    """
+    item = _rows_answers(rows).get(str(order_id))
+    return [dict(row) for row in item["lines"]] if item else []
 
 
 def partial_send_marked(rows: Optional[List[Dict[str, Any]]], order_id: str) -> bool:
     """The second line, not a lone five-field row, is the send mark."""
-    lines = partial_lines(rows, order_id)
-    if len(lines) < 2:
-        return False
-    return any(partial_has_five(row) for row in lines[1:])
+    item = _rows_answers(rows).get(str(order_id))
+    return bool(item and item["send_marked"])
 
 
 def partial_old_remember(row: Optional[Dict[str, Any]]) -> bool:
@@ -4150,6 +4273,31 @@ def partial_close_send_line(row: Optional[Dict[str, Any]]) -> bool:
     return row.get("take_profit_price") in (None, "")
 
 
+def _answers_for_rows(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    """Lines of each number in journal order and its answers, by the same predicates.
+
+    Each answer is the same expression the readers ran over all rows, computed
+    once over the same lines in the same order: nothing added, nothing lost.
+    `old_remember_plain` is the «remember, not an annotation» rule, whose
+    `item is not row` guard is a no-op: the guarded rule only runs on an
+    annotation line, which never satisfies `not partial_annotation_line(row)`.
+    """
+    answers: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        key = str(row.get("order_id") or "")
+        item = answers.setdefault(key, {"lines": []})
+        item["lines"].append(row)
+    for item in answers.values():
+        lines = item["lines"]
+        item["send_marked"] = len(lines) >= 2 and any(partial_has_five(row) for row in lines[1:])
+        item["old_remember"] = any(partial_old_remember(row) for row in lines)
+        item["old_remember_plain"] = any(
+            partial_old_remember(row) and not partial_annotation_line(row) for row in lines
+        )
+        item["has_five"] = any(partial_has_five(row) for row in lines)
+    return answers
+
+
 def partial_holding_ids(rows: Optional[List[Dict[str, Any]]], executor_id: str) -> set:
     """Old remember and a successful send mark hold. A lone five-field row does not.
 
@@ -4159,6 +4307,7 @@ def partial_holding_ids(rows: Optional[List[Dict[str, Any]]], executor_id: str) 
     found = set()
     if rows is None:
         return found
+    answers = _rows_answers(rows)
     for row in rows:
         if row.get("executor_id") not in (None, "", executor_id):
             continue
@@ -4168,16 +4317,13 @@ def partial_holding_ids(rows: Optional[List[Dict[str, Any]]], executor_id: str) 
             continue
         if row.get("role") in ("close", "market_close"):
             continue
-        if partial_send_marked(rows, str(order_id)):
+        item = answers.get(str(order_id)) or {}
+        if item.get("send_marked"):
             found.add(str(order_id))
             continue
         if not partial_old_remember(row):
             continue
-        if partial_annotation_line(row) and any(
-            partial_old_remember(item) and not partial_annotation_line(item)
-            for item in partial_lines(rows, str(order_id))
-            if item is not row
-        ):
+        if partial_annotation_line(row) and item.get("old_remember_plain"):
             continue
         found.add(str(order_id))
     return found
@@ -4192,15 +4338,14 @@ def partial_hold_kinds(
     kinds: Dict[str, str] = {}
     if rows is None:
         return kinds
+    answers = _rows_answers(rows)
     for order_id in partial_holding_ids(rows, executor_id):
         if parsed is not None and partial_end_visible(parsed, str(order_id)):
             continue
-        if partial_send_marked(rows, str(order_id)):
+        item = answers.get(str(order_id)) or {}
+        if item.get("send_marked"):
             kinds[str(order_id)] = "send-mark"
-        elif any(
-            partial_old_remember(item) and not partial_annotation_line(item)
-            for item in partial_lines(rows, str(order_id))
-        ):
+        elif item.get("old_remember_plain"):
             kinds[str(order_id)] = "remember"
         else:
             kinds[str(order_id)] = "annotation-only"
