@@ -28,6 +28,7 @@ from utils.executor_checkpoint import (
     partial_hold_kinds,
     partial_holding_ids,
     partial_lines,
+    partial_lone_five,
     partial_old_remember,
     partial_send_marked,
     partial_stop_forbidden,
@@ -148,16 +149,6 @@ def _old_stop_forbidden(rows, parsed, executor_id, *, proof_ready):
     return False
 
 
-def _new_lone_five(rows, order_id):
-    """Тот же ответ, что _partial_lone_five сервиса после правки."""
-    if not order_id or partial_send_marked(rows, order_id):
-        return False
-    lines = partial_lines(rows, order_id)
-    if any(partial_old_remember(row) for row in lines):
-        return False
-    return any(partial_has_five(row) for row in lines)
-
-
 # ── формы строк журнала ────────────────────────────────────────────────────────
 
 
@@ -240,7 +231,7 @@ def test_journal_is_read_once_for_many_lookups(monkeypatch, tmp_path):
     for order_id in sample:
         assert partial_lines(journal, order_id) == _old_lines(journal, order_id)
         assert partial_send_marked(journal, order_id) == _old_send_marked(journal, order_id)
-        assert _new_lone_five(journal, order_id) == _old_lone_five(journal, order_id)
+        assert partial_lone_five(journal, order_id) == _old_lone_five(journal, order_id)
     assert partial_holding_ids(journal, "ex") == _old_holding_ids(journal, "ex")
 
 
@@ -320,7 +311,7 @@ def test_readers_match_the_old_journal_reading(monkeypatch, tmp_path):
     for order_id in ["n%d" % i for i in range(1, 12)] + ["отсутствует"]:
         assert partial_lines(journal, order_id) == _old_lines(journal, order_id), order_id
         assert partial_send_marked(journal, order_id) == _old_send_marked(journal, order_id), order_id
-        assert _new_lone_five(journal, order_id) == _old_lone_five(journal, order_id), order_id
+        assert partial_lone_five(journal, order_id) == _old_lone_five(journal, order_id), order_id
     for executor_id in ("ex", "other", None, ""):
         assert partial_holding_ids(journal, executor_id) == _old_holding_ids(journal, executor_id)
         for parsed in parsed_forms:
@@ -364,27 +355,28 @@ def test_writer_bypass_sees_the_fresh_send_mark(monkeypatch, tmp_path):
         return rows
 
     monkeypatch.setattr(ledger_mod, "_read_ledger", read_and_append)
-    ledger_mod._bump_ledger_version()  # первый вызов обязан пересобрать снимок
+    monkeypatch.setattr(ledger_mod, "_ledger_file_key", lambda _path: ("frozen",))
     journal = read_ledger_filtered()
     assert all(row.get("order_id") != "n2" for row in journal)
     journal = read_ledger_filtered()
-    assert any(row.get("order_id") == "n2" for row in journal), "следующий вызов пересобирает снимок"
+    assert any(row.get("order_id") == "n2" for row in journal), "следующий вызов пересобирает снимок по версии"
 
 
 def test_version_beats_an_identical_stat(monkeypatch, tmp_path):
     path = tmp_path / "data" / "order-ledger.jsonl"
     _boot(monkeypatch, path, [_annotation("n1")])
     read_ledger_filtered()
-    frozen_key = ledger_mod._ledger_cache_key()
     monkeypatch.setattr(ledger_mod, "_ledger_file_key", lambda _path: ("frozen",))
     assert ledger_mod._ledger_cache_key()[0] == (("frozen",),) * 3
 
+    # снимок обязан построиться под замороженным ключом — дальше отличает только версия
+    journal = read_ledger_filtered()
+    assert not partial_send_marked(journal, "n1")
     assert append_durable_row(_five("n1", level_id="L1"))
     reads_before = ledger_cache_stats()["reads"]
     journal = read_ledger_filtered()
-    assert ledger_cache_stats()["reads"] == reads_before + 1
-    assert partial_send_marked(journal, "n1"), "версия писателя перебивает неизменившийся stat"
-    assert frozen_key is not None
+    assert ledger_cache_stats()["reads"] == reads_before + 1, "версия писателя перебивает неизменившийся stat"
+    assert partial_send_marked(journal, "n1"), "записанная метка видна, хотя stat заморожен"
 
 
 # ── проба 4: занятые цены не теряются ─────────────────────────────────────────
@@ -418,10 +410,10 @@ def test_occupied_prices_match_the_old_pass(monkeypatch, tmp_path):
         return prices
 
     for executor_id in ("ex", "other"):
-        new_prices = collect(partial_holding_ids(journal, executor_id), _new_lone_five)
+        new_prices = collect(partial_holding_ids(journal, executor_id), partial_lone_five)
         old_prices = collect(_old_holding_ids(journal, executor_id), _old_lone_five)
         assert new_prices == old_prices
-    ex_prices = collect(partial_holding_ids(journal, "ex"), _new_lone_five)
+    ex_prices = collect(partial_holding_ids(journal, "ex"), partial_lone_five)
     assert ("n5", "0.5") in ex_prices, "чужой номер по цене остаётся занятой ценой для своих"
     assert ("n1", "0.1") not in ex_prices, "метка отправки держит свою цену"
 

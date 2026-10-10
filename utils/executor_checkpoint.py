@@ -525,7 +525,7 @@ def _ledger_file_key(path: str) -> Optional[tuple]:
         return ("absent", path)
     except OSError:
         return None
-    return ("file", path, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    return ("file", path, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
 
 def _ledger_cache_key() -> Optional[tuple]:
@@ -4295,7 +4295,16 @@ def _answers_for_rows(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[st
             partial_old_remember(row) and not partial_annotation_line(row) for row in lines
         )
         item["has_five"] = any(partial_has_five(row) for row in lines)
+        item["lone_five"] = item["has_five"] and not item["send_marked"] and not item["old_remember"]
     return answers
+
+
+def partial_lone_five(rows: Optional[List[Dict[str, Any]]], order_id: str) -> bool:
+    """A lone five-field row: five fields, but neither send-mark nor old remember."""
+    if not order_id:
+        return False
+    item = _rows_answers(rows).get(str(order_id))
+    return bool(item and item["lone_five"])
 
 
 def partial_holding_ids(rows: Optional[List[Dict[str, Any]]], executor_id: str) -> set:

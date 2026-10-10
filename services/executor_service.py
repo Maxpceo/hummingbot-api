@@ -135,6 +135,7 @@ from utils.executor_checkpoint import (
     partial_holding_ids,
     partial_level_released,
     partial_lines,
+    partial_lone_five,
     partial_lists_cover,
     partial_old_remember,
     partial_order_body,
@@ -6304,12 +6305,7 @@ class ExecutorService:
         return prices
 
     def _partial_lone_five(self, rows: List[Dict[str, Any]], order_id: str) -> bool:
-        if not order_id or partial_send_marked(rows, order_id):
-            return False
-        lines = partial_lines(rows, order_id)
-        if any(partial_old_remember(row) for row in lines):
-            return False
-        return any(partial_has_five(row) for row in lines)
+        return partial_lone_five(rows, order_id)
 
     def _partial_price_belongs_to_released(self, rows: List[Dict[str, Any]], released: set, price: Any) -> bool:
         if price in (None, ""):
