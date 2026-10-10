@@ -7,6 +7,7 @@ _read_ledger() (включая форму с записью в наборах �
 и встала бы вторая заявка на ту же цену.
 """
 
+import copy
 import json
 
 import pytest
@@ -19,8 +20,6 @@ ExecutorService = mod.ExecutorService
 
 from contextlib import asynccontextmanager  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
-
-from database.repositories.executor_repository import _price_checkpoint  # noqa: E402
 
 import utils.executor_checkpoint as ledger_mod  # noqa: E402
 from utils.executor_checkpoint import (  # noqa: E402
@@ -44,6 +43,10 @@ from utils.executor_checkpoint import (  # noqa: E402
     ledger_unowned_ids,
     parse_checkpoint,
     parse_checkpoint_cached,
+    partial_annotation_line,
+    partial_has_five,
+    partial_holding_ids,
+    partial_old_remember,
     read_ledger_filtered,
     reset_ledger_process_state,
 )
@@ -104,11 +107,212 @@ def _old_min_ts():
     return min(found) if found else None
 
 
-# ── прежний декор тела: _price_checkpoint(parse_checkpoint(text)) ────────────
+# ── прежний декор тела: _price_checkpoint/_slot_price из базы bac7f35 ─────────
 
 
-def _old_decorated(text):
-    return _price_checkpoint(parse_checkpoint(text))
+def _old_slot_price(slot, level, allow_level_price):
+    if not isinstance(slot, dict):
+        return None
+    price = slot.get("price")
+    if price in (None, ""):
+        order = slot.get("order")
+        if isinstance(order, dict):
+            price = order.get("price")
+    if price in (None, "") and allow_level_price:
+        price = level.get("price")
+    if price in (None, ""):
+        return None
+    return price
+
+
+def _old_decorated(parsed):
+    """Тело старого _price_checkpoint из bac7f35, скопированное в пробу."""
+    body = copy.deepcopy(parsed) if isinstance(parsed, dict) else {}
+    holds = [item for item in (body.get("holds") or []) if isinstance(item, dict)]
+    known = {str(item.get("order_id")) for item in holds if item.get("order_id")}
+    for level in body.get("levels") or []:
+        if not isinstance(level, dict):
+            continue
+        for key, allow_level in (("open_order", True), ("close_order", False)):
+            slot = level.get(key) or {}
+            if not isinstance(slot, dict):
+                continue
+            order_id = slot.get("order_id")
+            if not order_id or str(order_id) in known:
+                continue
+            price = _old_slot_price(slot, level, allow_level)
+            if price in (None, ""):
+                continue
+            holds.append({"order_id": order_id, "price": str(price)})
+            known.add(str(order_id))
+    body["holds"] = holds
+    return body
+
+
+def _old_decorated_text(text):
+    return _old_decorated(parse_checkpoint(text))
+
+
+# ── прежние предикаты занятых цен (база bac7f35, до кэша снимка) ─────────────
+
+
+def _old_lines(rows, order_id):
+    return [row for row in rows or [] if str(row.get("order_id") or "") == str(order_id)]
+
+
+def _old_send_marked(rows, order_id):
+    lines = _old_lines(rows, order_id)
+    if len(lines) < 2:
+        return False
+    return any(partial_has_five(row) for row in lines[1:])
+
+
+def _old_lone_five(rows, order_id):
+    if not order_id or _old_send_marked(rows, order_id):
+        return False
+    lines = [row for row in rows or [] if str(row.get("order_id") or "") == order_id]
+    if any(partial_old_remember(row) for row in lines):
+        return False
+    return any(partial_has_five(row) for row in lines)
+
+
+def _old_holding_ids(rows, executor_id):
+    found = set()
+    if rows is None:
+        return found
+    for row in rows:
+        if row.get("executor_id") not in (None, "", executor_id):
+            continue
+        order_id = row.get("order_id")
+        level_id = row.get("level_id")
+        if not order_id or not level_id:
+            continue
+        if row.get("role") in ("close", "market_close"):
+            continue
+        if _old_send_marked(rows, str(order_id)):
+            found.add(str(order_id))
+            continue
+        if not partial_old_remember(row):
+            continue
+        if partial_annotation_line(row) and any(
+            partial_old_remember(item) and not partial_annotation_line(item)
+            for item in _old_lines(rows, str(order_id))
+            if item is not row
+        ):
+            continue
+        found.add(str(order_id))
+    return found
+
+
+# ── занятые цены: прежняя и нынешняя формулы _durable_open ─────────────────
+
+
+def _old_collect_stored(rows, executor_id):
+    """Формула базы: сырой журнал, прежние предикаты (блок stored из _durable_open)."""
+    stored = []
+    journal_ts = []
+    held = _old_holding_ids(rows, executor_id)
+    for row in rows:
+        order_key = str(row.get("order_id") or "")
+        if row.get("ts") is not None:
+            journal_ts.append(row.get("ts"))
+        if order_key in held:
+            continue
+        if _old_lone_five(rows, order_key):
+            continue
+        if row.get("price") not in (None, ""):
+            stored.append((order_key, row.get("price")))
+        if row.get("take_profit_price") not in (None, ""):
+            stored.append((order_key, row.get("take_profit_price")))
+    return stored, journal_ts
+
+
+def _new_collect_stored(service, executor_id):
+    """Нынешний блок stored из _durable_open, строка в строку."""
+    stored = []
+    journal_ts = []
+    ledger_rows = read_ledger_filtered()
+    held_now = partial_holding_ids(ledger_rows, executor_id)
+    for row in ledger_rows:
+        order_key = str(row.get("order_id") or "")
+        if row.get("ts") is not None:
+            journal_ts.append(row.get("ts"))
+        if order_key in held_now:
+            continue
+        if service._partial_lone_five(ledger_rows, order_key):
+            continue
+        if row.get("price") not in (None, ""):
+            stored.append((order_key, row.get("price")))
+        if row.get("take_profit_price") not in (None, ""):
+            stored.append((order_key, row.get("take_profit_price")))
+    return stored, journal_ts
+
+
+def _old_collect_journal_prices(rows):
+    prices = []
+    for row in rows:
+        order_key = str(row.get("order_id") or "")
+        if not order_key:
+            continue
+        if _old_lone_five(rows, order_key):
+            continue
+        if row.get("price") not in (None, ""):
+            prices.append((order_key, row.get("price")))
+        if row.get("take_profit_price") not in (None, ""):
+            prices.append((order_key, row.get("take_profit_price")))
+    return prices
+
+
+def _new_collect_journal_prices(service):
+    prices = []
+    ledger_rows = read_ledger_filtered()
+    for row in ledger_rows:
+        order_key = str(row.get("order_id") or "")
+        if not order_key:
+            continue
+        if service._partial_lone_five(ledger_rows, order_key):
+            continue
+        if row.get("price") not in (None, ""):
+            prices.append((order_key, row.get("price")))
+        if row.get("take_profit_price") not in (None, ""):
+            prices.append((order_key, row.get("take_profit_price")))
+    return prices
+
+
+def _old_unpriced_close_blocks(service, executor):
+    """Формула базы: прежняя _close_price_known с петлёй над _read_ledger()."""
+    pair = getattr(getattr(executor, "config", None), "trading_pair", None)
+    for other in service._active_executors.values():
+        other_pair = getattr(getattr(other, "config", None), "trading_pair", None)
+        if pair and other_pair and other_pair != pair:
+            continue
+        ids = {str(item) for item in getattr(other, "_close_ban_ids", set()) or set() if item}
+        for item in getattr(other, "_close_holds", []) or []:
+            if isinstance(item, dict) and item.get("order_id"):
+                ids.add(str(item.get("order_id")))
+        close = getattr(other, "_close_order", None)
+        if getattr(close, "order_id", None):
+            ids.add(str(close.order_id))
+        for order_id in ids:
+            if _old_close_price_known(service, order_id):
+                continue
+            if service._close_left_the_book(other, order_id):
+                continue
+            return True
+    return False
+
+
+def _old_close_price_known(service, order_id):
+    for row in _old_read() or []:
+        if str(row.get("order_id") or "") == str(order_id) and row.get("price") not in (None, ""):
+            return True
+    wanted = str(order_id)
+    for entry in service._hold_index():
+        if entry["close_price_map"].get(wanted) not in (None, ""):
+            return True
+        if entry["close_hold_price_map"].get(wanted) not in (None, ""):
+            return True
+    return False
 
 
 # ── прежний фильтр мёртвых: то, что делал _parsed_without_dead до правки ──────
@@ -311,14 +515,14 @@ def _body_forms():
 @pytest.mark.parametrize("body", _body_forms())
 def test_decorated_body_matches_the_old_price_checkpoint(body):
     text = json.dumps(body, sort_keys=True)
-    assert checkpoint_decorated(text) == _old_decorated(text), (
-        "декор кэша разошёлся с прежним _price_checkpoint(parse_checkpoint(text))"
+    assert checkpoint_decorated(text) == _old_decorated_text(text), (
+        "декор кэша разошёлся со старым _price_checkpoint(parse_checkpoint(text)) из базы"
     )
-    assert checkpoint_decorated(body) == _price_checkpoint(body), (
-        "декор от своего тела разошёлся с прежним _price_checkpoint"
+    assert checkpoint_decorated(body) == _old_decorated(body), (
+        "декор от своего тела разошёлся со старым _price_checkpoint из базы"
     )
-    assert checkpoint_decorated("") == _old_decorated("")
-    assert checkpoint_decorated("{not json") == _old_decorated("{not json")
+    assert checkpoint_decorated("") == _old_decorated_text("")
+    assert checkpoint_decorated("{not json") == _old_decorated_text("{not json")
 
 
 # ── проба 4: декор один на текст и чистится вместе с мастером ─────────────────
@@ -595,3 +799,144 @@ def test_external_file_change_is_picked_up(monkeypatch, tmp_path):
     assert ledger_price_known("late") is True, "внешняя правка журнала не подхвачена"
     assert ledger_close_price_taken("7.7", "") is True
     assert ledger_min_ts() == 2.0
+
+
+# ── проба 14: занятые цены stored/journal_prices равны прежней формуле ─────────
+
+
+def _price_rows_forms():
+    return [
+        {"order_id": "a", "price": "0.1", "executor_id": "ex", "level_id": "L1", "ts": 5.0},
+        {"order_id": "a", "price": "0.11", "executor_id": "ex", "level_id": "L1", "ts": 6.0},
+        {"order_id": "b", "take_profit_price": "0.21", "executor_id": "ex", "level_id": "L2"},
+        {"order_id": "c", "price": "0.3", "executor_id": "other", "level_id": "L1"},
+        {"order_id": "d", "price": "0.4"},
+        {"order_id": "", "price": "0.5"},
+        {"order_id": "e", "price": "0.6", "executor_id": "ex", "level_id": "L3", "ts": 1.0},
+    ]
+
+
+def test_occupied_price_lists_match_the_old_pass(monkeypatch, tmp_path):
+    """Списки занятых цен _durable_open до и после равны: цена номера не
+    выпадает из занятых и не встаёт вторая заявка на ту же цену."""
+    _boot(monkeypatch, tmp_path / "data" / "order-ledger.jsonl", _price_rows_forms())
+    service = _bare_service([])
+    raw = _old_read()
+    old_stored, old_ts = _old_collect_stored(raw, "ex")
+    new_stored, new_ts = _new_collect_stored(service, "ex")
+    assert new_stored == old_stored, "список stored разошёлся с прежней формулой"
+    assert new_ts == old_ts
+    assert _new_collect_journal_prices(service) == _old_collect_journal_prices(raw), (
+        "список journal_prices разошёлся с прежней формулой"
+    )
+    assert ("c", "0.3") in new_stored and ("d", "0.4") in new_stored, (
+        "форма сломана: занятые цены не собраны"
+    )
+    assert ("a", "0.1") not in new_stored, (
+        "форма сломана: удержанный номер должен исключаться из списка занятых"
+    )
+
+
+# ── проба 15: ответ _unpriced_close_blocks равен прежнему ─────────────────────
+
+
+class _Other:
+    class config:
+        trading_pair = "DOGE-USDT"
+
+    _close_ban_ids = {"close-ban"}
+    _close_holds = [{"order_id": "chold-x"}, {"order_id": "close-a"}]
+    _close_order = SimpleNamespace(order_id="close-live")
+
+
+class _Self:
+    class config:
+        trading_pair = "DOGE-USDT"
+
+
+def test_unpriced_close_blocks_matches_the_old(monkeypatch, tmp_path):
+    """«Заявка без хозяина»: тормоз незакрытой цены тот же, что и до правки."""
+    rows = [{"executor_id": "grid-a", "checkpoint": json.dumps(_body_forms()[0]), "trading_pair": "DOGE-USDT"}]
+    _boot(monkeypatch, tmp_path / "data" / "order-ledger.jsonl", [
+        {"order_id": "close-live", "price": "0.9", "role": "close", "executor_id": "other"},
+        {"order_id": "close-a", "price": "0.91", "role": "close", "executor_id": "other"},
+        {"order_id": "close-ban", "price": "0.92", "role": "close", "executor_id": "other"},
+    ])
+    service = _bare_service(rows)
+    service.__dict__["_active_executors"] = {"other": _Other()}
+    assert service._unpriced_close_blocks(_Self()) is False
+    assert _old_unpriced_close_blocks(service, _Self()) is False
+
+    _boot(monkeypatch, tmp_path / "data" / "order-ledger.jsonl", [])
+    service = _bare_service(rows)
+    service.__dict__["_active_executors"] = {"other": _Other()}
+    assert service._unpriced_close_blocks(_Self()) is True, (
+        "тормоз незакрытой цены пропал: чужая заявка останется без хозяина"
+    )
+    assert _old_unpriced_close_blocks(service, _Self()) is True
+
+
+# ── проба 16: гейт «column prices unread» на битом тексте в базе ──────────────
+
+
+async def test_column_gate_closes_on_a_broken_text(monkeypatch, tmp_path):
+    _boot(monkeypatch, tmp_path / "data" / "order-ledger.jsonl", [])
+    rows = _column_rows()
+    rows.append({
+        "executor_type": "grid_executor", "account_name": "main",
+        "connector_name": "okx_perpetual_demo", "trading_pair": "DOGE-USDT",
+        "controller_id": "main", "created_at": None, "config": "{}",
+        "checkpoint": "{not json", "executor_id": "grid-broken",
+    })
+    service = _column_service(monkeypatch, rows)
+    assert await service._column_prices("DOGE-USDT") is None, (
+        "битый текст в базе перестал закрывать гейт column prices unread"
+    )
+
+
+# ── проба 17: обход sweep при сбое чтения пустой ─────────────────────────────
+
+
+async def test_sweep_pass_is_empty_on_read_failure(monkeypatch, tmp_path):
+    path = tmp_path / "data" / "order-ledger.jsonl"
+    _boot(monkeypatch, path, [
+        {"order_id": "a", "price": "0.1", "executor_id": "ex", "ts": 5.0},
+        {"order_id": "b", "price": "0.2", "executor_id": "ex", "ts": 6.0},
+    ])
+    service = _bare_service([])
+    service.db_manager = None
+    committed = []
+
+    async def _fake_commit(self, owner, order_id, price):
+        committed.append((owner, order_id, price))
+        return True
+
+    monkeypatch.setattr(ExecutorService, "_commit_price_hold", _fake_commit)
+    monkeypatch.setattr(mod, "recover_folder_debt", lambda: None)
+    await service._sweep_unproven_orders()
+    assert committed, "форма сломана: обход sweep ничего не собрал"
+
+    committed.clear()
+    path.unlink()
+    path.mkdir()
+    await service._sweep_unproven_orders()
+    assert committed == [], "обход sweep при сбое чтения журнала не пустой"
+
+
+# ── проба 18: смешанные типы ts не роняют сборку снимка ────────────────────────
+
+
+def test_mixed_ts_types_do_not_break_the_snapshot(monkeypatch, tmp_path):
+    _boot(monkeypatch, tmp_path / "data" / "order-ledger.jsonl", [
+        {"order_id": "a", "price": "0.1", "executor_id": "ex", "ts": 3.0},
+        {"order_id": "b", "price": "0.2", "ts": "later"},
+        {"order_id": "c", "price": "0.3"},
+    ])
+    assert ledger_price_known("a") is True, "снимок не собрался из-за смешанных типов ts"
+    assert ledger_journal_mark("c") == ("unowned", None)
+    assert ledger_unowned_ids() == {"b", "c"}, "чужие номера снова без хозяина из-за битого ts"
+    assert ledger_close_price_taken("0.2") is False
+    assert ledger_min_ts() in (3.0, "later")
+    service = _bare_service([])
+    monkeypatch.setattr(mod, "owed_records", lambda: [])
+    assert service._oldest_ts({"pair": "DOGE-USDT"}) == ledger_min_ts()

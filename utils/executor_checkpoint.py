@@ -4440,8 +4440,18 @@ def _answers_for_rows(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
         if row.get("role") in ("close", "market_close") and row.get("price") not in (None, ""):
             close_price_ids.setdefault(str(row.get("price")), set()).add(str(row.get("order_id") or ""))
         ts = row.get("ts")
-        if ts is not None and (min_ts is None or ts < min_ts):
-            min_ts = ts
+        if ts is not None:
+            if min_ts is None:
+                min_ts = ts
+            else:
+                try:
+                    if ts < min_ts:
+                        min_ts = ts
+                except TypeError:
+                    # Несопоставимые типы ts не роняют сборку снимка: иначе битый
+                    # журнал отключил бы и те читателей, которым ts не нужен
+                    # (замечание проверяющего кода).
+                    pass
     for item in orders.values():
         lines = item["lines"]
         item["send_marked"] = len(lines) >= 2 and any(partial_has_five(row) for row in lines[1:])
