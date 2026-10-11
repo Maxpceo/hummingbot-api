@@ -677,6 +677,26 @@ async def test_uncovered_row_time_writes_no_end_and_holds_the_stop(tmp_path, mon
     assert service._partial_forbids(EXECUTOR) is True
 
 
+async def test_hold_planted_in_the_body_keeps_the_level(tmp_path, monkeypatch):
+    _journal(tmp_path, monkeypatch, [_row("buy-1"), _row("sell-1")])
+    checkpoint = _checkpoint(_level(open_id="buy-1", close_id="sell-1", take="101"))
+    fresh = _fresh(finished=[_finished("buy-1"), _finished("sell-1")])
+    service, repo = _service_with(monkeypatch, checkpoint, fresh, [])
+    real = service._partial_cas
+
+    async def plant(executor_id, mutate, visible, target_id=None):
+        stored = json.loads(repo.rows[0]["checkpoint"])
+        stored.setdefault("holds", []).append({"order_id": "buy-live", "level_id": "L1"})
+        repo.rows[0]["checkpoint"] = json.dumps(stored, sort_keys=True)
+        return await real(executor_id, mutate, visible, target_id)
+
+    service._partial_cas = plant
+    await service._shutdown_release_step(EXECUTOR, _ram_executor())
+    stored = _stored(repo)
+    assert not partial_level_released(stored, "L1")
+    assert stored["levels"][0]["take_profit_price"] == "101"
+
+
 async def test_cancel_without_base_fields_does_not_flatten(tmp_path, monkeypatch):
     _journal(tmp_path, monkeypatch, [_row("buy-1"), _row("sell-1")])
     checkpoint = _checkpoint(_level(open_id="buy-1", close_id="sell-1", take="101"))

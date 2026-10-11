@@ -5397,7 +5397,7 @@ class ExecutorService:
 
         def proven_dead(order_id: str) -> bool:
             text = str(order_id or "")
-            if not text or text in inflight or text in lost or order_send_unknown(text):
+            if order_miss_unreadable() or not text or text in inflight or text in lost or order_send_unknown(text):
                 return False
             return self._shutdown_id_dead(text, fresh)
 
@@ -5522,7 +5522,7 @@ class ExecutorService:
         wrote_ends: list = []
         wrote_ids: list = []
 
-        def ids_of_body(level: Dict[str, Any]) -> list:
+        def ids_of_body(level: Dict[str, Any], body: Dict[str, Any], live_journal) -> list:
             found = []
             for key in ("open_order", "close_order"):
                 text = str((level.get(key) or {}).get("order_id") or "")
@@ -5532,10 +5532,10 @@ class ExecutorService:
                 if isinstance(item, dict) and item.get("order_id"):
                     found.append(str(item.get("order_id")))
             level_id = str(level.get("id") or "")
-            for row in journal or []:
+            for row in live_journal or []:
                 if row.get("executor_id") == executor_id and str(row.get("level_id") or "") == level_id and row.get("order_id"):
                     found.append(str(row.get("order_id")))
-            for hold in (parsed.get("holds") or []):
+            for hold in body.get("holds") or []:
                 if isinstance(hold, dict) and str(hold.get("level_id") or "") == level_id and hold.get("order_id"):
                     found.append(str(hold.get("order_id")))
             for ram in getattr(executor, "grid_levels", []) or []:
@@ -5547,13 +5547,19 @@ class ExecutorService:
                         found.append(text)
             return list(dict.fromkeys(found))
 
-        def flat_on_body(level: Dict[str, Any]) -> bool:
-            ids = ids_of_body(level)
+        def flat_on_body(level: Dict[str, Any], body: Dict[str, Any], live_journal) -> bool:
+            if live_journal is None:
+                return False
+            ids = ids_of_body(level, body, live_journal)
             return bool(ids) and self._shutdown_level_flat(level, fresh) and all(
                 proven_dead(item) for item in ids
             ) and not self._shutdown_position_open(level, ids, fresh)
 
         def mutate(body: Dict[str, Any]) -> None:
+            try:
+                live_journal = read_ledger_filtered()
+            except Exception:
+                live_journal = None
             ends = dict(body.get("partial_ends") or {})
             wrote_flat.clear()
             for level in body.get("levels") or []:
@@ -5561,9 +5567,9 @@ class ExecutorService:
                     continue
                 level_id = str(level.get("id") or "")
                 # Решение по телу, которое пишем сейчас, не по снимку до чтения.
-                if level_id in {str(item.get("id")) for item in flat_levels} and flat_on_body(level):
+                if level_id in {str(item.get("id")) for item in flat_levels} and flat_on_body(level, body, live_journal):
                     ids = [
-                        text for text in ids_of_body(level)
+                        text for text in ids_of_body(level, body, live_journal)
                         if proven_dead(text)
                     ]
                     key = ids[0] if ids else level_id
