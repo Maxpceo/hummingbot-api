@@ -677,6 +677,22 @@ async def test_uncovered_row_time_writes_no_end_and_holds_the_stop(tmp_path, mon
     assert service._partial_forbids(EXECUTOR) is True
 
 
+async def test_filled_journal_buy_keeps_price_when_slot_is_a_later_cancel(tmp_path, monkeypatch):
+    _journal(tmp_path, monkeypatch, [_row("buy-old"), _row("buy-new")])
+    checkpoint = _checkpoint(_level(open_id="buy-new", take="101", bought="1"))
+    fresh = _fresh(finished=[
+        _finished("buy-new"),
+        _finished("buy-old", filled=True, amount="1"),
+    ])
+    service, repo = _service_with(monkeypatch, checkpoint, fresh, [])
+    await service._shutdown_release_step(EXECUTOR, _ram_executor(open_id="buy-new"))
+    stored = _stored(repo)
+    assert not partial_level_released(stored, "L1")
+    assert stored["levels"][0]["take_profit_price"] == "101"
+    for mark in (stored.get("partial_ends") or {}).values():
+        assert mark.get("level_id") != "L1"
+
+
 async def test_live_ram_slot_keeps_the_flat_level(tmp_path, monkeypatch):
     _journal(tmp_path, monkeypatch, [_row("buy-1"), _row("sell-1")])
     checkpoint = _checkpoint(_level(open_id="buy-1", close_id="sell-1"))

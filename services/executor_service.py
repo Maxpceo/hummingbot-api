@@ -5305,6 +5305,34 @@ class ExecutorService:
             sold += self._shutdown_sold_base(row)
         return sold >= bought
 
+    def _shutdown_position_open(self, level: Dict[str, Any], numbers, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Позиция уровня ещё открыта: куплено больше, чем продано.
+
+        Слот open уже может быть другой отменённый номер. Исполненная покупка
+        в журнале того же уровня всё равно держит цену тейка.
+        """
+        close_ids = set()
+        closed = str((level.get("close_order") or {}).get("order_id") or "")
+        if closed:
+            close_ids.add(closed)
+        for item in level.get("partial_closes") or []:
+            if isinstance(item, dict) and item.get("order_id"):
+                close_ids.add(str(item.get("order_id")))
+        sold = Decimal("0")
+        for text in close_ids:
+            row = self._finished_row(text, fresh)
+            if row is not None and self._closed_row_filled(row):
+                sold += self._shutdown_sold_base(row)
+        bought = partial_decimal(level.get("partial_bought"))
+        if bought is not None and bought > 0 and sold < bought:
+            return True
+        for text in numbers or []:
+            if text in close_ids or not self._proven_dead_filled(text, fresh):
+                continue
+            if bought is None or bought <= 0 or sold < bought:
+                return True
+        return False
+
     def _shutdown_sold_base(self, row: Dict[str, Any]) -> Decimal:
         """База исполненной продажи: amount минус left, иначе fill_size."""
         base = partial_raw_base(row)
@@ -5441,6 +5469,7 @@ class ExecutorService:
                 numbers is not None
                 and self._shutdown_level_flat(level, fresh)
                 and all(proven_dead(item) for item in numbers)
+                and not self._shutdown_position_open(level, numbers, fresh)
             ):
                 flat_levels.append(level)
                 flat_numbers[str(level.get("id"))] = list(numbers)
@@ -5483,33 +5512,67 @@ class ExecutorService:
             return
         lone_ends = list(dict.fromkeys(lone_ends))
 
+        wrote_flat: list = []
+
+        def ids_of_body(level: Dict[str, Any]) -> list:
+            found = []
+            for key in ("open_order", "close_order"):
+                text = str((level.get(key) or {}).get("order_id") or "")
+                if text:
+                    found.append(text)
+            for item in level.get("partial_closes") or []:
+                if isinstance(item, dict) and item.get("order_id"):
+                    found.append(str(item.get("order_id")))
+            level_id = str(level.get("id") or "")
+            for row in journal or []:
+                if row.get("executor_id") == executor_id and str(row.get("level_id") or "") == level_id and row.get("order_id"):
+                    found.append(str(row.get("order_id")))
+            for hold in (parsed.get("holds") or []):
+                if isinstance(hold, dict) and str(hold.get("level_id") or "") == level_id and hold.get("order_id"):
+                    found.append(str(hold.get("order_id")))
+            for ram in getattr(executor, "grid_levels", []) or []:
+                if str(getattr(ram, "id", "") or "") != level_id:
+                    continue
+                for seated in (getattr(ram, "active_open_order", None), getattr(ram, "active_close_order", None)):
+                    text = str(getattr(seated, "order_id", "") or "")
+                    if text:
+                        found.append(text)
+            return list(dict.fromkeys(found))
+
+        def flat_on_body(level: Dict[str, Any]) -> bool:
+            ids = ids_of_body(level)
+            return bool(ids) and self._shutdown_level_flat(level, fresh) and all(
+                proven_dead(item) for item in ids
+            ) and not self._shutdown_position_open(level, ids, fresh)
+
         def mutate(body: Dict[str, Any]) -> None:
             ends = dict(body.get("partial_ends") or {})
+            wrote_flat.clear()
             for level in body.get("levels") or []:
                 if not isinstance(level, dict):
                     continue
-                if str(level.get("id")) in {str(item.get("id")) for item in flat_levels}:
-                    ids = []
-                    slot = level.get("open_order") or {}
-                    close = level.get("close_order") or {}
-                    if slot.get("order_id"):
-                        ids.append(str(slot.get("order_id")))
-                    if close.get("order_id"):
-                        ids.append(str(close.get("order_id")))
-                    for item in level.get("partial_closes") or []:
-                        if isinstance(item, dict) and item.get("order_id"):
-                            ids.append(str(item.get("order_id")))
-                    ids = list(dict.fromkeys(item for item in ids if item))
-                    key = ids[0] if ids else str(level.get("id"))
-                    ends[key] = {"kind": "flat", "level_id": str(level.get("id")), "order_ids": ids}
+                level_id = str(level.get("id") or "")
+                # Решение по телу, которое пишем сейчас, не по снимку до чтения.
+                if level_id in {str(item.get("id")) for item in flat_levels} and flat_on_body(level):
+                    ids = [
+                        text for text in ids_of_body(level)
+                        if proven_dead(text)
+                    ]
+                    key = ids[0] if ids else level_id
+                    ends[key] = {"kind": "flat", "level_id": level_id, "order_ids": ids}
                     level.pop("take_profit_price", None)
                     level["close_order"] = None
                     level["partial_closes"] = []
+                    slot = level.get("open_order") or {}
                     if slot.get("filled"):
                         level["open_order"] = None
                     self._strip_recorded(body, ids)
-                for level_id, close_id in dead_closes:
-                    if str(level.get("id")) == level_id:
+                    wrote_flat.append(level_id)
+                for dead_level, close_id in dead_closes:
+                    if level_id != dead_level:
+                        continue
+                    current = str((level.get("close_order") or {}).get("order_id") or "")
+                    if current == close_id and proven_dead(current):
                         level["close_order"] = None
             for text in lone_ends:
                 self._shutdown_end_mark(ends, text)
@@ -5519,8 +5582,8 @@ class ExecutorService:
             self._strip_recorded(body, [*lone_ends, *([market_id] if market_dead else [])])
 
         def visible(stored: Optional[Dict[str, Any]]) -> bool:
-            for level in flat_levels:
-                if not partial_level_released(stored, str(level.get("id"))):
+            for level_id in wrote_flat:
+                if not partial_level_released(stored, level_id):
                     return False
             for text in [*lone_ends, *([market_id] if market_dead else [])]:
                 if not partial_end_visible(stored, text):
