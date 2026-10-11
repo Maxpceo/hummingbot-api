@@ -746,6 +746,10 @@ async def test_filled_journal_buy_keeps_price_when_slot_is_a_later_cancel(tmp_pa
     assert stored["levels"][0]["take_profit_price"] == "101"
     for mark in (stored.get("partial_ends") or {}).values():
         assert mark.get("level_id") != "L1"
+    seat = service._partial_pair_seat_prices(PAIR, set())
+    assert "101" in {str(item[1] if isinstance(item, tuple) else item) for item in seat}
+    fed = service._feed_prices(service._partial_rows() or [], service._partial_parsed(EXECUTOR), fresh)
+    assert "101" in {str(item) for item in fed}
 
 
 async def test_live_ram_slot_keeps_the_flat_level(tmp_path, monkeypatch):

@@ -2698,8 +2698,10 @@ class ExecutorService:
                     copy_level[key] = {}
                     # Исполненная покупка держит тейк-тик уровня (позиция открыта):
                     # цена take-profit не отпущена и остаётся в фиде постановки.
-                    if key == "open_order" and not self._proven_dead_filled(
-                        str(slot.get("order_id")), fresh
+                    if (
+                        key == "open_order"
+                        and not self._proven_dead_filled(str(slot.get("order_id")), fresh)
+                        and not self._shutdown_position_open(copy_level, [str(slot.get("order_id"))], fresh)
                     ):
                         copy_level["take_profit_price"] = None
             levels.append(copy_level)
@@ -6720,9 +6722,12 @@ class ExecutorService:
                 # Уровень пропускается только когда все его номера мёртвы без
                 # исполнения (zero-dead). Исполненная покупка держит позицию —
                 # её пара (opened, take_profit_price) остаётся в фиде.
-                if opened and self._proven_dead_zero(opened, fresh) and (not closed or self._proven_dead_zero(closed, fresh)):
+                position_open = self._shutdown_position_open(level, [opened, closed], fresh)
+                if opened and self._proven_dead_zero(opened, fresh) and (not closed or self._proven_dead_zero(closed, fresh)) and not position_open:
                     continue
-                if not self._proven_dead_zero(opened, fresh) and level.get("take_profit_price") not in (None, ""):
+                if level.get("take_profit_price") not in (None, "") and (
+                    not self._proven_dead_zero(opened, fresh) or position_open
+                ):
                     prices.append((opened, level.get("take_profit_price")))
                 close = level.get("close_order") or {}
                 if not self._proven_dead(closed, fresh) and close.get("price") not in (None, ""):

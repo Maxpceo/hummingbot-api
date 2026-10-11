@@ -4695,6 +4695,10 @@ def partial_feed_prices(
         }
         level_ids.discard("")
         if level_ids and level_ids & released:
+            # Слот отменён, но тейк в теле ещё стоит: позиция открыта, тик
+            # должен остаться в фиде, иначе на него встанет вторая покупка.
+            if level.get("take_profit_price") not in (None, ""):
+                prices.append(level.get("take_profit_price"))
             continue
         if level.get("take_profit_price") not in (None, ""):
             prices.append(level.get("take_profit_price"))
