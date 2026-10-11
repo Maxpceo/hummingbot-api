@@ -2658,9 +2658,9 @@ class ExecutorService:
         return row is not None and self._closed_row_filled(row)
 
     def _proven_dead_zero(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
-        """Доказанно мёртв без исполнения: отмена с нулевой базой."""
+        """Отмена с нулевой базой. Пустые amount/left — не ноль."""
         row = self._finished_row(order_id, fresh)
-        return row is not None and not self._closed_row_filled(row)
+        return row is not None and gate_base_is_zero(row)
 
     def _parsed_without_dead(self, parsed, fresh):
         import copy
@@ -5386,8 +5386,14 @@ class ExecutorService:
         # который мог дойти до биржи и ещё не сидит в слоте.
         if order_miss_unreadable():
             return
-        inflight = getattr(connector, "in_flight_orders", None) or {}
-        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
+        inflight = getattr(connector, "in_flight_orders", None)
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None)
+        # Пустой словарь живой книги нельзя подменять новым: заявка садится в него
+        # пока запись идёт, и повторная проверка должна её увидеть.
+        if not isinstance(inflight, dict):
+            inflight = {}
+        if not isinstance(lost, dict):
+            lost = {}
 
         def proven_dead(order_id: str) -> bool:
             text = str(order_id or "")
@@ -5513,6 +5519,8 @@ class ExecutorService:
         lone_ends = list(dict.fromkeys(lone_ends))
 
         wrote_flat: list = []
+        wrote_ends: list = []
+        wrote_ids: list = []
 
         def ids_of_body(level: Dict[str, Any]) -> list:
             found = []
@@ -5568,63 +5576,55 @@ class ExecutorService:
                         level["open_order"] = None
                     self._strip_recorded(body, ids)
                     wrote_flat.append(level_id)
+                    wrote_ids.extend(ids)
                 for dead_level, close_id in dead_closes:
                     if level_id != dead_level:
                         continue
                     current = str((level.get("close_order") or {}).get("order_id") or "")
                     if current == close_id and proven_dead(current):
                         level["close_order"] = None
+                        wrote_ids.append(current)
+            wrote_ends.clear()
             for text in lone_ends:
+                if not proven_dead(text):
+                    continue
                 self._shutdown_end_mark(ends, text)
-            if market_dead:
+                wrote_ends.append(text)
+            if market_dead and proven_dead(market_id):
                 self._shutdown_end_mark(ends, market_id)
-            body["partial_ends"] = ends
-            self._strip_recorded(body, [*lone_ends, *([market_id] if market_dead else [])])
+                wrote_ends.append(market_id)
+            if wrote_ends or wrote_flat:
+                body["partial_ends"] = ends
+            if wrote_ends:
+                self._strip_recorded(body, wrote_ends)
 
         def visible(stored: Optional[Dict[str, Any]]) -> bool:
             for level_id in wrote_flat:
                 if not partial_level_released(stored, level_id):
                     return False
-            for text in [*lone_ends, *([market_id] if market_dead else [])]:
+            for text in wrote_ends:
                 if not partial_end_visible(stored, text):
                     return False
             return True
 
         if not await self._partial_cas(executor_id, mutate, visible, None):
             return
-        released_ids = list(lone_ends)
-        for level in flat_levels:
-            released_ids.extend(flat_numbers.get(str(level.get("id"))) or [])
-            for key in ("open_order", "close_order"):
-                text = str((level.get(key) or {}).get("order_id") or "")
-                if text:
-                    released_ids.append(text)
-            for item in level.get("partial_closes") or []:
-                if isinstance(item, dict) and item.get("order_id"):
-                    released_ids.append(str(item.get("order_id")))
-        for _level_id, close_id in dead_closes:
-            released_ids.append(close_id)
-        if market_dead:
-            released_ids.append(market_id)
+        released_ids = [*wrote_ends, *wrote_ids]
         self._forget_close_memory(executor, released_ids)
-        if market_dead:
+        if market_id in wrote_ends:
             executor._close_order = None
-        flat_ids = {str(item.get("id")) for item in flat_levels}
-        dead_close_ids = {close_id for _level_id, close_id in dead_closes}
+        flat_ids = set(wrote_flat)
         for level in getattr(executor, "grid_levels", []) or []:
             level_id = str(getattr(level, "id", "") or "")
+            opened_now = str(getattr(getattr(level, "active_open_order", None), "order_id", "") or "")
+            closed_now = str(getattr(getattr(level, "active_close_order", None), "order_id", "") or "")
             if level_id in flat_ids:
-                # Слот чистим только если его текущий номер сам снят этим шагом.
-                # Чужой живой номер, севший в память после снимка, не затираем.
-                opened_now = str(getattr(getattr(level, "active_open_order", None), "order_id", "") or "")
-                closed_now = str(getattr(getattr(level, "active_close_order", None), "order_id", "") or "")
                 if opened_now and opened_now in released_ids:
                     level.active_open_order = None
                 if closed_now and closed_now in released_ids:
                     level.active_close_order = None
                 continue
-            seated = getattr(level, "active_close_order", None)
-            if str(getattr(seated, "order_id", "") or "") in dead_close_ids:
+            if closed_now and closed_now in released_ids:
                 level.active_close_order = None
 
     async def stop_executor(

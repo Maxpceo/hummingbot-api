@@ -677,6 +677,41 @@ async def test_uncovered_row_time_writes_no_end_and_holds_the_stop(tmp_path, mon
     assert service._partial_forbids(EXECUTOR) is True
 
 
+async def test_cancel_without_base_fields_does_not_flatten(tmp_path, monkeypatch):
+    _journal(tmp_path, monkeypatch, [_row("buy-1"), _row("sell-1")])
+    checkpoint = _checkpoint(_level(open_id="buy-1", close_id="sell-1", take="101"))
+    bare = {"text": "buy-1", "status": "closed", "finish_as": "cancelled"}
+    bare_sell = {"text": "sell-1", "status": "closed", "finish_as": "cancelled"}
+    fresh = _fresh(finished=[bare, bare_sell])
+    service, repo = _service_with(monkeypatch, checkpoint, fresh, [])
+    await service._shutdown_release_step(EXECUTOR, _ram_executor(open_id="buy-1", close_id="sell-1"))
+    stored = _stored(repo)
+    assert not partial_level_released(stored, "L1")
+    assert stored["levels"][0]["take_profit_price"] == "101"
+
+
+async def test_number_that_lands_in_flight_during_the_write_keeps_its_end(tmp_path, monkeypatch):
+    _journal(tmp_path, monkeypatch, [_row("mkt-1")])
+    service, repo = _service_with(
+        monkeypatch, _checkpoint(), _fresh(finished=[_finished("mkt-1")]), [],
+    )
+    executor = _ram_executor()
+    executor._close_order = SimpleNamespace(order_id="mkt-1")
+    book = executor.connectors["gate_io"].in_flight_orders
+    service._active_executors[EXECUTOR] = executor
+    real = service._partial_cas
+
+    async def land_then_write(executor_id, mutate, visible, target_id=None):
+        book["mkt-1"] = SimpleNamespace(price="1")
+        return await real(executor_id, mutate, visible, target_id)
+
+    service._partial_cas = land_then_write
+    before = repo.rows[0]["checkpoint"]
+    await service._shutdown_release_step(EXECUTOR, executor)
+    assert repo.rows[0]["checkpoint"] == before
+    assert executor._close_order.order_id == "mkt-1"
+
+
 async def test_filled_journal_buy_keeps_price_when_slot_is_a_later_cancel(tmp_path, monkeypatch):
     _journal(tmp_path, monkeypatch, [_row("buy-old"), _row("buy-new")])
     checkpoint = _checkpoint(_level(open_id="buy-new", take="101", bought="1"))
