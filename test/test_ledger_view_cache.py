@@ -124,28 +124,26 @@ def _old_exposure(rows, parsed, executor_id):
 
 
 def _old_stop_forbidden(rows, parsed, executor_id, *, proof_ready):
-    from utils.executor_checkpoint import partial_end_visible, partial_level_released
+    """Форма после плана stop-locks-release: слоты уровней стоп не держат.
+
+    Прежняя форма держала стоп по column_holds и по любому holding без конца —
+    отсюда замкнутый круг, в котором стоп не доходит до конца. Теперь держат
+    только номера с неизвестной судьбой: durable miss без sent и номера, чьи
+    строки свежие списки не покрывают. Эталоны ниже покрыты (ts нет — покрытие
+    полное), поэтому держит только miss без sent, при любом proof_ready.
+    """
+    from utils.executor_checkpoint import order_is_unsent, order_send_unknown, partial_end_visible
 
     if rows is None:
         return _old_exposure(None, parsed, executor_id)
     holding = _old_holding_ids(rows, executor_id)
-    column_holds = False
-    for level in (parsed or {}).get("levels") or []:
-        slot = (level or {}).get("open_order") or {}
-        close = (level or {}).get("close_order") or {}
-        if slot.get("order_id") and slot.get("level_id") and not partial_end_visible(parsed, str(slot.get("order_id"))):
-            column_holds = True
-        if close.get("order_id") and close.get("level_id") and not partial_level_released(parsed, str(level.get("id"))):
-            column_holds = True
-    if not holding and not column_holds:
+    if not holding:
         return False
-    if not proof_ready:
-        return True
     for order_id in holding:
-        if not partial_end_visible(parsed, order_id):
+        if partial_end_visible(parsed, order_id):
+            continue
+        if order_is_unsent(str(order_id)) or order_send_unknown(str(order_id)):
             return True
-    if column_holds:
-        return True
     return False
 
 

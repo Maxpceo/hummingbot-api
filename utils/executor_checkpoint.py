@@ -466,6 +466,21 @@ def order_is_unsent(order_id: str) -> bool:
     return str(order_id) not in sent
 
 
+def order_send_unknown(order_id: str) -> bool:
+    """Номер в durable miss, а набор sent не читается: судьба отправки неизвестна.
+
+    order_is_unsent здесь отвечает ложью (он держит только доказанный miss без
+    sent). Для стопа нечитаемый набор — не разрешение пройти: отправка могла
+    дойти до биржи.
+    """
+    if not order_id:
+        return False
+    miss = _load_set_file(_miss_path())
+    if not miss or str(order_id) not in miss:
+        return False
+    return _load_set_file(_sent_path()) is None
+
+
 def read_ledger_filtered() -> List[Dict[str, Any]]:
     """View for hold and price readers. Raw _read_ledger stays for debt recovery, prune, rewrite.
 
@@ -4747,6 +4762,8 @@ def partial_stop_forbidden(
     Держим только номера с неизвестной судьбой, которые ещё могут оказаться на
     бирже: durable miss без sent (отправка не помечена дошедшей) и номера из
     `unproven_ids` (не подтверждены биржей, списки их время не покрывают).
+    Без переданного набора покрытие не предполагается — иначе старый вызов
+    снова запирает стоп по любому номеру без конца.
     Подтверждённую живую заявку отменяет cancel_open_orders внутри early_stop,
     доказанно-мёртвую гасит шаг сборки концов — держать стоп нельзя, иначе
     отмены и гашение не запускаются никогда. Нечитаемая история — не разрешение
@@ -4762,10 +4779,12 @@ def partial_stop_forbidden(
         text = str(order_id)
         if partial_end_visible(parsed, text):
             continue
-        if order_is_unsent(text):
+        if order_is_unsent(text) or order_send_unknown(text):
             unproven.add(text)
             continue
-        if unproven_ids is None or text in unproven_ids:
+        # Без переданного набора покрытие неизвестно: держать по нему нельзя,
+        # иначе старый вызов снова запирает стоп по любому номеру без конца.
+        if unproven_ids is not None and text in unproven_ids:
             unproven.add(text)
     if not unproven:
         return False

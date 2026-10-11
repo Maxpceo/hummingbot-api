@@ -2161,7 +2161,11 @@ class ExecutorService:
             if row.get("executor_id") == executor_id and row.get("order_id")
         }
         ids.update(column_ids)
-        released = self.__dict__.get("_released_order_ids", set())
+        # Видимый конец в partial_ends — штатная запись «номер отпущен»:
+        # оперативный список стирается каждым проходом обхода и один не держит
+        # гашение. Концы без level_id (отдельные номера) тоже отпускают номер.
+        released = set(self.__dict__.get("_released_order_ids", set()))
+        released.update(partial_released_ids(self._partial_parsed(executor_id)))
         held_ids = [order_id for order_id in sorted(ids) if order_id not in released]
         if held_ids:
             gates[executor_id] = "unreleased-ids ids=" + ",".join(held_ids)
@@ -5263,6 +5267,237 @@ class ExecutorService:
         """
         return self._log_capture.get_logs(executor_id, level=level, limit=limit)
 
+    def _shutdown_level_flat(self, level: Dict[str, Any], fresh: Optional[Dict[str, Any]]) -> bool:
+        """Уровень плоский, без позиции: все номера zero-dead либо покупка и
+        продажи исполнены (bought == sold, форма flat из _partial_reject)."""
+        slot = level.get("open_order") or {}
+        close = level.get("close_order") or {}
+        opened = str(slot.get("order_id") or "")
+        ids = [opened, str(close.get("order_id") or "")]
+        ids.extend(
+            str(item.get("order_id") or "")
+            for item in level.get("partial_closes") or []
+            if isinstance(item, dict)
+        )
+        ids = [item for item in ids if item]
+        if ids and all(self._proven_dead_zero(item, fresh) for item in ids):
+            return True
+        if not opened or not self._proven_dead_filled(opened, fresh):
+            return False
+        bought = partial_decimal(level.get("partial_bought"))
+        if bought is None or bought <= 0:
+            return False
+        sold = Decimal("0")
+        for item in level.get("partial_closes") or []:
+            if not isinstance(item, dict):
+                continue
+            row = self._finished_row(str(item.get("order_id") or ""), fresh)
+            if row is None or not self._closed_row_filled(row):
+                return False
+            sold += self._shutdown_sold_base(row)
+        close_id = str(close.get("order_id") or "")
+        if close_id:
+            row = self._finished_row(close_id, fresh)
+            if row is None or not self._closed_row_filled(row):
+                return False
+            sold += self._shutdown_sold_base(row)
+        return sold >= bought
+
+    def _shutdown_sold_base(self, row: Dict[str, Any]) -> Decimal:
+        """База исполненной продажи: amount минус left, иначе fill_size."""
+        base = partial_raw_base(row)
+        if base is not None:
+            return base
+        return partial_decimal(row.get("fill_size")) or Decimal("0")
+
+    def _shutdown_id_dead(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Номер доказанно мёртв: запись finished либо его нет нигде при покрытии
+        списков (пустая база). Живой и непокрытый номер не мёртв."""
+        text = str(order_id or "")
+        if not text or not self._lists_ready(fresh):
+            return False
+        if partial_text_in(fresh.get("opens"), text):
+            return False
+        if self._finished_row(text, fresh) is not None:
+            return True
+        return partial_lists_cover(fresh, 0)
+
+    def _shutdown_end_mark(self, ends: Dict[str, Any], order_id: str) -> None:
+        """Конец отдельного номера: без price и без level_id, ключ — номер."""
+        text = str(order_id)
+        if partial_end_visible({"partial_ends": ends}, text):
+            return
+        ends[text] = {"kind": "flat", "order_ids": [text]}
+
+    async def _shutdown_release_step(self, executor_id: str, executor: Any) -> None:
+        """Сборка концов гашения: снимает только доказанно мёртвые следы.
+
+        Плоский уровень (все номера zero-dead либо покупка и продажи исполнены)
+        снимается целиком меткой формата _partial_release. Уровень с исполненной
+        покупкой и открытой позицией не снимается: его мёртвым номерам пишутся
+        концы без level_id, запись close_order мёртвого закрытия снимается.
+        Номера вне слотов и hold рыночного закрытия снимаются по доказательству
+        номера при любой позиции. Живой номер не трогается никогда. Запись в
+        базу идёт до снятия в памяти: отказ записи оставляет память как была.
+        """
+        parsed = self._partial_parsed(executor_id)
+        if parsed is None:
+            return
+        config = getattr(executor, "config", None)
+        pair = getattr(config, "trading_pair", None) or ""
+        connector_name = getattr(config, "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        fresh = self._tick_fresh(pair)
+        if not self._lists_ready(fresh):
+            return
+        inflight = getattr(connector, "in_flight_orders", None) or {}
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
+
+        def proven_dead(order_id: str) -> bool:
+            text = str(order_id or "")
+            if not text or text in inflight or text in lost:
+                return False
+            return self._shutdown_id_dead(text, fresh)
+
+        slot_ids = set()
+        for level in parsed.get("levels") or []:
+            if not isinstance(level, dict):
+                continue
+            for key in ("open_order", "close_order"):
+                text = str((level.get(key) or {}).get("order_id") or "")
+                if text:
+                    slot_ids.add(text)
+            for item in level.get("partial_closes") or []:
+                if isinstance(item, dict) and item.get("order_id"):
+                    slot_ids.add(str(item.get("order_id")))
+
+        flat_levels = []
+        dead_closes = []
+        lone_ends = []
+        for level in parsed.get("levels") or []:
+            if not isinstance(level, dict) or not level.get("id"):
+                continue
+            if partial_level_released(parsed, str(level.get("id"))):
+                continue
+            slot = level.get("open_order") or {}
+            close = level.get("close_order") or {}
+            opened = str(slot.get("order_id") or "")
+            closed = str(close.get("order_id") or "")
+            if self._shutdown_level_flat(level, fresh):
+                flat_levels.append(level)
+                continue
+            if opened and self._proven_dead_filled(opened, fresh) and not self._shutdown_level_flat(level, fresh):
+                if not partial_end_visible(parsed, opened):
+                    lone_ends.append(opened)
+                if closed and proven_dead(closed):
+                    dead_closes.append((str(level.get("id")), closed))
+                    if not partial_end_visible(parsed, closed):
+                        lone_ends.append(closed)
+        for hold in parsed.get("holds") or []:
+            if not isinstance(hold, dict) or not hold.get("order_id"):
+                continue
+            text = str(hold.get("order_id"))
+            if text in slot_ids or partial_end_visible(parsed, text):
+                continue
+            if proven_dead(text):
+                lone_ends.append(text)
+        try:
+            journal = read_ledger_filtered()
+        except Exception:
+            journal = None
+        if journal is not None:
+            for row in journal:
+                if row.get("executor_id") != executor_id or not row.get("order_id"):
+                    continue
+                text = str(row.get("order_id"))
+                if text in slot_ids or partial_end_visible(parsed, text):
+                    continue
+                if text not in lone_ends and proven_dead(text):
+                    lone_ends.append(text)
+        market_id = str(getattr(getattr(executor, "_close_order", None), "order_id", "") or "")
+        if not market_id:
+            for hold in getattr(executor, "_close_holds", []) or []:
+                if isinstance(hold, dict) and hold.get("role") == "market_close" and hold.get("order_id"):
+                    market_id = str(hold.get("order_id"))
+                    break
+        market_dead = bool(market_id) and market_id not in slot_ids and proven_dead(market_id)
+        if not flat_levels and not dead_closes and not lone_ends and not market_dead:
+            return
+        lone_ends = list(dict.fromkeys(lone_ends))
+
+        def mutate(body: Dict[str, Any]) -> None:
+            ends = dict(body.get("partial_ends") or {})
+            for level in body.get("levels") or []:
+                if not isinstance(level, dict):
+                    continue
+                if str(level.get("id")) in {str(item.get("id")) for item in flat_levels}:
+                    ids = []
+                    slot = level.get("open_order") or {}
+                    close = level.get("close_order") or {}
+                    if slot.get("order_id"):
+                        ids.append(str(slot.get("order_id")))
+                    if close.get("order_id"):
+                        ids.append(str(close.get("order_id")))
+                    for item in level.get("partial_closes") or []:
+                        if isinstance(item, dict) and item.get("order_id"):
+                            ids.append(str(item.get("order_id")))
+                    ids = list(dict.fromkeys(item for item in ids if item))
+                    key = ids[0] if ids else str(level.get("id"))
+                    ends[key] = {"kind": "flat", "level_id": str(level.get("id")), "order_ids": ids}
+                    level.pop("take_profit_price", None)
+                    level["close_order"] = None
+                    level["partial_closes"] = []
+                    if slot.get("filled"):
+                        level["open_order"] = None
+                    self._strip_recorded(body, ids)
+                for level_id, close_id in dead_closes:
+                    if str(level.get("id")) == level_id:
+                        level["close_order"] = None
+            for text in lone_ends:
+                self._shutdown_end_mark(ends, text)
+            if market_dead:
+                self._shutdown_end_mark(ends, market_id)
+            body["partial_ends"] = ends
+            self._strip_recorded(body, [*lone_ends, *([market_id] if market_dead else [])])
+
+        def visible(stored: Optional[Dict[str, Any]]) -> bool:
+            for level in flat_levels:
+                if not partial_level_released(stored, str(level.get("id"))):
+                    return False
+            for text in [*lone_ends, *([market_id] if market_dead else [])]:
+                if not partial_end_visible(stored, text):
+                    return False
+            return True
+
+        if not await self._partial_cas(executor_id, mutate, visible, None):
+            return
+        released_ids = list(lone_ends)
+        for level in flat_levels:
+            for key in ("open_order", "close_order"):
+                text = str((level.get(key) or {}).get("order_id") or "")
+                if text:
+                    released_ids.append(text)
+            for item in level.get("partial_closes") or []:
+                if isinstance(item, dict) and item.get("order_id"):
+                    released_ids.append(str(item.get("order_id")))
+        for _level_id, close_id in dead_closes:
+            released_ids.append(close_id)
+        if market_dead:
+            released_ids.append(market_id)
+        self._forget_close_memory(executor, released_ids)
+        if market_dead:
+            executor._close_order = None
+        flat_ids = {str(item.get("id")) for item in flat_levels}
+        dead_close_ids = {close_id for _level_id, close_id in dead_closes}
+        for level in getattr(executor, "grid_levels", []) or []:
+            if str(getattr(level, "id", "") or "") in flat_ids:
+                level.active_open_order = None
+                level.active_close_order = None
+                continue
+            seated = getattr(level, "active_close_order", None)
+            if str(getattr(seated, "order_id", "") or "") in dead_close_ids:
+                level.active_close_order = None
+
     async def stop_executor(
         self,
         executor_id: str,
@@ -5309,6 +5544,13 @@ class ExecutorService:
 
         if executor.is_closed:
             raise HTTPException(status_code=400, detail=f"Executor {executor_id} is already closed")
+
+        # Сборка концов до early_stop: обёртка стопа и тормоз гашения читают
+        # следы, которые шаг снимает. Без этого стоп встаёт на полпути.
+        try:
+            await self._shutdown_release_step(executor_id, executor)
+        except Exception:
+            logger.exception("shutdown release step failed for %s", executor_id)
 
         # Trigger early stop
         try:
@@ -6340,9 +6582,12 @@ class ExecutorService:
                 opened = str((level.get("open_order") or {}).get("order_id") or "")
                 closed = str((level.get("close_order") or {}).get("order_id") or "")
                 fresh = self._tick_fresh(pair)
-                if self._proven_dead(opened, fresh) and self._proven_dead(closed, fresh):
+                # Уровень пропускается только когда все его номера мёртвы без
+                # исполнения (zero-dead). Исполненная покупка держит позицию —
+                # её пара (opened, take_profit_price) остаётся в фиде.
+                if opened and self._proven_dead_zero(opened, fresh) and (not closed or self._proven_dead_zero(closed, fresh)):
                     continue
-                if not self._proven_dead(opened, fresh) and level.get("take_profit_price") not in (None, ""):
+                if not self._proven_dead_zero(opened, fresh) and level.get("take_profit_price") not in (None, ""):
                     prices.append((opened, level.get("take_profit_price")))
                 close = level.get("close_order") or {}
                 if not self._proven_dead(closed, fresh) and close.get("price") not in (None, ""):
@@ -6429,15 +6674,49 @@ class ExecutorService:
             return ""
         return " " + " ".join(parts)
 
+    def _unproven_holding_ids(self, executor_id: str, connector: Any, pair: str) -> set:
+        """Номера holding без видимого конца, которые ещё могут оказаться на бирже.
+
+        Номер не подтверждён (нет ни в трекерах, ни в живом списке opens) и свежие
+        списки не покрывают время его строки — история ещё не может судить.
+        Подтверждённая живая заявка и доказанно-мёртвый номер сюда не входят:
+        первую отменит early_stop, второму конец пишет шаг сборки.
+        """
+        rows = self._partial_rows()
+        parsed = self._partial_parsed(executor_id)
+        found = set()
+        if rows is None:
+            return found
+        fresh = self._tick_fresh(pair or "")
+        for order_id in partial_holding_ids(rows, executor_id):
+            text = str(order_id)
+            if partial_end_visible(parsed, text):
+                continue
+            if self._id_still_live(fresh, connector, text):
+                continue
+            if self._proven_dead(text, fresh):
+                continue
+            lines = partial_lines(rows, text)
+            if lines and all(partial_lists_cover(fresh, row.get("ts")) for row in lines):
+                continue
+            found.add(text)
+        return found
+
     def _partial_forbids(self, executor_id: str) -> bool:
         if (self.__dict__.get("_stock_tick_forbid") or {}).get(executor_id):
             return True
         ready = bool((self.__dict__.get("_partial_proof_ready") or {}).get(executor_id))
+        executor = self._active_executors.get(executor_id)
+        config = getattr(executor, "config", None)
+        connector_name = getattr(config, "connector_name", None)
+        pair = getattr(config, "trading_pair", None) or ""
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
         return partial_stop_forbidden(
             self._partial_rows(),
             self._partial_parsed(executor_id),
             executor_id,
             proof_ready=ready,
+            unproven_ids=self._unproven_holding_ids(executor_id, connector, pair),
         )
 
     def _partial_keep_running(self, executor: Any) -> None:
