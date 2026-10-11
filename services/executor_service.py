@@ -5313,43 +5313,18 @@ class ExecutorService:
         return partial_decimal(row.get("fill_size")) or Decimal("0")
 
     def _shutdown_id_dead(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
-        """Номер доказанно мёртв: запись finished либо его нет нигде при покрытии
-        списков (пустая база). Живой и непокрытый номер не мёртв."""
+        """Номер доказанно мёртв только по записи finished этой заявки.
+
+        Пустой список, даже покрывающий время строки, не доказательство: заявка
+        могла дойти до биржи и ещё не сидеть в слоте. Конец отпустил бы гашение,
+        а отмена её не видит.
+        """
         text = str(order_id or "")
         if not text or not self._lists_ready(fresh):
             return False
         if partial_text_in(fresh.get("opens"), text):
             return False
-        if self._finished_row(text, fresh) is not None:
-            return True
-        times = self._shutdown_row_times(order_id)
-        if not times:
-            return False
-        return all(partial_lists_cover(fresh, ts) for ts in times)
-
-    def _shutdown_row_times(self, order_id: str) -> Optional[list]:
-        """Времена строк номера. Нет строки или нет ts — пустая база не доказательство.
-
-        Покрытие считается по времени строки, не по эпохе 0: окно биржи от самой
-        ранней заявки до сейчас строку покрывает, а ноль — нет.
-        """
-        text = str(order_id or "")
-        try:
-            journal = read_ledger_filtered()
-        except Exception:
-            return None
-        if journal is None:
-            return None
-        found = []
-        seen = False
-        for row in journal:
-            if str(row.get("order_id") or "") != text:
-                continue
-            seen = True
-            if row.get("ts") is None:
-                return None
-            found.append(row.get("ts"))
-        return found if seen else None
+        return self._finished_row(text, fresh) is not None
 
     def _shutdown_end_mark(self, ends: Dict[str, Any], order_id: str) -> None:
         """Конец отдельного номера: без price и без level_id, ключ — номер."""
@@ -6787,9 +6762,8 @@ class ExecutorService:
                 continue
             if self._proven_dead(text, fresh):
                 continue
-            lines = partial_lines(rows, text)
-            if lines and all(partial_lists_cover(fresh, row.get("ts")) for row in lines):
-                continue
+            # Нет записи finished — стоп держит, даже если списки покрывают строку.
+            # Пустая база не разрешение пройти: отмена видит только слоты.
             found.add(text)
         return found
 

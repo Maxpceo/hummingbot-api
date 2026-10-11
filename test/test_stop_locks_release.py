@@ -640,12 +640,30 @@ def _window(from_ts, to_ts):
     return fresh
 
 
-async def test_empty_book_uses_the_row_time_not_epoch_zero(tmp_path, monkeypatch):
+async def test_covering_empty_book_writes_no_end_and_holds_the_stop(tmp_path, monkeypatch):
     _journal(tmp_path, monkeypatch, [_row("stray-1", ts=10)])
     service, repo = _service_with(monkeypatch, _checkpoint(), _window(5, 100), [])
-    await service._shutdown_release_step(EXECUTOR, _ram_executor())
-    assert partial_end_visible(_stored(repo), "stray-1")
-    assert "level_id" not in _stored(repo)["partial_ends"]["stray-1"]
+    executor = _ram_executor()
+    service._active_executors[EXECUTOR] = executor
+    before = repo.rows[0]["checkpoint"]
+    await service._shutdown_release_step(EXECUTOR, executor)
+    assert repo.rows[0]["checkpoint"] == before
+    assert service._partial_forbids(EXECUTOR) is True
+
+
+async def test_market_close_empty_book_is_not_cleared(tmp_path, monkeypatch):
+    _journal(tmp_path, monkeypatch, [_row("mkt-1", ts=10)])
+    service, repo = _service_with(monkeypatch, _checkpoint(), _window(5, 100), [])
+    executor = _ram_executor()
+    executor._close_holds = [{"order_id": "mkt-1", "role": "market_close"}]
+    executor._close_order = SimpleNamespace(order_id="mkt-1")
+    executor.position_size_base = Decimal("1")
+    service._active_executors[EXECUTOR] = executor
+    before = repo.rows[0]["checkpoint"]
+    await service._shutdown_release_step(EXECUTOR, executor)
+    assert repo.rows[0]["checkpoint"] == before
+    assert executor._close_order.order_id == "mkt-1"
+    assert service._partial_forbids(EXECUTOR) is True
 
 
 async def test_uncovered_row_time_writes_no_end_and_holds_the_stop(tmp_path, monkeypatch):
