@@ -494,7 +494,7 @@ async def test_unreadable_miss_writes_no_end(tmp_path, monkeypatch):
 
 async def test_live_take_sell_does_not_freeze_the_dead_traces(tmp_path, monkeypatch):
     """Живой тейк другого уровня не охраняет мёртвые следы: охраны глобальной нет."""
-    _journal(tmp_path, monkeypatch, [_row("buy-1"), _row("sell-1"), _row("sell-2")])
+    _journal(tmp_path, monkeypatch, [_row("buy-1"), _row("sell-1"), _row("sell-2", level_id="L2")])
     dead = _level(open_id="buy-1", close_id="sell-1")
     live = _level(level_id="L2", open_id="buy-2", close_id="sell-2")
     checkpoint = _checkpoint(dead, live)
@@ -606,23 +606,68 @@ async def test_flat_by_filled_buy_and_sells(tmp_path, monkeypatch):
 # ── 4. повтор и цены ─────────────────────────────────────────────────────────
 
 
-def test_zero_position_does_not_place_another_close():
-    """Штатный шаг гашения ставит закрытие только при позиции не меньше минимума."""
-    position = Decimal("0")
-    min_order_size = Decimal("0.01")
-    assert not (position >= min_order_size)
+async def test_zero_position_does_not_place_another_close(tmp_path, monkeypatch):
+    """После снятия мёртвого рыночного закрытия шаг сам новую заявку не ставит."""
+    _journal(tmp_path, monkeypatch, [_row("mkt-1")])
+    service, _repo = _service_with(
+        monkeypatch, _checkpoint(), _fresh(finished=[_finished("mkt-1")]), [],
+    )
+    executor = _ram_executor()
+    executor._close_order = SimpleNamespace(order_id="mkt-1")
+    executor.position_size_base = Decimal("0")
+    await service._shutdown_release_step(EXECUTOR, executor)
+    assert executor._close_order is None
+    assert not (executor.position_size_base >= Decimal("0.01"))
 
 
-def test_take_profit_tick_stays_occupied_after_the_step(tmp_path, monkeypatch):
+async def test_take_profit_tick_stays_occupied_after_the_step(tmp_path, monkeypatch):
     _journal(tmp_path, monkeypatch, [_row("buy-1"), _row("sell-1")])
     checkpoint = _checkpoint(_level(open_id="buy-1", close_id="sell-1", filled=True, bought="1"))
     fresh = _fresh(finished=[_finished("buy-1", filled=True), _finished("sell-1")])
-    service, repo = _service_with(monkeypatch, checkpoint, fresh, [])
-    service._active_executors[EXECUTOR] = _ram_executor()
+    service, _repo = _service_with(monkeypatch, checkpoint, fresh, [])
+    executor = _ram_executor(open_id="buy-1", close_id="sell-1")
+    service._active_executors[EXECUTOR] = executor
+    await service._shutdown_release_step(EXECUTOR, executor)
     prices = service._partial_pair_seat_prices(PAIR, set())
     assert ("buy-1", "101") in prices
-    occupied = service._occupied_close_prices(service._active_executors[EXECUTOR])
+    occupied = service._occupied_close_prices(executor)
     assert "101" not in {str(item) for item in occupied}
+
+
+def _window(from_ts, to_ts):
+    fresh = _fresh()
+    fresh["finished_request"] = {"path": "spot/orders", "params": {"from": from_ts, "to": to_ts}}
+    return fresh
+
+
+async def test_empty_book_uses_the_row_time_not_epoch_zero(tmp_path, monkeypatch):
+    _journal(tmp_path, monkeypatch, [_row("stray-1", ts=10)])
+    service, repo = _service_with(monkeypatch, _checkpoint(), _window(5, 100), [])
+    await service._shutdown_release_step(EXECUTOR, _ram_executor())
+    assert partial_end_visible(_stored(repo), "stray-1")
+    assert "level_id" not in _stored(repo)["partial_ends"]["stray-1"]
+
+
+async def test_uncovered_row_time_writes_no_end_and_holds_the_stop(tmp_path, monkeypatch):
+    _journal(tmp_path, monkeypatch, [_row("stray-1", ts=10)])
+    service, repo = _service_with(monkeypatch, _checkpoint(), _window(20, 100), [])
+    executor = _ram_executor()
+    service._active_executors[EXECUTOR] = executor
+    before = repo.rows[0]["checkpoint"]
+    await service._shutdown_release_step(EXECUTOR, executor)
+    assert repo.rows[0]["checkpoint"] == before
+    assert service._partial_forbids(EXECUTOR) is True
+
+
+async def test_live_ram_slot_keeps_the_flat_level(tmp_path, monkeypatch):
+    _journal(tmp_path, monkeypatch, [_row("buy-1"), _row("sell-1")])
+    checkpoint = _checkpoint(_level(open_id="buy-1", close_id="sell-1"))
+    fresh = _fresh(finished=[_finished("buy-1"), _finished("sell-1")])
+    service, repo = _service_with(monkeypatch, checkpoint, fresh, [])
+    executor = _ram_executor(open_id="buy-2")
+    await service._shutdown_release_step(EXECUTOR, executor)
+    assert not partial_level_released(_stored(repo), "L1")
+    assert executor.grid_levels[0].active_open_order.order_id == "buy-2"
 
 
 def test_flat_level_price_is_released_like_partial_release():

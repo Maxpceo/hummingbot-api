@@ -5322,7 +5322,34 @@ class ExecutorService:
             return False
         if self._finished_row(text, fresh) is not None:
             return True
-        return partial_lists_cover(fresh, 0)
+        times = self._shutdown_row_times(order_id)
+        if not times:
+            return False
+        return all(partial_lists_cover(fresh, ts) for ts in times)
+
+    def _shutdown_row_times(self, order_id: str) -> Optional[list]:
+        """Времена строк номера. Нет строки или нет ts — пустая база не доказательство.
+
+        Покрытие считается по времени строки, не по эпохе 0: окно биржи от самой
+        ранней заявки до сейчас строку покрывает, а ноль — нет.
+        """
+        text = str(order_id or "")
+        try:
+            journal = read_ledger_filtered()
+        except Exception:
+            return None
+        if journal is None:
+            return None
+        found = []
+        seen = False
+        for row in journal:
+            if str(row.get("order_id") or "") != text:
+                continue
+            seen = True
+            if row.get("ts") is None:
+                return None
+            found.append(row.get("ts"))
+        return found if seen else None
 
     def _shutdown_end_mark(self, ends: Dict[str, Any], order_id: str) -> None:
         """Конец отдельного номера: без price и без level_id, ключ — номер."""
@@ -5365,6 +5392,42 @@ class ExecutorService:
                 return False
             return self._shutdown_id_dead(text, fresh)
 
+        try:
+            journal = read_ledger_filtered()
+        except Exception:
+            journal = None
+
+        def level_numbers(level: Dict[str, Any]) -> Optional[list]:
+            """Все номера уровня: слот, журнал, holds и текущий RAM. Журнал не читается — уровень не плоский."""
+            if journal is None:
+                return None
+            level_id = str(level.get("id") or "")
+            found = []
+            for key in ("open_order", "close_order"):
+                text = str((level.get(key) or {}).get("order_id") or "")
+                if text:
+                    found.append(text)
+            for item in level.get("partial_closes") or []:
+                if isinstance(item, dict) and item.get("order_id"):
+                    found.append(str(item.get("order_id")))
+            for row in journal:
+                if row.get("executor_id") != executor_id:
+                    continue
+                if str(row.get("level_id") or "") != level_id or not row.get("order_id"):
+                    continue
+                found.append(str(row.get("order_id")))
+            for hold in parsed.get("holds") or []:
+                if isinstance(hold, dict) and str(hold.get("level_id") or "") == level_id and hold.get("order_id"):
+                    found.append(str(hold.get("order_id")))
+            for ram in getattr(executor, "grid_levels", []) or []:
+                if str(getattr(ram, "id", "") or "") != level_id:
+                    continue
+                for seated in (getattr(ram, "active_open_order", None), getattr(ram, "active_close_order", None)):
+                    text = str(getattr(seated, "order_id", "") or "")
+                    if text:
+                        found.append(text)
+            return list(dict.fromkeys(found))
+
         slot_ids = set()
         for level in parsed.get("levels") or []:
             if not isinstance(level, dict):
@@ -5378,6 +5441,7 @@ class ExecutorService:
                     slot_ids.add(str(item.get("order_id")))
 
         flat_levels = []
+        flat_numbers = {}
         dead_closes = []
         lone_ends = []
         for level in parsed.get("levels") or []:
@@ -5395,10 +5459,16 @@ class ExecutorService:
                 for item in level.get("partial_closes") or []
                 if isinstance(item, dict) and item.get("order_id")
             )
-            # Плоский и исполненный номер снимаются только вне живых трекеров:
-            # запись finished одна не доказывает, что заявка уже ушла с биржи.
-            if self._shutdown_level_flat(level, fresh) and all(proven_dead(item) for item in level_ids):
+            # Плоский уровень — только если мёртв каждый его номер, включая тот,
+            # что постановка уже посадила в память, но ещё не записала в слот.
+            numbers = level_numbers(level)
+            if (
+                numbers is not None
+                and self._shutdown_level_flat(level, fresh)
+                and all(proven_dead(item) for item in numbers)
+            ):
                 flat_levels.append(level)
+                flat_numbers[str(level.get("id"))] = list(numbers)
                 continue
             # Уровень не плоский. Мёртвый номер всё равно получает конец, иначе
             # он держит финализацию навсегда: после early_stop шаг больше не
@@ -5418,10 +5488,6 @@ class ExecutorService:
                 continue
             if proven_dead(text):
                 lone_ends.append(text)
-        try:
-            journal = read_ledger_filtered()
-        except Exception:
-            journal = None
         if journal is not None:
             for row in journal:
                 if row.get("executor_id") != executor_id or not row.get("order_id"):
@@ -5490,6 +5556,7 @@ class ExecutorService:
             return
         released_ids = list(lone_ends)
         for level in flat_levels:
+            released_ids.extend(flat_numbers.get(str(level.get("id"))) or [])
             for key in ("open_order", "close_order"):
                 text = str((level.get(key) or {}).get("order_id") or "")
                 if text:
@@ -5507,9 +5574,16 @@ class ExecutorService:
         flat_ids = {str(item.get("id")) for item in flat_levels}
         dead_close_ids = {close_id for _level_id, close_id in dead_closes}
         for level in getattr(executor, "grid_levels", []) or []:
-            if str(getattr(level, "id", "") or "") in flat_ids:
-                level.active_open_order = None
-                level.active_close_order = None
+            level_id = str(getattr(level, "id", "") or "")
+            if level_id in flat_ids:
+                # Слот чистим только если его текущий номер сам снят этим шагом.
+                # Чужой живой номер, севший в память после снимка, не затираем.
+                opened_now = str(getattr(getattr(level, "active_open_order", None), "order_id", "") or "")
+                closed_now = str(getattr(getattr(level, "active_close_order", None), "order_id", "") or "")
+                if opened_now and opened_now in released_ids:
+                    level.active_open_order = None
+                if closed_now and closed_now in released_ids:
+                    level.active_close_order = None
                 continue
             seated = getattr(level, "active_close_order", None)
             if str(getattr(seated, "order_id", "") or "") in dead_close_ids:
