@@ -25,6 +25,8 @@ ExecutorService = mod.ExecutorService
 
 import utils.executor_checkpoint as ledger_mod  # noqa: E402
 from utils.executor_checkpoint import (  # noqa: E402
+    _miss_path,
+    _sent_path,
     add_miss_order,
     apply_partial_keep,
     partial_end_visible,
@@ -450,6 +452,44 @@ async def test_finished_row_still_in_flight_is_not_released(tmp_path, monkeypatc
     stored = _stored(repo)
     assert not partial_end_visible(stored, "sell-1")
     assert stored["levels"][0]["close_order"]["order_id"] == "sell-1"
+
+
+def _make_unreadable(path):
+    import os
+    if os.path.lexists(path) and not os.path.isdir(path):
+        os.remove(path)
+    os.mkdir(path)
+
+
+async def _unknown_send_writes_no_end(tmp_path, monkeypatch, *, hide_miss):
+    """Пустая биржа не доказательство, пока судьба отправки неизвестна."""
+    _journal(tmp_path, monkeypatch, [_row("buy-1")])
+    if not hide_miss:
+        add_miss_order("buy-1")
+        _make_unreadable(_sent_path())
+    else:
+        _make_unreadable(_miss_path())
+        _make_unreadable(_sent_path())
+    service, repo = _service_with(monkeypatch, _checkpoint(), _fresh(), [])
+    executor = _ram_executor()
+    service._active_executors[EXECUTOR] = executor
+    before = repo.rows[0]["checkpoint"]
+    await service._shutdown_release_step(EXECUTOR, executor)
+    assert repo.rows[0]["checkpoint"] == before
+    assert partial_stop_forbidden(
+        service._partial_rows(), service._partial_parsed(EXECUTOR), EXECUTOR, proof_ready=True,
+    ) is True
+    service.__dict__["_sweep_seen"] = True
+    assert service._executor_proofs_released(EXECUTOR) is False
+    assert "buy-1" in service.__dict__["_stop_gate"][EXECUTOR]
+
+
+async def test_unreadable_sent_writes_no_end(tmp_path, monkeypatch):
+    await _unknown_send_writes_no_end(tmp_path, monkeypatch, hide_miss=False)
+
+
+async def test_unreadable_miss_writes_no_end(tmp_path, monkeypatch):
+    await _unknown_send_writes_no_end(tmp_path, monkeypatch, hide_miss=True)
 
 
 async def test_live_take_sell_does_not_freeze_the_dead_traces(tmp_path, monkeypatch):

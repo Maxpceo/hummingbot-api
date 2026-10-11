@@ -164,6 +164,8 @@ from utils.executor_checkpoint import (
     add_sent_order,
     ledger_cache_stats,
     order_is_unsent,
+    order_miss_unreadable,
+    order_send_unknown,
     read_ledger_filtered,
     remove_miss_order,
     remove_sent_order,
@@ -5350,12 +5352,16 @@ class ExecutorService:
         fresh = self._tick_fresh(pair)
         if not self._lists_ready(fresh):
             return
+        # Нечитаемый miss — не пустая база. Конец раньше стопа отпустил бы номер,
+        # который мог дойти до биржи и ещё не сидит в слоте.
+        if order_miss_unreadable():
+            return
         inflight = getattr(connector, "in_flight_orders", None) or {}
         lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
 
         def proven_dead(order_id: str) -> bool:
             text = str(order_id or "")
-            if not text or text in inflight or text in lost:
+            if not text or text in inflight or text in lost or order_send_unknown(text):
                 return False
             return self._shutdown_id_dead(text, fresh)
 

@@ -481,6 +481,15 @@ def order_send_unknown(order_id: str) -> bool:
     return _load_set_file(_sent_path()) is None
 
 
+def order_miss_unreadable() -> bool:
+    """Набор miss не читается. Ошибка чтения — не пустой набор и не «номера там нет».
+
+    order_send_unknown здесь ложь. Пока набор не читается, отправка любого номера
+    неизвестна: стоп держит, шаг сборки конец не пишет.
+    """
+    return _load_set_file(_miss_path()) is None
+
+
 def read_ledger_filtered() -> List[Dict[str, Any]]:
     """View for hold and price readers. Raw _read_ledger stays for debt recovery, prune, rewrite.
 
@@ -4779,7 +4788,7 @@ def partial_stop_forbidden(
         text = str(order_id)
         if partial_end_visible(parsed, text):
             continue
-        if order_is_unsent(text) or order_send_unknown(text):
+        if order_is_unsent(text) or order_send_unknown(text) or order_miss_unreadable():
             unproven.add(text)
             continue
         # Без переданного набора покрытие неизвестно: держать по нему нельзя,

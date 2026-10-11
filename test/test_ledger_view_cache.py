@@ -132,7 +132,12 @@ def _old_stop_forbidden(rows, parsed, executor_id, *, proof_ready):
     строки свежие списки не покрывают. Эталоны ниже покрыты (ts нет — покрытие
     полное), поэтому держит только miss без sent, при любом proof_ready.
     """
-    from utils.executor_checkpoint import order_is_unsent, order_send_unknown, partial_end_visible
+    from utils.executor_checkpoint import (
+        order_is_unsent,
+        order_miss_unreadable,
+        order_send_unknown,
+        partial_end_visible,
+    )
 
     if rows is None:
         return _old_exposure(None, parsed, executor_id)
@@ -142,7 +147,7 @@ def _old_stop_forbidden(rows, parsed, executor_id, *, proof_ready):
     for order_id in holding:
         if partial_end_visible(parsed, order_id):
             continue
-        if order_is_unsent(str(order_id)) or order_send_unknown(str(order_id)):
+        if order_is_unsent(str(order_id)) or order_send_unknown(str(order_id)) or order_miss_unreadable():
             return True
     return False
 
