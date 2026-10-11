@@ -4571,6 +4571,25 @@ def partial_released_ids(parsed: Optional[Dict[str, Any]]) -> set:
     return found
 
 
+def partial_price_released_ids(parsed: Optional[Dict[str, Any]]) -> set:
+    """Цена отпущена — только концы уровней (метки с level_id), не отдельные номера.
+
+    Конец отдельного номера (метка без level_id) отпускает номер для стопа и
+    финализации, но цену не снимает: тик тейка живого уровня должен оставаться
+    занятым, иначе на него встанет чужая заявка и склеится по цене с закрытием
+    уровня, а стоп снова отвергнется.
+    """
+    ends = (parsed or {}).get("partial_ends") or {}
+    found = set()
+    for key, mark in ends.items():
+        if not isinstance(mark, dict) or not mark.get("level_id"):
+            continue
+        found.add(str(key))
+        found.add("level:" + str(mark.get("level_id")))
+        found.update(str(item) for item in (mark.get("order_ids") or []) if item)
+    return found
+
+
 def partial_end_visible(parsed: Optional[Dict[str, Any]], order_id: str) -> bool:
     ends = (parsed or {}).get("partial_ends") or {}
     mark = ends.get(str(order_id))
@@ -4625,7 +4644,7 @@ def partial_feed_prices(
     """Placement feeds until the seat is visible. The take-profit field feeds until the end mark."""
     if rows is None:
         return [None]
-    released = partial_released_ids(parsed)
+    released = partial_price_released_ids(parsed)
     if extra_released:
         released.update(str(item) for item in extra_released)
     prices: List[Any] = []
@@ -4721,29 +4740,38 @@ def partial_stop_forbidden(
     executor_id: str,
     *,
     proof_ready: bool,
+    unproven_ids: Optional[set] = None,
 ) -> bool:
-    """Unread history is not permission to stop. A lone five-field row does not hold."""
+    """Штатный стоп проходит при готовом гашении. Слоты уровней его не держат.
+
+    Держим только номера с неизвестной судьбой, которые ещё могут оказаться на
+    бирже: durable miss без sent (отправка не помечена дошедшей) и номера из
+    `unproven_ids` (не подтверждены биржей, списки их время не покрывают).
+    Подтверждённую живую заявку отменяет cancel_open_orders внутри early_stop,
+    доказанно-мёртвую гасит шаг сборки концов — держать стоп нельзя, иначе
+    отмены и гашение не запускаются никогда. Нечитаемая история — не разрешение
+    стопить.
+    """
     if rows is None:
         return partial_exposure(None, parsed, executor_id)
     holding = partial_holding_ids(rows, executor_id)
-    column_holds = False
-    for level in (parsed or {}).get("levels") or []:
-        slot = (level or {}).get("open_order") or {}
-        close = (level or {}).get("close_order") or {}
-        if slot.get("order_id") and slot.get("level_id") and not partial_end_visible(parsed, str(slot.get("order_id"))):
-            column_holds = True
-        if close.get("order_id") and close.get("level_id") and not partial_level_released(parsed, str(level.get("id"))):
-            column_holds = True
-    if not holding and not column_holds:
+    if not holding:
+        return False
+    unproven = set()
+    for order_id in holding:
+        text = str(order_id)
+        if partial_end_visible(parsed, text):
+            continue
+        if order_is_unsent(text):
+            unproven.add(text)
+            continue
+        if unproven_ids is None or text in unproven_ids:
+            unproven.add(text)
+    if not unproven:
         return False
     if not proof_ready:
         return True
-    for order_id in holding:
-        if not partial_end_visible(parsed, order_id):
-            return True
-    if column_holds:
-        return True
-    return False
+    return True
 
 
 def partial_decimal(value: Any) -> Optional[Decimal]:
@@ -4987,7 +5015,11 @@ def apply_partial_keep(body: Dict[str, Any], previous: Dict[str, Any]) -> None:
             and prev_close.get("price") not in (None, "")
         )
         flat_close = not close.get("level_id") or close.get("price") in (None, "")
-        if rich_close and flat_close:
+        # Снятую запись мёртвого закрытия не воскрешать: её номер отпущен,
+        # а живая запись слота снова держит и стоп, и охрану шага гашения.
+        if rich_close and flat_close and not partial_end_visible(
+            previous, str(prev_close.get("order_id") or "")
+        ):
             level["close_order"] = json.loads(json.dumps(prev_close))
         if incomplete and prev.get("take_profit_price"):
             level["take_profit_price"] = prev.get("take_profit_price")

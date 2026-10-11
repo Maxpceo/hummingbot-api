@@ -150,6 +150,7 @@ from utils.executor_checkpoint import (
     partial_raw_base,
     partial_base_zero,
     partial_released_ids,
+    partial_price_released_ids,
     partial_seating_visible,
     partial_send_marked,
     partial_stop_forbidden,
@@ -1742,6 +1743,7 @@ class ExecutorService:
         column_ids: set = set(owner_ids)
         seated_ids: set = set()
         released_ids: set = set()
+        price_released_ids: set = set()
         released_texts: set = set()
         level_close_ids: set = set()
         level_close_prices: list = []
@@ -1796,6 +1798,7 @@ class ExecutorService:
                     )
                     protected_ids.update(item for item in ids if item)
             released_ids = set(partial_released_ids(body))
+            price_released_ids = set(partial_price_released_ids(body))
             released_texts = {
                 str(item) for item in partial_released_ids(body)
                 if item and not str(item).startswith("level:")
@@ -1818,6 +1821,7 @@ class ExecutorService:
             "column_ids": column_ids,
             "seated_ids": seated_ids,
             "released_ids": released_ids,
+            "price_released_ids": price_released_ids,
             "released_texts": released_texts,
             "level_close_ids": level_close_ids,
             "level_close_prices": level_close_prices,
@@ -2629,6 +2633,29 @@ class ExecutorService:
                 return True
         return False
 
+    def _finished_row(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Строка finished этого номера. Живой и неизвестный номер её не имеют."""
+        if not self._lists_ready(fresh):
+            return None
+        text = str(order_id)
+        for raw in fresh.get("opens") or []:
+            if str(raw.get("text") or raw.get("order_id") or "") == text:
+                return None
+        for raw in fresh.get("finished") or []:
+            if str(raw.get("text") or raw.get("order_id") or "") == text:
+                return raw
+        return None
+
+    def _proven_dead_filled(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Доказанно мёртв и исполнен: у уровня открыта позиция, тейк жив."""
+        row = self._finished_row(order_id, fresh)
+        return row is not None and self._closed_row_filled(row)
+
+    def _proven_dead_zero(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Доказанно мёртв без исполнения: отмена с нулевой базой."""
+        row = self._finished_row(order_id, fresh)
+        return row is not None and not self._closed_row_filled(row)
+
     def _parsed_without_dead(self, parsed, fresh):
         import copy
         if not isinstance(parsed, dict) or not self._lists_ready(fresh):
@@ -2663,7 +2690,11 @@ class ExecutorService:
                 slot = copy_level.get(key) or {}
                 if isinstance(slot, dict) and slot.get("order_id") and self._proven_dead(str(slot.get("order_id")), fresh):
                     copy_level[key] = {}
-                    if key == "open_order":
+                    # Исполненная покупка держит тейк-тик уровня (позиция открыта):
+                    # цена take-profit не отпущена и остаётся в фиде постановки.
+                    if key == "open_order" and not self._proven_dead_filled(
+                        str(slot.get("order_id")), fresh
+                    ):
                         copy_level["take_profit_price"] = None
             levels.append(copy_level)
         body["levels"] = levels
@@ -2730,7 +2761,7 @@ class ExecutorService:
                 order_id, price = item
                 if price in (None, "") or isinstance(price, (tuple, dict)):
                     continue
-                if not self._proven_dead(order_id, fresh):
+                if not self._proven_dead_zero(order_id, fresh):
                     live_prices.add(str(price))
             elif not isinstance(item, (tuple, dict)) and item not in (None, ""):
                 live_prices.add(str(item))
@@ -2741,7 +2772,7 @@ class ExecutorService:
                 order_id, price = item
                 if price in (None, "") or isinstance(price, (tuple, dict)):
                     continue
-                if self._proven_dead(order_id, fresh) and str(price) not in live_prices:
+                if self._proven_dead_zero(order_id, fresh) and str(price) not in live_prices:
                     continue
                 value = price
             elif isinstance(item, dict) or item in (None, ""):
@@ -7412,7 +7443,7 @@ class ExecutorService:
         released = set()
         level_close_ids = set()
         for entry in self._hold_index():
-            released.update(entry["released_ids"])
+            released.update(entry["price_released_ids"])
             level_close_ids.update(entry["level_close_ids"])
         for other in self._active_executors.values():
             other_pair = getattr(getattr(other, "config", None), "trading_pair", None)
