@@ -2701,7 +2701,7 @@ class ExecutorService:
                     if (
                         key == "open_order"
                         and not self._proven_dead_filled(str(slot.get("order_id")), fresh)
-                        and not self._shutdown_position_open(copy_level, [str(slot.get("order_id"))], fresh)
+                        and not self._level_position_open(copy_level, body, fresh)
                     ):
                         copy_level["take_profit_price"] = None
             levels.append(copy_level)
@@ -5335,6 +5335,27 @@ class ExecutorService:
                 return True
         return False
 
+    def _level_position_open(self, level: Dict[str, Any], body: Optional[Dict[str, Any]], fresh: Optional[Dict[str, Any]]) -> bool:
+        """Позиция открыта по журналу и holds того же уровня, не только по слоту."""
+        level_id = str(level.get("id") or "")
+        numbers = [
+            str((level.get("open_order") or {}).get("order_id") or ""),
+            str((level.get("close_order") or {}).get("order_id") or ""),
+        ]
+        for hold in (body or {}).get("holds") or []:
+            if isinstance(hold, dict) and str(hold.get("level_id") or "") == level_id and hold.get("order_id"):
+                numbers.append(str(hold.get("order_id")))
+        try:
+            journal = read_ledger_filtered()
+        except Exception:
+            return True
+        if journal is None:
+            return True
+        for row in journal:
+            if str(row.get("level_id") or "") == level_id and row.get("order_id"):
+                numbers.append(str(row.get("order_id")))
+        return self._shutdown_position_open(level, [item for item in numbers if item], fresh)
+
     def _shutdown_sold_base(self, row: Dict[str, Any]) -> Decimal:
         """База исполненной продажи: amount минус left, иначе fill_size."""
         base = partial_raw_base(row)
@@ -6722,7 +6743,7 @@ class ExecutorService:
                 # Уровень пропускается только когда все его номера мёртвы без
                 # исполнения (zero-dead). Исполненная покупка держит позицию —
                 # её пара (opened, take_profit_price) остаётся в фиде.
-                position_open = self._shutdown_position_open(level, [opened, closed], fresh)
+                position_open = self._level_position_open(level, parsed, fresh)
                 if opened and self._proven_dead_zero(opened, fresh) and (not closed or self._proven_dead_zero(closed, fresh)) and not position_open:
                     continue
                 if level.get("take_profit_price") not in (None, "") and (
