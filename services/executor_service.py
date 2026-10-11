@@ -5394,13 +5394,16 @@ class ExecutorService:
             if self._shutdown_level_flat(level, fresh) and all(proven_dead(item) for item in level_ids):
                 flat_levels.append(level)
                 continue
-            if opened and proven_dead(opened) and self._proven_dead_filled(opened, fresh) and not self._shutdown_level_flat(level, fresh):
-                if not partial_end_visible(parsed, opened):
-                    lone_ends.append(opened)
-                if closed and proven_dead(closed):
-                    dead_closes.append((str(level.get("id")), closed))
-                    if not partial_end_visible(parsed, closed):
-                        lone_ends.append(closed)
+            # Уровень не плоский. Мёртвый номер всё равно получает конец, иначе
+            # он держит финализацию навсегда: после early_stop шаг больше не
+            # вызывается. Живой и неизвестный номер не трогаем.
+            for text in level_ids:
+                if proven_dead(text) and not partial_end_visible(parsed, text):
+                    lone_ends.append(text)
+            # Мёртвая запись закрытия держит стоп как живой тейк, даже если
+            # покупка этого уровня ещё жива или неизвестна. Снять запись, не уровень.
+            if closed and proven_dead(closed):
+                dead_closes.append((str(level.get("id")), closed))
         for hold in parsed.get("holds") or []:
             if not isinstance(hold, dict) or not hold.get("order_id"):
                 continue

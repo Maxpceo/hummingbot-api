@@ -388,6 +388,70 @@ async def test_mixed_case_dead_open_live_close_keeps_the_level(tmp_path, monkeyp
     assert "level_id" not in stored["partial_ends"]["buy-1"]
 
 
+async def test_dead_close_is_cleared_while_the_open_is_still_live(tmp_path, monkeypatch):
+    """Мёртвая запись закрытия не держит стоп, даже если покупка уровня жива."""
+    _journal(tmp_path, monkeypatch, [_row("buy-1"), _row("sell-1")])
+    checkpoint = _checkpoint(_level(open_id="buy-1", close_id="sell-1", filled=True, bought="1"))
+    fresh = _fresh(opens=[_open("buy-1")], finished=[_finished("sell-1")])
+    service, repo = _service_with(monkeypatch, checkpoint, fresh, [])
+    executor = _ram_executor(open_id="buy-1", close_id="sell-1")
+    service._active_executors[EXECUTOR] = executor
+    await service._shutdown_release_step(EXECUTOR, executor)
+    stored = _stored(repo)
+    level = stored["levels"][0]
+    assert not partial_level_released(stored, "L1")
+    assert level["open_order"]["order_id"] == "buy-1"
+    assert level["take_profit_price"] == "101"
+    assert level["close_order"] is None
+    assert partial_end_visible(stored, "sell-1")
+    assert "level_id" not in stored["partial_ends"]["sell-1"]
+    assert not partial_end_visible(stored, "buy-1")
+    assert executor.grid_levels[0].active_close_order is None
+    assert executor.grid_levels[0].active_open_order is not None
+    connector = SimpleNamespace(in_flight_orders={}, _order_tracker=SimpleNamespace(lost_orders={}))
+    assert service._partial_sell_is_live(EXECUTOR, connector, stored, PAIR) is False
+
+
+async def test_dead_partial_close_gets_an_end_beside_a_live_close(tmp_path, monkeypatch):
+    _journal(tmp_path, monkeypatch, [_row("buy-1"), _row("sell-old"), _row("sell-1")])
+    checkpoint = _checkpoint(_level(
+        open_id="buy-1", close_id="sell-1", filled=True, bought="2",
+        partial_closes=[{"order_id": "sell-old", "filled_base": "1"}],
+    ))
+    fresh = _fresh(opens=[_open("sell-1")], finished=[_finished("sell-old")], covers=False)
+    fresh["finished_request"] = {"params": {}}
+    service, repo = _service_with(monkeypatch, checkpoint, fresh, [])
+    executor = _ram_executor(open_id="buy-1", close_id="sell-1")
+    service._active_executors[EXECUTOR] = executor
+    await service._shutdown_release_step(EXECUTOR, executor)
+    stored = _stored(repo)
+    assert partial_end_visible(stored, "sell-old")
+    assert "level_id" not in stored["partial_ends"]["sell-old"]
+    assert not partial_end_visible(stored, "sell-1")
+    assert stored["levels"][0]["close_order"]["order_id"] == "sell-1"
+    assert not partial_level_released(stored, "L1")
+    service.__dict__["_sweep_seen"] = True
+    assert service._executor_proofs_released(EXECUTOR) is False
+    assert "sell-old" not in service.__dict__["_stop_gate"][EXECUTOR]
+
+
+async def test_finished_row_still_in_flight_is_not_released(tmp_path, monkeypatch):
+    _journal(tmp_path, monkeypatch, [_row("sell-1")])
+    checkpoint = _checkpoint(_level(open_id="buy-1", close_id="sell-1", filled=True, bought="1"))
+    fresh = _fresh(finished=[_finished("sell-1")])
+    connector = SimpleNamespace(
+        in_flight_orders={"sell-1": SimpleNamespace(price="102")},
+        _order_tracker=SimpleNamespace(lost_orders={}),
+    )
+    service, repo = _service_with(monkeypatch, checkpoint, fresh, [], connector=connector)
+    executor = _ram_executor(open_id="buy-1", close_id="sell-1")
+    executor.connectors["gate_io"] = connector
+    await service._shutdown_release_step(EXECUTOR, executor)
+    stored = _stored(repo)
+    assert not partial_end_visible(stored, "sell-1")
+    assert stored["levels"][0]["close_order"]["order_id"] == "sell-1"
+
+
 async def test_live_take_sell_does_not_freeze_the_dead_traces(tmp_path, monkeypatch):
     """Живой тейк другого уровня не охраняет мёртвые следы: охраны глобальной нет."""
     _journal(tmp_path, monkeypatch, [_row("buy-1"), _row("sell-1"), _row("sell-2")])
