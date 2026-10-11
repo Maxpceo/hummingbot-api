@@ -5383,10 +5383,18 @@ class ExecutorService:
             close = level.get("close_order") or {}
             opened = str(slot.get("order_id") or "")
             closed = str(close.get("order_id") or "")
-            if self._shutdown_level_flat(level, fresh):
+            level_ids = [item for item in (opened, closed) if item]
+            level_ids.extend(
+                str(item.get("order_id") or "")
+                for item in level.get("partial_closes") or []
+                if isinstance(item, dict) and item.get("order_id")
+            )
+            # Плоский и исполненный номер снимаются только вне живых трекеров:
+            # запись finished одна не доказывает, что заявка уже ушла с биржи.
+            if self._shutdown_level_flat(level, fresh) and all(proven_dead(item) for item in level_ids):
                 flat_levels.append(level)
                 continue
-            if opened and self._proven_dead_filled(opened, fresh) and not self._shutdown_level_flat(level, fresh):
+            if opened and proven_dead(opened) and self._proven_dead_filled(opened, fresh) and not self._shutdown_level_flat(level, fresh):
                 if not partial_end_visible(parsed, opened):
                     lone_ends.append(opened)
                 if closed and proven_dead(closed):
