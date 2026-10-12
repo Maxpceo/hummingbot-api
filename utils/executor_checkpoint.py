@@ -4042,6 +4042,8 @@ def skip_marked_levels(levels, text: Optional[str]):
 
 # One channel for this close call. Empty means the connector mints its own id.
 _RESERVED_CLOSE_ID: ContextVar[Optional[str]] = ContextVar("reserved_close_id", default=None)
+# Заморозка: проверка метки, которую задача канала зовёт перед _create_order.
+_CLOSE_FROZEN_CHECK: ContextVar[Optional[Any]] = ContextVar("close_frozen_check", default=None)
 _WRAPPED_CONNECTORS: set = set()
 
 
@@ -4090,17 +4092,35 @@ def install_connector_close_channel(connector: Any) -> None:
             create = getattr(connector, "_create_order", None)
             if create is None:
                 return reserved
+            frozen = _CLOSE_FROZEN_CHECK.get()
+            fields = {
+                "trade_type": "BUY" if name == "buy" else "SELL",
+                "order_id": reserved,
+                "trading_pair": args[0] if args else kwargs.get("trading_pair"),
+                "amount": args[1] if len(args) > 1 else kwargs.get("amount"),
+                "order_type": args[2] if len(args) > 2 else kwargs.get("order_type"),
+                "price": args[3] if len(args) > 3 else kwargs.get("price"),
+            }
+
+            async def queued_create():
+                # Свежая перечитка метки внутри задачи, непосредственно перед
+                # _create_order, без await между перечиткой и вызовом: проверка
+                # до buy/sell этот разрыв не закрывает (план stop-freeze п.2).
+                if frozen is not None:
+                    try:
+                        if await frozen():
+                            logger.info(
+                                "close channel held the send under the stop mark id=…%s",
+                                str(reserved)[-8:],
+                            )
+                            return
+                    except Exception:
+                        logger.exception("close channel stop mark check failed")
+                await create(**fields)
+
             try:
                 from hummingbot.core.utils.async_utils import safe_ensure_future
-                trade = "BUY" if name == "buy" else "SELL"
-                safe_ensure_future(create(
-                    trade_type=trade,
-                    order_id=reserved,
-                    trading_pair=args[0] if args else kwargs.get("trading_pair"),
-                    amount=args[1] if len(args) > 1 else kwargs.get("amount"),
-                    order_type=args[2] if len(args) > 2 else kwargs.get("order_type"),
-                    price=args[3] if len(args) > 3 else kwargs.get("price"),
-                ))
+                safe_ensure_future(queued_create())
             except Exception:
                 logger.exception("close channel could not queue _create_order")
                 return reserved
@@ -4172,6 +4192,7 @@ def place_level_close(executor: Any, executor_id: str, level: Any) -> Optional[s
     if not append_durable_row(sent):
         return None
     token = _RESERVED_CLOSE_ID.set(order_id)
+    frozen_token = _CLOSE_FROZEN_CHECK.set(getattr(executor, "_refuse_frozen_close", None))
     try:
         market = _executor_connector(executor)
         install_connector_close_channel(market)
@@ -4187,6 +4208,7 @@ def place_level_close(executor: Any, executor_id: str, level: Any) -> Optional[s
         )
     finally:
         _RESERVED_CLOSE_ID.reset(token)
+        _CLOSE_FROZEN_CHECK.reset(frozen_token)
     remember_hold(executor, order_id, role="close", level_id=str(level_id), price=price)
     tracked = type("Tracked", (), {})()
     tracked.order_id = order_id
@@ -4231,6 +4253,7 @@ def place_market_close(executor: Any, executor_id: str) -> Optional[str]:
     if not append_durable_row(line_for_send(executor_id, order_id, "market_close", sent=True)):
         return None
     token = _RESERVED_CLOSE_ID.set(order_id)
+    frozen_token = _CLOSE_FROZEN_CHECK.set(getattr(executor, "_refuse_frozen_close", None))
     try:
         market = _executor_connector(executor)
         if market is not None:
@@ -4238,6 +4261,7 @@ def place_market_close(executor: Any, executor_id: str) -> Optional[str]:
             market.sell(executor.config.trading_pair, 1, None, None)
     finally:
         _RESERVED_CLOSE_ID.reset(token)
+        _CLOSE_FROZEN_CHECK.reset(frozen_token)
     remember_hold(executor, order_id, role="market_close")
     tracked = type("Tracked", (), {})()
     tracked.order_id = order_id

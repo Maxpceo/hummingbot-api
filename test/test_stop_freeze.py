@@ -5,6 +5,12 @@
 чужая склейка и неподтверждённая отправка держат с причиной; под меткой ни один
 путь не чеканит и не шлёт, записи уровней не трогаются, цена тейка остаётся
 занятой для соседней сетки; гашение и финализация не отдаются (brake-held).
+
+Плюс пробы вердикта кода 20261012-212613-69817: гонка mutate (метка в теле CAS
+после гейта — запись не проходит, цена тейка цела); перезагрузка после коммита
+метки (RAM холодный — метка прогрета, обёртка не отказывает, отмены ушли);
+чужая заявка на цене тейка из свежего opens держит команду; задача канала
+закрытия уже в очереди, метка закоммичена — `_create_order` не вызван.
 """
 
 import json
@@ -86,6 +92,12 @@ class _Connector:
 
     async def _create_order(self, **kwargs):
         self.created.append(kwargs)
+
+    def buy(self, *args, **kwargs):
+        return None
+
+    def sell(self, *args, **kwargs):
+        return None
 
 
 def _service_with(monkeypatch, checkpoint, connector=None, journal_lines=None, tmp_path=None):
@@ -415,3 +427,286 @@ def test_stop_marks_nothing_but_the_mark(monkeypatch):
     for key, value in before.items():
         assert after.get(key) == value
     assert set(after.get("partial_ends") or {}) == {STOP_MARK_KEY}
+
+
+# ── гонка mutate: метка в теле CAS после гейта ──────────────────────────────
+
+
+def _marked(text):
+    body = json.loads(text)
+    ends = dict(body.get("partial_ends") or {})
+    ends[STOP_MARK_KEY] = {"kind": "stop_requested", "order_ids": []}
+    body["partial_ends"] = ends
+    return json.dumps(body, sort_keys=True)
+
+
+def _gate_misses_mark(service):
+    """Гейт до await метку не видел: его перечитка шла до её появления."""
+
+    async def gate_misses(_executor_id):
+        return False
+
+    service._read_stop_mark_fresh = gate_misses
+
+
+def test_mutate_race_keeps_the_take_price_on_a_marked_body(monkeypatch):
+    """Метка в теле CAS, гейт её не видел: конец с level_id не проходит."""
+    text = _checkpoint(_level(open_id="buy-1", filled=True, close_id="sell-1"))
+    service, repo, connector = _service_with(monkeypatch, text)
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    service._active_executors[EXECUTOR] = executor
+    _gate_misses_mark(service)
+    repo.rows[0]["checkpoint"] = _marked(text)
+    service._set_hold_rows(repo.rows)
+    before = _stored(repo)
+
+    import asyncio
+    assert asyncio.run(
+        service._partial_release(EXECUTOR, "buy-1", "L1", "stock_flat", connector, PAIR)
+    ) is False
+
+    after = _stored(repo)
+    assert after == before
+    assert (after["levels"][0] or {}).get("take_profit_price") == "101"
+    assert ((after["levels"][0] or {}).get("close_order") or {}).get("order_id") == "sell-1"
+    assert "level:L1" not in partial_price_released_ids(after)
+    for mark in (after.get("partial_ends") or {}).values():
+        assert "level_id" not in (mark or {})
+
+
+def test_mutate_race_in_flat_reject_keeps_the_take_price(monkeypatch):
+    """Та же гонка в flat-ветке _partial_reject: тело с меткой не меняется."""
+    level = _level(open_id="buy-1", filled=True, close_id="sell-1")
+    level["partial_bought"] = "1"
+    level["partial_closes"] = []
+    text = _checkpoint(level)
+    service, repo, connector = _service_with(monkeypatch, text)
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    service._active_executors[EXECUTOR] = executor
+    _gate_misses_mark(service)
+
+    async def fresh(_connector, _pair, _ts=None):
+        return {
+            "opens_read": True,
+            "opens_done": True,
+            "finished_read": True,
+            "finished_done": True,
+            "opens": [],
+            "finished": [{
+                "text": "sell-1", "status": "closed", "finish_as": "cancelled",
+                "amount": "1", "left": "0", "price": "101",
+            }],
+        }
+
+    service._fresh_raw_lists = fresh
+    repo.rows[0]["checkpoint"] = _marked(text)
+    service._set_hold_rows(repo.rows)
+    before = _stored(repo)
+
+    import asyncio
+    asyncio.run(service._partial_reject(
+        EXECUTOR, executor, connector, PAIR, "sell-1", "L1", "101", Decimal("1"), RuntimeError("create failed"),
+    ))
+
+    after = _stored(repo)
+    assert after == before
+    assert (after["levels"][0] or {}).get("take_profit_price") == "101"
+    assert "level:L1" not in partial_price_released_ids(after)
+
+
+# ── перезагрузка после коммита метки: RAM холодный, отмены ушли ─────────────
+
+
+def test_restart_after_mark_commit_warms_ram_and_sends_the_cancels(tmp_path, monkeypatch):
+    """Обрыв между коммитом метки и early_stop: метка прогрета, обёртка не отказывает."""
+    text = _marked(_checkpoint(_level(open_id="buy-1", filled=True, close_id="sell-1")))
+    service, repo, connector = _service_with(monkeypatch, text, journal_lines=[], tmp_path=tmp_path)
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    executor._status = "STOPPING"
+    service._active_executors[EXECUTOR] = executor
+    service._install_partial_guards(EXECUTOR, executor)
+    service.__dict__.pop("_stop_mark_ram", None)  # RAM холодный после перезапуска
+
+    import asyncio
+
+    async def call():
+        return await service.stop_executor(EXECUTOR)
+
+    answer = asyncio.run(call())
+    assert answer["status"] == "frozen"
+    # Обёртка _wrap_stop не отказала: early_stop прошёл — отмены ушли штатно.
+    assert recorded == ["early_stop"]
+    # ... и не поставила RUNNING.
+    assert executor._status == "STOPPING"
+    # Метка прогрета до early_stop.
+    assert (service.__dict__.get("_stop_mark_ram") or {}).get(EXECUTOR) is True
+
+    # Холодная RAM — не отсутствие метки: гейт читает RAM ИЛИ перечитанную запись.
+    service.__dict__.pop("_stop_mark_ram", None)
+    assert service._stop_mark_now(EXECUTOR) is True
+
+    # Подъём до start прогревает метку из записи строки.
+    service.__dict__.pop("_stop_mark_ram", None)
+    row = dict(repo.rows[0])
+    row["config"] = ""
+    assert asyncio.run(service._resume_one(row)) == "no stored config"
+    assert (service.__dict__.get("_stop_mark_ram") or {}).get(EXECUTOR) is True
+
+
+# ── чужая склейка по свежему opens ──────────────────────────────────────────
+
+
+def test_stop_holds_on_foreign_glue_from_fresh_opens(tmp_path, monkeypatch):
+    """Чужая заявка на цене тейка из СВЕЖЕГО opens держит команду."""
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(open_id="buy-1", close_id="sell-1")),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    service._active_executors[EXECUTOR] = executor
+
+    async def fresh(_connector, _pair, _ts=None):
+        return {
+            "opens_read": True,
+            "opens_done": True,
+            "finished_read": True,
+            "finished_done": True,
+            "opens": [{"text": "foreign-1", "status": "open", "price": "101.0000"}],
+            "finished": [],
+        }
+
+    service._fresh_raw_lists = fresh
+
+    import asyncio
+
+    async def call():
+        return await service.stop_executor(EXECUTOR)
+
+    answer = asyncio.run(call())
+    assert answer["status"] == "not_accepted"
+    assert "foreign-glue" in answer["reason"]
+    assert recorded == []
+    assert not stop_mark_visible(_stored(repo))
+
+
+def test_stop_passes_when_the_take_price_in_opens_is_our_own(tmp_path, monkeypatch):
+    """Своя заявка на цене тейка не держит: её снимает штатная отмена."""
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(open_id="buy-1", close_id="sell-1")),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    service._active_executors[EXECUTOR] = executor
+
+    async def fresh(_connector, _pair, _ts=None):
+        return {
+            "opens_read": True,
+            "opens_done": True,
+            "finished_read": True,
+            "finished_done": True,
+            "opens": [{"text": "sell-1", "status": "open", "price": "101"}],
+            "finished": [],
+        }
+
+    service._fresh_raw_lists = fresh
+
+    import asyncio
+
+    async def call():
+        return await service.stop_executor(EXECUTOR)
+
+    answer = asyncio.run(call())
+    assert answer["status"] == "stopping"
+    assert stop_mark_visible(_stored(repo))
+    assert recorded == ["early_stop"]
+
+
+# ── отложенная отправка канала закрытия ─────────────────────────────────────
+
+
+def _channel_executor(connector):
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    executor._strategy = SimpleNamespace(connectors={"gate_io": connector})
+    return executor, recorded
+
+
+def _queue_send(monkeypatch):
+    """Задачи канала копятся в очереди: проба гоняет их после записи метки."""
+    queued = []
+    import hummingbot.core.utils.async_utils as async_utils
+    monkeypatch.setattr(async_utils, "safe_ensure_future", lambda coro: queued.append(coro))
+    return queued
+
+
+def _stub_trade_types(monkeypatch):
+    """Мелочь для вызова вне коробки: enum биржи не влияет на выбор стороны."""
+    import hummingbot.core.data_type.common as common
+    monkeypatch.setattr(common, "TradeType", SimpleNamespace(SELL="SELL", BUY="BUY"), raising=False)
+    monkeypatch.setattr(common, "OrderType", SimpleNamespace(LIMIT="LIMIT"), raising=False)
+
+
+def test_close_channel_task_holds_the_send_under_the_mark(tmp_path, monkeypatch):
+    """Задача канала уже в очереди, метка закоммичена: _create_order не вызван."""
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(take="101")),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    executor, _ = _channel_executor(connector)
+    executor._next_close_id = "close-2"
+    service._active_executors[EXECUTOR] = executor
+    service._install_partial_guards(EXECUTOR, executor)
+    queued = _queue_send(monkeypatch)
+    _stub_trade_types(monkeypatch)
+    level = SimpleNamespace(
+        id="L1",
+        price=Decimal("101"),
+        amount_quote=Decimal("1"),
+        active_open_order=SimpleNamespace(order_id="buy-1"),
+        active_close_order=None,
+    )
+
+    import asyncio
+
+    async def run():
+        assert ledger_mod.place_level_close(executor, EXECUTOR, level) == "close-2"
+        assert len(queued) == 1
+        assert await service._freeze_stop_mark(EXECUTOR) is True
+        await queued.pop()
+        assert connector.created == []
+
+    asyncio.run(run())
+
+
+def test_market_close_channel_task_holds_the_send_under_the_mark(tmp_path, monkeypatch):
+    """Та же проба для очереди place_market_close."""
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(take="101")),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    executor, _ = _channel_executor(connector)
+    executor._next_close_id = "close-3"
+    service._active_executors[EXECUTOR] = executor
+    service._install_partial_guards(EXECUTOR, executor)
+    queued = _queue_send(monkeypatch)
+    _stub_trade_types(monkeypatch)
+
+    import asyncio
+
+    async def run():
+        assert ledger_mod.place_market_close(executor, EXECUTOR) == "close-3"
+        assert len(queued) == 1
+        assert await service._freeze_stop_mark(EXECUTOR) is True
+        await queued.pop()
+        assert connector.created == []
+
+    asyncio.run(run())

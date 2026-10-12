@@ -4821,6 +4821,9 @@ class ExecutorService:
     async def _resume_one(self, row: Dict[str, Any], owned_by: Optional[Dict[str, str]] = None) -> Optional[str]:
         """None on success. A string is why this row was left for cleanup."""
         checkpoint = parse_checkpoint_cached(row.get("checkpoint"))
+        # Подъём до start: метка из колонки прогревает RAM (план stop-freeze п.1).
+        if stop_mark_visible(checkpoint):
+            self.__dict__.setdefault("_stop_mark_ram", {})[str(row["executor_id"])] = True
         accounted = {
             order_id: price
             for order_id, price in accounted_orders(row["executor_id"], checkpoint).items()
@@ -5730,9 +5733,13 @@ class ExecutorService:
         # коммитом и перечиткой НОВОЙ сессией ДО early_stop. Шаг сборки концов
         # в этом срезе не вызывается: записи уровней/тел/закрытий не трогаются.
         pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
-        already = self._stop_mark_now(executor_id) or await self._read_stop_mark_fresh(executor_id)
+        # Свежая перечитка идёт всегда и до early_stop: показанная метка
+        # прогревает RAM, иначе обёртка смотрит в холодную память и не пускает
+        # отмены (вердикт кода 20261012-212613-69817). Непрочитанное не
+        # размораживает: метку из памяти перечитка не снимает.
+        already = await self._read_stop_mark_fresh(executor_id) or self._stop_mark_now(executor_id)
         if not already:
-            hold_reason = self._stop_freeze_holds(executor_id, executor)
+            hold_reason = await self._stop_freeze_holds(executor_id, executor)
             if hold_reason:
                 self._log_silent_exit(
                     "stop-aside", pair, hold_reason, executor_id,
@@ -5895,10 +5902,13 @@ class ExecutorService:
         logger.info(f"Orphaned position for executor {executor_id} marked resolved")
         return {"executor_id": executor_id, "orphan_resolved": True}
 
-    def _stop_freeze_holds(self, executor_id: str, executor: Any) -> Optional[str]:
+    async def _stop_freeze_holds(self, executor_id: str, executor: Any) -> Optional[str]:
         """Чужая склейка по цене и неподтверждённая отправка держат команду.
 
         Свой номер не держит: штатная отмена снимает его той же командой.
+        Чужая заявка на цене тейка сверяется ещё и со СВЕЖИМ списком opens
+        биржи: после перезапуска локальные книги пусты (план stop-freeze п.3).
+        Сверка идёт ДО записи метки.
         """
         parsed = self._partial_parsed(executor_id)
         if order_miss_unreadable():
@@ -5930,18 +5940,24 @@ class ExecutorService:
         if connector is None:
             return None
         texts = self._partial_sell_texts(executor_id, parsed)
+        fresh = await self._fresh_raw_lists(connector, pair, None)
         inflight = getattr(connector, "in_flight_orders", None) or {}
         lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
+        tick = self._pair_tick(executor)
+        seen = [
+            (
+                str(getattr(order, "client_order_id", "") or getattr(order, "order_id", "") or ""),
+                getattr(order, "price", None),
+            )
+            for order in list(inflight.values()) + list(lost.values())
+        ]
+        seen.extend((str(raw.get("text") or ""), raw.get("price")) for raw in (fresh or {}).get("opens") or [])
         for level in (parsed or {}).get("levels") or []:
             marks = [level.get("take_profit_price"), (level.get("close_order") or {}).get("price")]
-            for order in list(inflight.values()) + list(lost.values()):
-                text = str(getattr(order, "client_order_id", "") or getattr(order, "order_id", "") or "")
+            for text, price in seen:
                 if not text or text in texts:
                     continue
-                price = getattr(order, "price", None)
-                if price in (None, ""):
-                    continue
-                if any(mark not in (None, "") and str(mark) == str(price) for mark in marks):
+                if any(self._mark_price_hit(mark, price, tick) for mark in marks):
                     return f"foreign-glue id=…{text[-8:]}"
         return None
 
@@ -7940,6 +7956,12 @@ class ExecutorService:
             service._occupied_close_prices(executor, include_opens=False)
         ) or service._unpriced_close_blocks(executor)
         executor._refuse_unpriced_close = lambda: service._unpriced_close_blocks(executor)
+
+        async def _refuse_frozen_close() -> bool:
+            """Свежая перечитка метки для задачи канала закрытия перед _create_order."""
+            return await service._refresh_stop_mark(executor_id)
+
+        executor._refuse_frozen_close = _refuse_frozen_close
         executor._partial_guarded = True
 
     def _pair_tick(self, executor: Any):
@@ -7957,6 +7979,16 @@ class ExecutorService:
             return str(left) == str(right)
         same = _same_tick(left, right, tick)
         return same is True
+
+    def _mark_price_hit(self, mark: Any, price: Any, tick: Any) -> bool:
+        """Цена чужой заявки совпала с нашей. Формат строки не оправдание."""
+        if mark in (None, "") or price in (None, ""):
+            return False
+        if self._price_same(mark, price, tick):
+            return True
+        left = partial_decimal(mark)
+        right = partial_decimal(price)
+        return left is not None and right is not None and left == right
 
     def _live_open_prices(self, executor: Any) -> list:
         found = []
@@ -8177,13 +8209,27 @@ class ExecutorService:
         return str(getattr(getattr(executor, "config", None), "id", "") or "")
 
     def _stop_mark_now(self, executor_id: str) -> bool:
-        """RAM-гейт заморозки. Тёплый от свежих перечиток и от записи метки."""
-        return bool((self.__dict__.get("_stop_mark_ram") or {}).get(str(executor_id)))
+        """Синхронный гейт заморозки: RAM ИЛИ последняя перечитанная запись.
+
+        Холодная RAM не значит «метки нет», если колонка её уже отдала
+        (обрыв между коммитом метки и early_stop, вердикт кода
+        20261012-212613-69817).
+        """
+        if (self.__dict__.get("_stop_mark_ram") or {}).get(str(executor_id)):
+            return True
+        return stop_mark_visible(self._partial_parsed(executor_id))
 
     async def _read_stop_mark_fresh(self, executor_id: str) -> bool:
-        """Перечитка метки НОВОЙ сессией — доказательство коммита записи."""
+        """Перечитка метки НОВОЙ сессией — доказательство коммита записи.
+
+        Показанная метка прогревает RAM: любая свежая перечитка, показавшая
+        метку, пишет её в память (план stop-freeze п.1).
+        """
         text = await self._partial_column_text(executor_id)
-        return stop_mark_visible(parse_checkpoint(text))
+        seen = stop_mark_visible(parse_checkpoint(text))
+        if seen:
+            self.__dict__.setdefault("_stop_mark_ram", {})[str(executor_id)] = True
+        return seen
 
     async def _refresh_stop_mark(self, executor_id: str) -> bool:
         """Свежая перечитка перед чеканкой/отправкой; без await до вызова биржи.
@@ -8672,6 +8718,11 @@ class ExecutorService:
         ids = [order_id]
 
         def mutate(body: Dict[str, Any]) -> None:
+            # Гонка: mutate бежит ПОСЛЕ чтения строки CAS, и перечитки до await
+            # недостаточно. Метка в этом теле — тело не меняется, запись конца
+            # с level_id не проходит (план stop-freeze п.2).
+            if stop_mark_visible(body):
+                raise RuntimeError("stop mark")
             ends = dict(body.get("partial_ends") or {})
             ends[order_id] = {"kind": kind, "level_id": level_id, "order_ids": list(ids)}
             body["partial_ends"] = ends
@@ -8873,6 +8924,10 @@ class ExecutorService:
         )
 
         def mutate(body: Dict[str, Any]) -> None:
+            # Гонка CAS: метка в прочитанном теле — level_id не пишем, запись
+            # не проходит (план stop-freeze п.2).
+            if stop_mark_visible(body):
+                raise RuntimeError("stop mark")
             for level in body.get("levels") or []:
                 if str(level.get("id")) != str(level_id):
                     continue
@@ -9143,6 +9198,11 @@ class ExecutorService:
             )
 
         def mutate(body: Dict[str, Any]) -> None:
+            # Гонка: метка могла появиться между перечиткой до await и чтением
+            # строки CAS. Метка в этом теле — тело не меняется: ни конца с
+            # level_id (flat), ни нового close_order с level_id (план п.2).
+            if stop_mark_visible(body):
+                raise RuntimeError("stop mark")
             for level in body.get("levels") or []:
                 if str(level.get("id")) != str(level_id):
                     continue
