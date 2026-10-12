@@ -211,8 +211,10 @@ def test_stop_mark_absent_means_not_frozen(monkeypatch):
 # ── 2. метка до команды; early_stop мимо отказа обёртки ──────────────────────
 
 
-def test_stop_does_not_send_early_stop_until_mark_confirmed(monkeypatch):
-    service, repo, _ = _service_with(monkeypatch, _checkpoint(_level(open_id="buy-1")))
+def test_stop_does_not_send_early_stop_until_mark_confirmed(tmp_path, monkeypatch):
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(open_id="buy-1")), journal_lines=[], tmp_path=tmp_path,
+    )
     recorded = []
     executor = _stub_executor(_Connector(), recorded)
     service._active_executors[EXECUTOR] = executor
@@ -307,11 +309,12 @@ def test_stop_holds_on_unproven_send_and_names_the_reason(tmp_path, monkeypatch)
         remove_miss_order("buy-1")
 
 
-def test_stop_holds_on_foreign_glue_by_price(monkeypatch):
+def test_stop_holds_on_foreign_glue_by_price(tmp_path, monkeypatch):
     connector = _Connector()
     connector.in_flight_orders["foreign-1"] = SimpleNamespace(price="101", client_order_id="foreign-1")
     service, repo, _ = _service_with(
-        monkeypatch, _checkpoint(_level(open_id="buy-1", close_id="sell-1")), connector=connector,
+        monkeypatch, _checkpoint(_level(open_id="buy-1", close_id="sell-1")),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
     )
     recorded = []
     executor = _stub_executor(connector, recorded)
@@ -403,8 +406,11 @@ def test_brake_passes_the_shutdown_path_when_clean_and_not_frozen():
     assert "shutdown" in recorded
 
 
-def test_stop_marks_nothing_but_the_mark(monkeypatch):
-    service, repo, _ = _service_with(monkeypatch, _checkpoint(_level(open_id="buy-1", filled=True, close_id="sell-1")))
+def test_stop_marks_nothing_but_the_mark(tmp_path, monkeypatch):
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(open_id="buy-1", filled=True, close_id="sell-1")),
+        journal_lines=[], tmp_path=tmp_path,
+    )
     recorded = []
     executor = _stub_executor(_Connector(), recorded)
     service._active_executors[EXECUTOR] = executor
@@ -600,6 +606,47 @@ def test_stop_passes_when_the_take_price_in_opens_is_our_own(tmp_path, monkeypat
     service, repo, _ = _service_with(
         monkeypatch, _checkpoint(_level(open_id="buy-1", close_id="sell-1")),
         connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    service._active_executors[EXECUTOR] = executor
+
+    async def fresh(_connector, _pair, _ts=None):
+        return {
+            "opens_read": True,
+            "opens_done": True,
+            "finished_read": True,
+            "finished_done": True,
+            "opens": [{"text": "sell-1", "status": "open", "price": "101"}],
+            "finished": [],
+        }
+
+    service._fresh_raw_lists = fresh
+
+    import asyncio
+
+    async def call():
+        return await service.stop_executor(EXECUTOR)
+
+    answer = asyncio.run(call())
+    assert answer["status"] == "stopping"
+    assert stop_mark_visible(_stored(repo))
+    assert recorded == ["early_stop"]
+
+
+def test_own_close_journal_line_with_level_id_does_not_hold(tmp_path, monkeypatch):
+    """Свой close с журнальной строкой level_id (так пишет place_level_close) не держит.
+
+    Воспроизведение вердикта 20261013-005043-97561: журнал sell-1/level_id=L1
+    и sell-1 на цене тейка в opens/inflight — стоп обязан приняться.
+    """
+    connector = _Connector()
+    connector.in_flight_orders["sell-1"] = SimpleNamespace(price="101", client_order_id="sell-1")
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(open_id="buy-1", close_id="sell-1")),
+        connector=connector,
+        journal_lines=[_row("sell-1", role="close", sent=True, price="101")],
+        tmp_path=tmp_path,
     )
     recorded = []
     executor = _stub_executor(connector, recorded)

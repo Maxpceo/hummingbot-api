@@ -5955,7 +5955,11 @@ class ExecutorService:
         for level in (parsed or {}).get("levels") or []:
             marks = [level.get("take_profit_price"), (level.get("close_order") or {}).get("price")]
             for text, price in seen:
-                if not text or text in texts:
+                # Свой номер не держит: numbers — журнал, слоты и holds, texts —
+                # продажи без level_id. Чужой только тот, чьего имени нет ни там,
+                # ни там: свой close с журнальной строкой level_id — не чужой
+                # (вердикт 20261013-005043-97561).
+                if not text or text in numbers or text in texts:
                     continue
                 if any(self._mark_price_hit(mark, price, tick) for mark in marks):
                     return f"foreign-glue id=…{text[-8:]}"
