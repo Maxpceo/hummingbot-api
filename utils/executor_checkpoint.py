@@ -4257,10 +4257,30 @@ def _executor_connector(executor: Any) -> Any:
     return None
 
 
-def install_close_without_level(executor: Any, executor_id: str) -> bool:
+_BRAKE_HELD_LOGGED: Dict[tuple, float] = {}
+
+
+def _brake_held(executor_id: str, place: str, reason: str, interval: float = 300.0) -> None:
+    """Свидетель держания тормоза: молчать нельзя, спамить тоже."""
+    try:
+        now = time.monotonic()
+        slot = (str(executor_id), place)
+        if now - float(_BRAKE_HELD_LOGGED.get(slot, 0.0)) < float(interval):
+            return
+        _BRAKE_HELD_LOGGED[slot] = now
+        logging.getLogger(__name__).warning(
+            "brake-held place=%s executor=%s reason=%s", place, executor_id, reason,
+        )
+    except Exception:
+        return
+
+
+def install_close_without_level(executor: Any, executor_id: str, frozen: Any = None) -> bool:
     """Fail-closed brake. False means start must not run.
 
     Occupied-open only wraps get_open_orders_to_create. This one wraps closes.
+    `frozen` — проверка метки «стоп запрошен»: путь гашения держится и молча
+    не остаётся (свидетель brake-held).
     """
     if getattr(executor, "_close_brake", False):
         return True
@@ -4291,23 +4311,33 @@ def install_close_without_level(executor: Any, executor_id: str) -> bool:
                 return True
         return False
 
-    def get_close(*args, **kwargs):
+    def hold(place: str) -> bool:
+        """Заморозка держит путь гашения всегда; тормоз — как прежде."""
+        if frozen is not None and frozen():
+            _brake_held(executor_id, place, "frozen: awaiting stage 2")
+            return True
         if blocked():
+            _brake_held(executor_id, place, "blocked")
+            return True
+        return False
+
+    def get_close(*args, **kwargs):
+        if hold("get_close"):
             return []
         return original_get(*args, **kwargs)
 
     async def control_close(*args, **kwargs):
-        if blocked():
+        if hold("control_close"):
             return None
         return await original_control(*args, **kwargs)
 
     async def control_shutdown(*args, **kwargs):
-        if blocked():
+        if hold("control_shutdown"):
             return None
         return await original_shutdown(*args, **kwargs)
 
     def adjust(level, *args, **kwargs):
-        if blocked():
+        if hold("adjust"):
             return None
         owns = getattr(executor, "_partial_owns_level", None)
         if owns is not None and owns(level):
@@ -4330,7 +4360,7 @@ def install_close_without_level(executor: Any, executor_id: str) -> bool:
     executor.control_close_order = control_close
     executor.control_shutdown_process = control_shutdown
     def market(*args, **kwargs):
-        if blocked():
+        if hold("market"):
             return None
         return place_market_close(executor, executor_id)
 
@@ -4341,7 +4371,7 @@ def install_close_without_level(executor: Any, executor_id: str) -> bool:
     original_stop = getattr(executor, "stop", None)
 
     def stop(*args, **kwargs):
-        if blocked():
+        if hold("stop"):
             return None
         if original_stop is None:
             return None
@@ -4618,6 +4648,20 @@ def partial_end_visible(parsed: Optional[Dict[str, Any]], order_id: str) -> bool
     ends = (parsed or {}).get("partial_ends") or {}
     mark = ends.get(str(order_id))
     return isinstance(mark, dict) and bool(mark.get("kind")) and "price" not in mark
+
+
+STOP_MARK_KEY = "stop-requested"
+
+
+def stop_mark_visible(parsed: Optional[Dict[str, Any]]) -> bool:
+    """Метка «стоп запрошен» — единственная запись среза заморозки.
+
+    Форма — метка в partial_ends без level_id, ключ не равен ни одному order_id,
+    order_ids пуст: только такую форму штатный захват чекпоинта переносит вперёд,
+    и она не отпускает цену уровня.
+    """
+    mark = ((parsed or {}).get("partial_ends") or {}).get(STOP_MARK_KEY)
+    return isinstance(mark, dict) and mark.get("kind") == "stop_requested"
 
 
 def partial_level_released(parsed: Optional[Dict[str, Any]], level_id: str) -> bool:

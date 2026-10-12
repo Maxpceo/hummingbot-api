@@ -105,6 +105,8 @@ from utils.executor_checkpoint import (
     CLOSE_HOLD_KEY,
     CLOSE_BAN_KEY,
     install_close_without_level,
+    stop_mark_visible,
+    STOP_MARK_KEY,
     read_merged_ledger,
     strip_close_holds_from_saved,
     is_close_ledger_row,
@@ -1065,7 +1067,10 @@ class ExecutorService:
         self._executor_metadata[executor_id] = metadata
         self._install_checkpoint_hook(executor_id, executor)
         if metadata.get("executor_type") == "grid_executor":
-            install_close_without_level(executor, executor_id)
+            install_close_without_level(
+                executor, executor_id,
+                frozen=lambda eid=str(executor_id): self._stop_mark_now(eid),
+            )
             self._open_fill_down_close_door(executor_id, executor)
         if start:
             self._start_registered_executor(executor_id, executor)
@@ -3409,6 +3414,8 @@ class ExecutorService:
 
     async def _one_sell_after_fill_down(self, executor_id, executor, connector, level) -> None:
         """Stock asked for the close. Record the id, then send that id once."""
+        if await self._refresh_stop_mark(executor_id):
+            return
         level_id = str(getattr(level, "id", "") or "")
         buy_id = self._filled_down_open(executor_id, executor, level)
         if not level_id or not buy_id or connector is None:
@@ -3434,6 +3441,8 @@ class ExecutorService:
             send_amount = self._amount_from_contracts(connector, pair, order, amount)
             if send_amount is None:
                 return
+            if await self._refresh_stop_mark(executor_id):
+                return
             await self._partial_send_committed(
                 executor_id, executor, connector, pair, close_id, level_id, quant, send_amount,
                 journal_ts=self._buy_journal_ts(buy_id),
@@ -3449,6 +3458,8 @@ class ExecutorService:
         amount = getattr(getattr(getattr(level, "active_open_order", None), "order", None), "executed_amount_base", None)
         price = getattr(getattr(getattr(level, "active_open_order", None), "order", None), "price", None)
         if not quant or amount in (None, "") or Decimal(str(amount)) <= 0 or price in (None, ""):
+            return
+        if await self._refresh_stop_mark(executor_id):
             return
         from hummingbot.connector.utils import get_new_client_order_id
         close_id = get_new_client_order_id(
@@ -3468,6 +3479,8 @@ class ExecutorService:
         order = getattr(getattr(level, "active_open_order", None), "order", None)
         send_amount = self._amount_from_contracts(connector, pair, order, amount)
         if send_amount is None:
+            return
+        if await self._refresh_stop_mark(executor_id):
             return
         await self._partial_send_committed(
             executor_id, executor, connector, pair, close_id, level_id, str(quant), send_amount,
@@ -3632,6 +3645,8 @@ class ExecutorService:
 
     async def _durable_open(self, executor_id: str, executor, level, reserves: dict) -> None:
         """Journal the client id, then send. Do not call stock adjust, buy, or sell."""
+        if await self._refresh_stop_mark(executor_id):
+            return
         connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
         connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
         pair = getattr(getattr(executor, "config", None), "trading_pair", None)
@@ -3933,6 +3948,9 @@ class ExecutorService:
                     release_quant(reserves, connector_key, pair, price_text)
                     return
         else:
+            if await self._refresh_stop_mark(executor_id):
+                release_quant(reserves, connector_key, pair, price_text)
+                return
             from hummingbot.connector.utils import get_new_client_order_id
             order_id = get_new_client_order_id(
                 is_buy=getattr(getattr(executor.config, "side", None), "name", "BUY") != "SELL",
@@ -3989,6 +4007,10 @@ class ExecutorService:
         self._chain_place_once(connector, reached)
         from hummingbot.core.data_type.common import PositionAction
         try:
+            if await self._refresh_stop_mark(executor_id):
+                release_quant(reserves, connector_key, pair, price_text)
+                level.active_open_order = None
+                return
             await connector._create_order(
                 trade_type=executor.config.side,
                 order_id=order_id,
@@ -4895,7 +4917,8 @@ class ExecutorService:
                 (checkpoint or {}).get("close_order")
             )
             if row["executor_type"] == "grid_executor" and not install_close_without_level(
-                executor, row["executor_id"]
+                executor, row["executor_id"],
+                frozen=lambda eid=str(row["executor_id"]): self._stop_mark_now(eid),
             ) and close_present:
                 self.__dict__.setdefault("_kept_ids", set()).add(row["executor_id"])
                 return "close brake was not installed"
@@ -5703,12 +5726,36 @@ class ExecutorService:
         if executor.is_closed:
             raise HTTPException(status_code=400, detail=f"Executor {executor_id} is already closed")
 
-        # Сборка концов до early_stop: обёртка стопа и тормоз гашения читают
-        # следы, которые шаг снимает. Без этого стоп встаёт на полпути.
-        try:
-            await self._shutdown_release_step(executor_id, executor)
-        except Exception:
-            logger.exception("shutdown release step failed for %s", executor_id)
+        # Заморозка (план stop-freeze): метка «стоп запрошен» — отдельной CAS,
+        # коммитом и перечиткой НОВОЙ сессией ДО early_stop. Шаг сборки концов
+        # в этом срезе не вызывается: записи уровней/тел/закрытий не трогаются.
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        already = self._stop_mark_now(executor_id) or await self._read_stop_mark_fresh(executor_id)
+        if not already:
+            hold_reason = self._stop_freeze_holds(executor_id, executor)
+            if hold_reason:
+                self._log_silent_exit(
+                    "stop-aside", pair, hold_reason, executor_id,
+                    interval=0.0, label="silent stop exit:", key=executor_id,
+                )
+                return {
+                    "executor_id": executor_id,
+                    "status": "not_accepted",
+                    "reason": hold_reason,
+                    "keep_position": keep_position,
+                }
+            confirmed = False
+            try:
+                confirmed = await self._freeze_stop_mark(executor_id)
+            except Exception:
+                logger.exception("stop mark failed for %s", executor_id)
+            if not confirmed:
+                return {
+                    "executor_id": executor_id,
+                    "status": "not_accepted",
+                    "reason": "stop mark was not confirmed in a fresh read",
+                    "keep_position": keep_position,
+                }
 
         # Trigger early stop
         try:
@@ -5721,7 +5768,7 @@ class ExecutorService:
 
         return {
             "executor_id": executor_id,
-            "status": "stopping",
+            "status": "frozen" if already else "stopping",
             "keep_position": keep_position
         }
 
@@ -5847,6 +5894,56 @@ class ExecutorService:
 
         logger.info(f"Orphaned position for executor {executor_id} marked resolved")
         return {"executor_id": executor_id, "orphan_resolved": True}
+
+    def _stop_freeze_holds(self, executor_id: str, executor: Any) -> Optional[str]:
+        """Чужая склейка по цене и неподтверждённая отправка держат команду.
+
+        Свой номер не держит: штатная отмена снимает его той же командой.
+        """
+        parsed = self._partial_parsed(executor_id)
+        if order_miss_unreadable():
+            return "miss-unreadable"
+        numbers = set(self._own_ids(executor_id))
+        for level in (parsed or {}).get("levels") or []:
+            for key in ("open_order", "close_order"):
+                text = str((level.get(key) or {}).get("order_id") or "")
+                if text:
+                    numbers.add(text)
+            for item in level.get("partial_closes") or []:
+                if isinstance(item, dict) and item.get("order_id"):
+                    numbers.add(str(item.get("order_id")))
+        for hold in (parsed or {}).get("holds") or []:
+            if isinstance(hold, dict) and hold.get("order_id"):
+                numbers.add(str(hold.get("order_id")))
+        unproven = []
+        for order_id in sorted(numbers):
+            text = str(order_id)
+            if partial_end_visible(parsed, text):
+                continue
+            if order_is_unsent(text) or order_send_unknown(text):
+                unproven.append(text)
+        if unproven:
+            return "unproven-send ids=" + ",".join(str(item)[-8:] for item in unproven)
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        if connector is None:
+            return None
+        texts = self._partial_sell_texts(executor_id, parsed)
+        inflight = getattr(connector, "in_flight_orders", None) or {}
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
+        for level in (parsed or {}).get("levels") or []:
+            marks = [level.get("take_profit_price"), (level.get("close_order") or {}).get("price")]
+            for order in list(inflight.values()) + list(lost.values()):
+                text = str(getattr(order, "client_order_id", "") or getattr(order, "order_id", "") or "")
+                if not text or text in texts:
+                    continue
+                price = getattr(order, "price", None)
+                if price in (None, ""):
+                    continue
+                if any(mark not in (None, "") and str(mark) == str(price) for mark in marks):
+                    return f"foreign-glue id=…{text[-8:]}"
+        return None
 
     async def _handle_executor_completion(self, executor_id: str):
         """Handle cleanup when an executor completes."""
@@ -6880,6 +6977,8 @@ class ExecutorService:
         )
 
     def _partial_keep_running(self, executor: Any) -> None:
+        if self._stop_mark_now(self._executor_id_of(executor)):
+            return
         status = getattr(executor, "_status", None)
         enum = type(status) if status is not None else None
         running = getattr(enum, "RUNNING", None)
@@ -7530,6 +7629,8 @@ class ExecutorService:
                 return
 
             def wrapped(*args, **kwargs):
+                if service._stop_mark_now(executor_id):
+                    return original(*args, **kwargs)
                 parsed = service._partial_parsed(executor_id)
                 connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
                 pair = getattr(getattr(executor, "config", None), "trading_pair", None)
@@ -7587,13 +7688,17 @@ class ExecutorService:
                             interval=300.0, label="silent stop exit:", key=executor_id,
                         )
                     return None
+                frozen = await service._refresh_stop_mark(executor_id)
                 was_forbidden = service._partial_forbids(executor_id)
                 if was_forbidden:
                     service._partial_keep_running(executor)
                     service.__dict__.setdefault("_stock_tick_forbid", {})[executor_id] = True
                     service.__dict__.setdefault("_stock_tick_ids", {})[executor_id] = set(service._partial_close_ids(executor_id))
-                await service._partial_tick(executor_id, executor)
-                witness = await service._hand_stock_picture(executor_id, executor, connector, pair or "")
+                if frozen:
+                    witness = ""
+                else:
+                    await service._partial_tick(executor_id, executor)
+                    witness = await service._hand_stock_picture(executor_id, executor, connector, pair or "")
                 fresh = service._tick_fresh(pair or "")
                 service._seat_visible_own(executor_id, executor, connector, fresh)
                 if service._partial_rows() is None:
@@ -7637,6 +7742,8 @@ class ExecutorService:
         if original_cancel_orders is not None:
 
             def wrapped_cancel_orders(*args, **kwargs):
+                if service._stop_mark_now(executor_id):
+                    return original_cancel_orders(*args, **kwargs)
                 stuck = (service.__dict__.get("_unseated_levels") or {}).get(executor_id) or set()
                 if service._stepped_aside(executor_id) and not stuck:
                     return original_cancel_orders(*args, **kwargs)
@@ -7650,6 +7757,8 @@ class ExecutorService:
 
             def wrapped_ids(*args, **kwargs):
                 found = list(original_ids(*args, **kwargs) or [])
+                if service._stop_mark_now(executor_id):
+                    return found
                 if service._stepped_aside(executor_id):
                     protected = set()
                     pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
@@ -7678,6 +7787,8 @@ class ExecutorService:
         if original_opens is not None:
 
             def wrapped_opens(*args, **kwargs):
+                if service._stop_mark_now(executor_id):
+                    return []
                 rows = service._partial_rows()
                 parsed = service._partial_parsed(executor_id)
                 held = partial_held_level_ids(rows, parsed, executor_id)
@@ -8058,6 +8169,53 @@ class ExecutorService:
         rows = self._partial_rows() or []
         found.update(partial_holding_ids(rows, executor_id))
         return found
+
+    def _executor_id_of(self, executor: Any) -> str:
+        for key, value in (getattr(self, "_active_executors", None) or {}).items():
+            if value is executor:
+                return str(key)
+        return str(getattr(getattr(executor, "config", None), "id", "") or "")
+
+    def _stop_mark_now(self, executor_id: str) -> bool:
+        """RAM-гейт заморозки. Тёплый от свежих перечиток и от записи метки."""
+        return bool((self.__dict__.get("_stop_mark_ram") or {}).get(str(executor_id)))
+
+    async def _read_stop_mark_fresh(self, executor_id: str) -> bool:
+        """Перечитка метки НОВОЙ сессией — доказательство коммита записи."""
+        text = await self._partial_column_text(executor_id)
+        return stop_mark_visible(parse_checkpoint(text))
+
+    async def _refresh_stop_mark(self, executor_id: str) -> bool:
+        """Свежая перечитка перед чеканкой/отправкой; без await до вызова биржи.
+
+        Непрочитанное не размораживает: RAM-копия, записанная при стопе,
+        остаётся истиной. Нет метки и в памяти — сетка не заморожена.
+        """
+        ram = self.__dict__.setdefault("_stop_mark_ram", {})
+        try:
+            if await self._read_stop_mark_fresh(executor_id):
+                ram[str(executor_id)] = True
+        except Exception:
+            logger.exception("stop mark re-read failed for %s", executor_id)
+        return bool(ram.get(str(executor_id)))
+
+    async def _freeze_stop_mark(self, executor_id: str) -> bool:
+        """Метка «стоп запрошен»: CAS → коммит (выход из сессии) → новая сессия."""
+        key = str(executor_id)
+
+        def mutate(body: Dict[str, Any]) -> None:
+            ends = dict(body.get("partial_ends") or {})
+            ends[STOP_MARK_KEY] = {"kind": "stop_requested", "order_ids": []}
+            body["partial_ends"] = ends
+
+        try:
+            await self._partial_cas(executor_id, mutate, stop_mark_visible, None)
+        except Exception:
+            logger.exception("stop mark write failed for %s", executor_id)
+        ram = self.__dict__.setdefault("_stop_mark_ram", {})
+        confirmed = await self._read_stop_mark_fresh(executor_id)
+        ram[key] = confirmed
+        return confirmed
 
     async def _partial_cas(self, executor_id: str, mutate: Any, visible: Any, target_id: Optional[str] = None) -> bool:
         if not self.db_manager:
@@ -8509,6 +8667,8 @@ class ExecutorService:
         return False
 
     async def _partial_release(self, executor_id: str, order_id: str, level_id: str, kind: str, connector: Any, pair: str) -> bool:
+        if await self._refresh_stop_mark(executor_id):
+            return False
         ids = [order_id]
 
         def mutate(body: Dict[str, Any]) -> None:
@@ -8702,6 +8862,8 @@ class ExecutorService:
     ) -> Optional[str]:
         if not quant:
             return None
+        if await self._refresh_stop_mark(executor_id):
+            return None
         from hummingbot.connector.utils import get_new_client_order_id
         order_id = get_new_client_order_id(
             is_buy=False,
@@ -8828,6 +8990,8 @@ class ExecutorService:
         amount: Decimal,
         journal_ts: Any = _OKX_JOURNAL_UNSET,
     ) -> None:
+        if await self._refresh_stop_mark(executor_id):
+            return
         given_ts = journal_ts is not _OKX_JOURNAL_UNSET
         read_ts = journal_ts if given_ts else None
         fresh = await self._fresh_raw_lists(connector, pair, read_ts)
@@ -8895,6 +9059,10 @@ class ExecutorService:
         self._seat_close_hold(executor, order_id)
         try:
             from hummingbot.core.data_type.common import PositionAction
+            if await self._refresh_stop_mark(executor_id):
+                if reserves.get(key) == order_id:
+                    reserves.pop(key, None)
+                return
             await connector._create_order(
                 trade_type=trade_type,
                 order_id=order_id,
@@ -8931,6 +9099,8 @@ class ExecutorService:
     ) -> None:
         if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
             return
+        if await self._refresh_stop_mark(executor_id):
+            return
         fresh = await self._fresh_raw_lists(connector, pair, None)
         if not fresh.get("opens_read") or not fresh.get("opens_done"):
             return
@@ -8960,6 +9130,8 @@ class ExecutorService:
                 if item.get("filled_base") not in (None, ""):
                     already += Decimal(str(item.get("filled_base")))
         flat = bool(open_id) and bought > 0 and already + filled >= bought
+        if await self._refresh_stop_mark(executor_id):
+            return
         new_id = None
         if not flat:
             from hummingbot.connector.utils import get_new_client_order_id
@@ -9066,6 +9238,8 @@ class ExecutorService:
         bought: Decimal,
         fresh: Dict[str, Any],
     ) -> None:
+        if await self._refresh_stop_mark(executor_id):
+            return
         parsed = self._partial_parsed(executor_id)
         level_body = None
         for level in (parsed or {}).get("levels") or []:
