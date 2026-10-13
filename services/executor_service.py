@@ -7,6 +7,13 @@ import asyncio
 import contextvars
 
 _placing_order_id = contextvars.ContextVar("placing_order_id", default=None)
+# Доставка отмены этим номером: блокировки её не прячут (план stop-freeze п.2).
+_cancel_delivery_id = contextvars.ContextVar("cancel_delivery_id", default=None)
+
+
+def _delivery_owns(text: str) -> bool:
+    current = _cancel_delivery_id.get()
+    return current not in (None, "") and str(text) == str(current)
 _own_fresh_send = contextvars.ContextVar("own_fresh_send", default="")
 import json
 import logging
@@ -2237,6 +2244,8 @@ class ExecutorService:
     def _close_delete_blocked(self, text: str) -> bool:
         """A held close, a ban, or an unproven prefix id must not be cancelled."""
         if not text:
+            return False
+        if _delivery_owns(text):
             return False
         for executor in self._active_executors.values():
             holds = {
@@ -5759,9 +5768,14 @@ class ExecutorService:
                     "keep_position": keep_position,
                 }
 
-        # Судьба наших номеров держит только доведение, не заморозку и не
-        # первую досылку отмен: доводку досылает сама программа (план п.3).
-        pending = self._stop_unproven_reason(executor_id)
+        # Доставка отмен по нашим номерам — сразу и не за готовностью списков
+        # (план stop-freeze п.3): пока номер не доказан снятым или мёртвым,
+        # доводка крутится сама, без повторного нажатия.
+        pending_ids = self._stop_unfinished_ids(executor_id, self._tick_fresh(pair))
+        pending = (
+            "undelivered-cancel ids=" + ",".join(str(item)[-8:] for item in pending_ids)
+            if pending_ids else None
+        )
         if pending:
             self._log_silent_exit(
                 "stop-aside", pair, pending, executor_id,
@@ -5775,6 +5789,13 @@ class ExecutorService:
         except Exception as e:
             logger.error(f"Error stopping executor {executor_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Error stopping executor: {str(e)}")
+
+        # Первая доставка отмен — тоже сразу (план п.3).
+        connector = (getattr(executor, "connectors", None) or {}).get(
+            getattr(getattr(executor, "config", None), "connector_name", "") or ""
+        )
+        if connector is not None:
+            await self._stop_deliver_cancels(executor_id, executor, connector, pair)
 
         logger.info(f"Initiated stop for executor {executor_id} (keep_position={keep_position})")
 
@@ -5908,16 +5929,14 @@ class ExecutorService:
         logger.info(f"Orphaned position for executor {executor_id} marked resolved")
         return {"executor_id": executor_id, "orphan_resolved": True}
 
-    def _stop_unproven_reason(self, executor_id: str) -> Optional[str]:
-        """Судьба наших номеров неизвестна: они ещё могут оказаться на бирже.
+    def _stop_unfinished_ids(self, executor_id: str, fresh: Optional[Dict[str, Any]] = None) -> list:
+        """Наши номера без доказательства «снят или мёртв» (план stop-freeze п.3).
 
-        Держит только доведение отмен, не заморозку (план stop-freeze п.3):
-        заявки опознаются ТОЛЬКО по номеру, чужая заявка на цене и нечитаемые
-        списки биржи сюда не входят. Нечитаемый miss — судьба неизвестна всем.
+        Доставка отмены ведётся по каждому такому номеру: журнал, слоты уровней,
+        holds. Заявки опознаются ТОЛЬКО по номеру; чужая заявка на цене и
+        нечитаемые списки биржи сюда не входят.
         """
         parsed = self._partial_parsed(executor_id)
-        if order_miss_unreadable():
-            return "miss-unreadable"
         numbers = set(self._own_ids(executor_id))
         for level in (parsed or {}).get("levels") or []:
             for key in ("open_order", "close_order"):
@@ -5930,42 +5949,78 @@ class ExecutorService:
         for hold in (parsed or {}).get("holds") or []:
             if isinstance(hold, dict) and hold.get("order_id"):
                 numbers.add(str(hold.get("order_id")))
-        unproven = []
-        for order_id in sorted(numbers):
-            text = str(order_id)
+        out = []
+        for text in sorted(numbers):
             if partial_end_visible(parsed, text):
                 continue
-            if order_is_unsent(text) or order_send_unknown(text):
-                unproven.append(text)
-        if not unproven:
-            return None
-        return "unproven-send ids=" + ",".join(str(item)[-8:] for item in unproven)
+            if self._proven_dead(text, fresh):
+                continue
+            out.append(text)
+        return out
 
-    def _stop_finish_repeat(self, executor_id: str, executor: Any, pair: str = "") -> None:
-        """Доводка заморозки: досылает отмены сама, пока судьба номеров неизвестна.
+    async def _stop_deliver_cancel(self, executor: Any, connector: Any, text: str, pair: str) -> bool:
+        """Доставка отмены по нашему номеру до биржи (план stop-freeze п.3).
 
-        Одно нажатие (план stop-freeze п.3): метка уже есть, досылка идёт тем же
-        `early_stop`, с паузой, без повторного нажатия кнопки. После перезагрузки
-        доводка продолжается сама: метка живёт в записи, судьба номеров — в
-        журнале.
+        Номер в трекере — штатный путь (`strategy.cancel` → `_api_delete`); наш
+        номер вне трекера — отмена по client id через `_place_cancel`, как в
+        `_cancel_copied_open` при пустом gate-запросе. Посадка и вызов, который
+        обёртка превратила в `None`, доставкой не считаются.
         """
-        reason = self._stop_unproven_reason(executor_id)
-        if not reason:
+        token = _cancel_delivery_id.set(text)
+        try:
+            tracked = getattr(connector, "in_flight_orders", None) or {}
+            lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
+            if text in tracked or text in lost:
+                strategy = getattr(executor, "_strategy", None)
+                cancel = getattr(strategy, "cancel", None)
+                if cancel is None:
+                    return False
+                result = cancel(order_id=text)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                return result is not None
+            place = getattr(connector, "_place_cancel", None)
+            if place is None:
+                return False
+            row = type("TrackedCancel", (), {})()
+            row.exchange_order_id = ""
+            row.client_order_id = text
+            row.trading_pair = pair
+            result = place(text, row)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result is True
+        except Exception:
+            logger.exception("stop cancel delivery failed for %s", text)
+            return False
+        finally:
+            _cancel_delivery_id.reset(token)
+
+    async def _stop_deliver_cancels(self, executor_id: str, executor: Any, connector: Any, pair: str = "") -> None:
+        """Доводка заморозки: доставка отмены по каждому нашему номеру.
+
+        Одно нажатие (план stop-freeze п.3): программа сама повторяет доставку,
+        с паузой, пока есть номера без доказательства «снят или мёртв» — и для
+        `sent` тоже. Не за готовностью списков и не за судьбой отправки; после
+        перезагрузки продолжается сама (метка живёт в записи, номера — в
+        журнале).
+        """
+        key = str(executor_id)
+        pending = self._stop_unfinished_ids(executor_id, self._tick_fresh(pair or ""))
+        if not pending:
             return
         stamps = self.__dict__.setdefault("_stop_finish_last", {})
         now = time.time()
-        if stamps.get(str(executor_id)) is not None and now - stamps[str(executor_id)] < STOP_FINISH_RETRY_SECONDS:
+        if stamps.get(key) is not None and now - stamps[key] < STOP_FINISH_RETRY_SECONDS:
             return
-        stamps[str(executor_id)] = now
+        stamps[key] = now
         self._log_silent_exit(
-            "stop-aside", pair or "", reason, executor_id,
-            interval=300.0, label="silent stop exit:", key=executor_id,
+            "stop-aside", pair or "",
+            "undelivered-cancel ids=" + ",".join(str(item)[-8:] for item in pending),
+            executor_id, interval=300.0, label="silent stop exit:", key=executor_id,
         )
-        try:
-            keep = bool((self.__dict__.get("_stop_keep_position") or {}).get(str(executor_id)))
-            executor.early_stop(keep_position=keep)
-        except Exception:
-            logger.exception("stop finish repeat failed for %s", executor_id)
+        for text in pending:
+            await self._stop_deliver_cancel(executor, connector, text, pair or "")
 
     async def _handle_executor_completion(self, executor_id: str):
         """Handle cleanup when an executor completes."""
@@ -7388,6 +7443,8 @@ class ExecutorService:
     def _partial_text_protected(self, text: str) -> bool:
         if not text:
             return False
+        if _delivery_owns(text):
+            return False
         rows = self._partial_rows()
         if rows is None:
             return True
@@ -7700,6 +7757,11 @@ class ExecutorService:
                 pair = getattr(getattr(executor, "config", None), "trading_pair", None)
                 if connector is not None and pair:
                     await service._store_tick_fresh(connector, pair)
+                frozen = await service._refresh_stop_mark(executor_id)
+                if frozen and connector is not None:
+                    # Доставка отмен не за готовностью списков и не за судьбой
+                    # номеров (план stop-freeze п.3).
+                    await service._stop_deliver_cancels(executor_id, executor, connector, pair or "")
                 fresh = service._tick_fresh(pair or "")
                 if not service._lists_ready(fresh):
                     if service._partial_forbids(executor_id):
@@ -7710,7 +7772,6 @@ class ExecutorService:
                             interval=300.0, label="silent stop exit:", key=executor_id,
                         )
                     return None
-                frozen = await service._refresh_stop_mark(executor_id)
                 was_forbidden = service._partial_forbids(executor_id)
                 if was_forbidden:
                     service._partial_keep_running(executor)
@@ -7718,8 +7779,6 @@ class ExecutorService:
                     service.__dict__.setdefault("_stock_tick_ids", {})[executor_id] = set(service._partial_close_ids(executor_id))
                 if frozen:
                     witness = ""
-                    # Доводка заморозки без повторного нажатия (план п.3).
-                    service._stop_finish_repeat(executor_id, executor, pair or "")
                 else:
                     await service._partial_tick(executor_id, executor)
                     witness = await service._hand_stock_picture(executor_id, executor, connector, pair or "")
@@ -8170,6 +8229,8 @@ class ExecutorService:
     def _cancel_blocked(self, order_id: str) -> bool:
         if not order_id:
             return False
+        if _delivery_owns(order_id):
+            return False
         if self._partial_text_protected(order_id):
             return True
         for executor in getattr(self, "_active_executors", {}).values():
@@ -8258,7 +8319,9 @@ class ExecutorService:
             logger.exception("stop mark write failed for %s", executor_id)
         ram = self.__dict__.setdefault("_stop_mark_ram", {})
         confirmed = await self._read_stop_mark_fresh(executor_id)
-        ram[key] = confirmed
+        # Непрочитанное не размораживает: ложь поверх истины метку не стирает.
+        if confirmed:
+            ram[key] = True
         return confirmed
 
     async def _partial_cas(self, executor_id: str, mutate: Any, visible: Any, target_id: Optional[str] = None) -> bool:

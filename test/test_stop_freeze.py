@@ -10,9 +10,10 @@
 после гейта — запись не проходит, цена тейка цела); перезагрузка после коммита
 метки (RAM холодный — метка прогрета, обёртка не отказывает, отмены ушли);
 чужая заявка на цене тейка НЕ держит команду (правило номера), нечитаемые
-списки биржи ни на что не влияют, неподтверждённая отправка не держит
-заморозку — доводка отмен идёт сама; задача канала закрытия уже в очереди,
-метка закоммичена — `_create_order` не вызван.
+списки биржи ни на что не влияют, доводка сама доставляет отмену по каждому
+нашему номеру (до `_place_cancel`/`strategy.cancel`, мимо защит) и кончается на
+доказанных; задача канала закрытия уже в очереди, метка закоммичена —
+`_create_order` не вызван.
 """
 
 import json
@@ -91,9 +92,14 @@ class _Connector:
         self.in_flight_orders = {}
         self._order_tracker = SimpleNamespace(lost_orders={})
         self.created = []
+        self.cancelled = []
 
     async def _create_order(self, **kwargs):
         self.created.append(kwargs)
+
+    async def _place_cancel(self, order_id, tracked):
+        self.cancelled.append(str(order_id))
+        return True
 
     def buy(self, *args, **kwargs):
         return None
@@ -286,46 +292,127 @@ def test_wrap_stop_does_not_refuse_or_reset_running_under_the_mark(monkeypatch):
 # ── 3. свидетели: чужая склейка и неподтверждённая отправка ─────────────────
 
 
-def test_unproven_send_freezes_now_and_finishes_itself(tmp_path, monkeypatch):
-    """Неподтверждённая отправка не держит заморозку: метка сразу, доводка сама.
+def test_stop_freezes_at_once_and_names_the_undelivered_cancels(tmp_path, monkeypatch):
+    """Метка сразу, отмены сразу; ответ называет номера без доставки (план п.3)."""
+    _journal(tmp_path, monkeypatch, [_row("sell-1", role="close", sent=True, price="101")])
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(open_id="buy-1", filled=True, close_id="sell-1")),
+        connector=connector,
+    )
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    executor._close_holds = [{"order_id": "sell-1", "role": "close", "level_id": "L1", "price": "101"}]
+    service._active_executors[EXECUTOR] = executor
 
-    План stop-freeze п.3: судьба наших номеров держит только завершение;
-    повторного нажатия кнопки нет — отмены досылает сама программа.
+    import asyncio
+
+    async def call():
+        return await service.stop_executor(EXECUTOR)
+
+    answer = asyncio.run(call())
+    # Заморозка и отмены сразу: отказа нет, повторного нажатия нет.
+    assert answer["status"] == "stopping"
+    assert "undelivered-cancel" in (answer.get("pending") or "")
+    assert "sell-1"[-8:] in (answer.get("pending") or "")
+    assert stop_mark_visible(_stored(repo))
+    assert recorded == ["early_stop"]
+    # Доставка пошла сразу: наши номера вне трекера отменяются по client id.
+    assert connector.cancelled == ["buy-1", "sell-1"]
+
+
+def test_cancel_delivery_reaches_place_cancel_for_untracked_number(tmp_path, monkeypatch):
+    """Проба 6 плана: номер в журнале и в `_close_holds`, сидит в уровне, вне трекера.
+
+    Доставкой считается только отмена, дошедшая до биржи: виден `_place_cancel`
+    по номеру, а не stub `early_stop` и не пустой `_api_delete`; повторы
+    кончаются, когда номер доказан снятым или мёртвым.
     """
-    _journal(tmp_path, monkeypatch, [_row("buy-1")])
-    from utils.executor_checkpoint import add_miss_order, add_sent_order, remove_miss_order
-    add_miss_order("buy-1")
-    try:
-        service, repo, _ = _service_with(monkeypatch, _checkpoint(_level(open_id="buy-1")))
-        recorded = []
-        executor = _stub_executor(_Connector(), recorded)
-        service._active_executors[EXECUTOR] = executor
+    _journal(tmp_path, monkeypatch, [_row("sell-1", role="close", sent=True, price="101")])
+    connector = _Connector()
+    text = _marked(_checkpoint(_level(open_id="buy-1", filled=True, close_id="sell-1")))
+    service, repo, _ = _service_with(monkeypatch, text, connector=connector)
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    executor._close_holds = [{"order_id": "sell-1", "role": "close", "level_id": "L1", "price": "101"}]
+    service._active_executors[EXECUTOR] = executor
+    service.__dict__.pop("_stop_mark_ram", None)  # холодная RAM после перезагрузки
 
-        import asyncio
+    import asyncio
 
-        async def call():
-            return await service.stop_executor(EXECUTOR)
+    async def run():
+        await service._stop_deliver_cancels(EXECUTOR, executor, connector, PAIR)
 
-        answer = asyncio.run(call())
-        # Заморозка сразу: метка записана, отмены ушли, отказа нет.
-        assert answer["status"] == "stopping"
-        assert "unproven-send" in (answer.get("pending") or "")
-        assert stop_mark_visible(_stored(repo))
-        assert recorded == ["early_stop"]
+    asyncio.run(run())
+    assert connector.cancelled == ["buy-1", "sell-1"]
+    assert connector.created == []
+    assert recorded == []
 
-        # Доводка сама, и холодная RAM ей не помеха (перезагрузка).
-        service.__dict__.pop("_stop_mark_ram", None)
-        service.__dict__.setdefault("_stop_finish_last", {})[EXECUTOR] = 0.0
-        service._stop_finish_repeat(EXECUTOR, executor)
-        assert recorded == ["early_stop", "early_stop"]
+    # Повтор без кнопки, пока номера не доказаны.
+    service.__dict__.setdefault("_stop_finish_last", {})[EXECUTOR] = 0.0
+    asyncio.run(run())
+    assert connector.cancelled == ["buy-1", "sell-1", "buy-1", "sell-1"]
 
-        # Судьба номера ясна — доводка молчит.
-        add_sent_order("buy-1")
-        service.__dict__.setdefault("_stop_finish_last", {})[EXECUTOR] = 0.0
-        service._stop_finish_repeat(EXECUTOR, executor)
-        assert recorded == ["early_stop", "early_stop"]
-    finally:
-        remove_miss_order("buy-1")
+    # Номера доказаны снятыми — повторы кончились.
+    done = json.loads(text)
+    done.setdefault("partial_ends", {})
+    done["partial_ends"]["sell-1"] = {"kind": "cancelled", "order_ids": ["sell-1"]}
+    done["partial_ends"]["buy-1"] = {"kind": "cancelled", "order_ids": ["buy-1"]}
+    repo.rows[0]["checkpoint"] = json.dumps(done, sort_keys=True)
+    service._set_hold_rows(repo.rows)
+    service.__dict__.setdefault("_stop_finish_last", {})[EXECUTOR] = 0.0
+    asyncio.run(run())
+    assert connector.cancelled == ["buy-1", "sell-1", "buy-1", "sell-1"]
+
+
+def test_cancel_delivery_passes_the_guard_for_tracked_number(tmp_path, monkeypatch):
+    """Номер в трекере: штатная отмена проходит мимо защит только для доставки (п.2)."""
+    connector = _Connector()
+    connector.in_flight_orders["sell-1"] = SimpleNamespace(price="101", client_order_id="sell-1")
+    service, repo, _ = _service_with(
+        monkeypatch, _marked(_checkpoint(_level(open_id="buy-1", filled=True, close_id="sell-1"))),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    executor._close_holds = [{"order_id": "sell-1", "role": "close", "level_id": "L1", "price": "101"}]
+    sent = []
+
+    def strategy_cancel(*args, **kwargs):
+        order_id = kwargs.get("order_id") or (args[-1] if args else None)
+        sent.append(str(order_id))
+        return order_id
+
+    executor._strategy = SimpleNamespace(cancel=strategy_cancel)
+    service._active_executors[EXECUTOR] = executor
+    service._install_partial_guards(EXECUTOR, executor)
+
+    # Вне доставки обёртка гасит отмену: sell-1 в `_close_holds`.
+    assert executor._strategy.cancel(order_id="sell-1") is None
+    assert sent == []
+
+    import asyncio
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "sell-1", PAIR)) is True
+    assert sent == ["sell-1"]
+
+
+def test_unreadable_reread_does_not_erase_the_mark(monkeypatch):
+    """Непрочитанная перечитка не стирает метку из RAM (план п.1)."""
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    service._active_executors[EXECUTOR] = executor
+    service.__dict__.setdefault("_stop_mark_ram", {})[EXECUTOR] = True
+
+    async def unreadable(_executor_id):
+        return False
+
+    service._read_stop_mark_fresh = unreadable
+
+    import asyncio
+    assert asyncio.run(service._freeze_stop_mark(EXECUTOR)) is False
+    assert service._stop_mark_now(EXECUTOR) is True
+    assert asyncio.run(service._refresh_stop_mark(EXECUTOR)) is True
 
 
 def test_foreign_order_by_price_does_not_hold(tmp_path, monkeypatch):
@@ -359,7 +446,7 @@ def test_foreign_order_by_price_does_not_hold(tmp_path, monkeypatch):
 
     answer = asyncio.run(call())
     assert answer["status"] == "stopping"
-    assert answer.get("pending") is None
+    assert "undelivered-cancel" in (answer.get("pending") or "")
     assert stop_mark_visible(_stored(repo))
     assert recorded == ["early_stop"]
 
