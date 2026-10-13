@@ -493,3 +493,41 @@ def test_take_releases_when_the_sell_covered_the_buy(monkeypatch, tmp_path):
     assert recorded_price_blocks(blocked_open, "0.10", TICK) is True, (
         "покупка исполнена, продажи нет — тейк открытой позиции держит"
     )
+
+
+def test_take_releases_after_the_sell_slot_was_cleared(monkeypatch, tmp_path):
+    """После гашения слот продажи пуст, в чекпоинте пометка flat. Продажа всё равно
+    доказана строкой журнала того же уровня: тейк не держит. Без продажи в finished — держит."""
+    import json
+
+    from utils.executor_checkpoint import recorded_price_blocks
+
+    released = _level(level_id="L1", open_id="", close_id="", take=None)
+    released["partial_bought"] = "1"
+    body = json.loads(_checkpoint(released, ends={
+        "buy-1": {"kind": "flat", "level_id": "L1", "order_ids": ["buy-1", "sell-1"]},
+    }))
+    body["levels"][0].pop("take_profit_price", None)
+    body["levels"][0]["close_order"] = None
+    body["levels"][0]["open_order"] = None
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True),
+        _row("sell-1", level_id="L1", role="close", price="0.10", sent=True),
+    ])
+    service, repo, connector = _service_with(monkeypatch, json.dumps(body))
+    sold = _fresh(finished=[
+        {"text": "buy-1", "finish_as": "filled", "price": "0.09487", "amount": "1", "left": "0"},
+        {"text": "sell-1", "finish_as": "filled", "price": "0.10", "amount": "1", "left": "0"},
+    ])
+    blocked = service._prices_for_blocks(service._ban_pairs(PAIR, sold), sold)
+    assert recorded_price_blocks(blocked, "0.10", TICK) is False, (
+        "слот снят, но продажа журнала покрыла покупку — тейк не держит"
+    )
+    assert recorded_price_blocks(blocked, "0.09487", TICK) is False, (
+        "цена исполненной покупки — история"
+    )
+    unsold = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "price": "0.09487"}])
+    blocked_open = service._prices_for_blocks(service._ban_pairs(PAIR, unsold), unsold)
+    assert recorded_price_blocks(blocked_open, "0.10", TICK) is True, (
+        "продажи в finished нет — тейк открытой позиции держит"
+    )

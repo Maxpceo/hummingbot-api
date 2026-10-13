@@ -2682,9 +2682,10 @@ class ExecutorService:
     def _take_holds(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
         """Тейк держит quant, пока позиция не закрыта (план number-rule, п.2 и п.7):
         живой или неизвестный номер ещё не кончил держание; отмена без позиции
-        не держит. Исполненный держит, только пока позиция номера открыта: продажа уровня
-        доказана finished и база продажи покрыла покупку (как `_level_position_open` ложь) — тейк
-        отпущен; пока продажа не доказана, тейк держит (вердикт 20261013-221347-72133)."""
+        не держит. Исполненный держит, только пока позиция номера открыта. Продажа уровня,
+        доказанная finished и покрывшая покупку, отпускает тейк и когда слот уже снят:
+        считается строка журнала того же уровня, не только номер в слоте. Пока такой продажи
+        в finished нет, тейк держит (вердикт 20261014-031325-47150)."""
         name = str(order_id or "")
         if not name:
             return False
@@ -2695,13 +2696,42 @@ class ExecutorService:
         return self._number_position_open(name, fresh)
 
     def _number_position_open(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
-        """Позиция номера открыта, пока продажа её уровня не доказана: уровень из
-        чекпоинта, дальше как `_level_position_open`. Уровень не найден или журнал не
-        прочитан — продажа не доказана, позиция считается открытой."""
+        """Позиция номера открыта, пока продажа её уровня не доказана. Слот — как
+        `_level_position_open`. Слот уже снят гашением — продажа того же уровня из журнала. Уровень не
+        найден или продажа не доказана — позиция считается открытой."""
         level, body = self._level_of_number(order_id)
         if level is None:
             return True
-        return self._level_position_open(level, body, fresh)
+        if not self._level_position_open(level, body, fresh):
+            return False
+        return not self._journal_sell_covered(level, fresh)
+
+    def _journal_sell_covered(self, level: Dict[str, Any], fresh: Optional[Dict[str, Any]]) -> bool:
+        """Продажа уровня доказана без слота: строка журнала role=close или
+        market_close того же level_id, finished показал её исполненной, база покрыла покупку."""
+        level_id = str(level.get("id") or "")
+        bought = partial_decimal(level.get("partial_bought"))
+        if not level_id or bought is None or bought <= 0:
+            return False
+        rows = self._partial_rows()
+        if not rows:
+            return False
+        sold = Decimal("0")
+        seen = set()
+        for row in rows:
+            if str(row.get("level_id") or "") != level_id:
+                continue
+            if str(row.get("role") or "") not in ("close", "market_close"):
+                continue
+            name = str(row.get("order_id") or "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            finished = self._finished_row(name, fresh)
+            if finished is None or not self._closed_row_filled(finished):
+                continue
+            sold += self._shutdown_sold_base(finished)
+        return sold >= bought
 
     def _level_of_number(self, order_id: str):
         """Уровень чекпоинта, которому принадлежит номер: по слоту уровня, иначе по
