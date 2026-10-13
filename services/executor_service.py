@@ -2723,16 +2723,44 @@ class ExecutorService:
             executor_id, executor, connector, pair, price, str(own_id or ""), self._tick_fresh(pair),
         )
 
-    def _pair_holds(self, order_id: Any, fresh: Optional[Dict[str, Any]]) -> bool:
+    def _take_map(self) -> dict:
+        """Тейки номеров из журнала: пара (номер, цена) — либо цена номера, либо
+        его тейк, и держат они по разным правилам."""
+        found = {}
+        for row in self._partial_rows() or []:
+            order_id = str(row.get("order_id") or "")
+            if order_id and order_id not in found and row.get("take_profit_price") not in (None, ""):
+                found[order_id] = row.get("take_profit_price")
+        return found
+
+    def _pair_holds(self, order_id: Any, price: Any, fresh: Optional[Dict[str, Any]], takes: Any = None) -> bool:
         """Пара (номер, цена) держит quant: голая пара без номера — как голая
-        цена; чужой текст — нет; отмена без позиции (finished, база ноль)
-        отпускает. Исполненная пара остаётся — её тейк держит позицию."""
+        цена; чужой текст — нет. Цена номера держит, пока `_text_holds`; его
+        тейк — пока `_take_holds`: цена самой исполненной покупки — история и
+        quant не держит, её тейк держит позицию (вердикт 20261013-201526-2866)."""
         name = str(order_id or "")
         if not name:
             return True
         if not self._own_text(name):
             return False
-        return not self._proven_dead_zero(name, fresh)
+        if takes is None:
+            takes = self._take_map()
+        take = str(takes.get(name) or "")
+        if take and str(price) == take:
+            return self._take_holds(name, fresh)
+        return self._text_holds(name, fresh)
+
+    def _stored_block_prices(self, stored: Any, fresh: Optional[Dict[str, Any]]) -> list:
+        """Список блокировки из `stored`: пара проходит, пока её держит
+        `_pair_holds`; отпущенная `_text_holds` пара в блокировку не попадает."""
+        takes = self._take_map()
+        kept = []
+        for item in stored or []:
+            if isinstance(item, tuple) and len(item) == 2:
+                if not self._pair_holds(item[0], item[1], fresh, takes):
+                    continue
+            kept.append(item)
+        return kept
 
     def _text_holds(self, text: Any, fresh: Optional[Dict[str, Any]], extra_own: Any = None) -> bool:
         """Держит ли запись с этим текстом цену для нового номера (правило
@@ -2872,15 +2900,16 @@ class ExecutorService:
 
     def _prices_for_blocks(self, items, fresh) -> List[Any]:
         """Price strings only. Пара (номер, цена) держит, пока держит `_pair_holds`:
-        чужой текст и отмена без позиции падают; исполненная пара (тейк открытой
-        позиции), голая цена и голая пара остаются."""
+        цена номера — пока `_text_holds`, его тейк — пока `_take_holds`; чужой
+        текст и голая пара без номера — как раньше."""
+        takes = self._take_map()
         live_prices = set()
         for item in items or []:
             if isinstance(item, tuple) and len(item) == 2:
                 order_id, price = item
                 if price in (None, "") or isinstance(price, (tuple, dict)):
                     continue
-                if self._pair_holds(order_id, fresh):
+                if self._pair_holds(order_id, price, fresh, takes):
                     live_prices.add(str(price))
             elif not isinstance(item, (tuple, dict)) and item not in (None, ""):
                 live_prices.add(str(item))
@@ -2891,7 +2920,7 @@ class ExecutorService:
                 order_id, price = item
                 if price in (None, "") or isinstance(price, (tuple, dict)):
                     continue
-                if not self._pair_holds(order_id, fresh) and str(price) not in live_prices:
+                if not self._pair_holds(order_id, price, fresh, takes) and str(price) not in live_prices:
                     continue
                 value = price
             elif isinstance(item, dict) or item in (None, ""):
@@ -3932,7 +3961,7 @@ class ExecutorService:
             return
         released = self._partial_released_ids_for_pair(pair)
         released.update(self.__dict__.get("_released_order_ids", set()))
-        prices = list(stored)
+        prices = self._stored_block_prices(stored, fresh)
         prices.extend(column_prices)
         prices.extend(self.__dict__.get("_claimed_prices", []))
         for raw in list(fresh.get("opens") or []) + list(fresh.get("finished") or []):

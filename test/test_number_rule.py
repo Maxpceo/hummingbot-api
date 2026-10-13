@@ -438,3 +438,28 @@ def test_place_level_close_refuses_on_a_bare_tick_snapshot(monkeypatch, tmp_path
     assert minted == [], "get_new_client_order_id не вызывался — чеканки не было"
     assert _ledger_rows_count() == before, "записи журнала не было"
     assert connector.created == []
+
+
+# ── 10. вердикт 20261013-201526-2866: stored не держит цену исполненной ──────
+
+
+def test_stored_block_prices_release_the_filled_buy_price(monkeypatch, tmp_path):
+    """Список блокировки `_durable_open` (из `stored`) не держит цену
+    исполненной покупки чужого исполнителя (0.09487), но держит тейк открытой
+    позиции — через `recorded_price_blocks` после списка, не сырой `_ban_pairs`."""
+    from utils.executor_checkpoint import recorded_price_blocks
+
+    _journal(tmp_path, monkeypatch, [
+        _row("gone-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10",
+             sent=True, executor_id="other"),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
+    fresh = _fresh(finished=[{"text": "gone-1", "finish_as": "filled", "price": "0.09487"}])
+    stored = [("gone-1", "0.09487"), ("gone-1", "0.10")]
+    blocked = service._prices_for_blocks(service._stored_block_prices(stored, fresh), fresh)
+    assert recorded_price_blocks(blocked, "0.09487", TICK) is False, (
+        "цена самой исполненной покупки чужого исполнителя quant не держит"
+    )
+    assert recorded_price_blocks(blocked, "0.10", TICK) is True, (
+        "тейк открытой позиции держит quant"
+    )
