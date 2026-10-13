@@ -454,7 +454,8 @@ def test_failed_commit_publishes_no_mark_and_sends_no_cancels(tmp_path, monkeypa
     assert connector.created == []
     # Метка не опубликована: ни RAM, ни запись её не несут.
     assert service._stop_mark_now(EXECUTOR) is False
-    assert asyncio.run(service._refresh_stop_mark(EXECUTOR)) is False
+    # А непрочитаемость ДЕРЖИТ отправку, а не открывает её (п.2).
+    assert asyncio.run(service._refresh_stop_mark(EXECUTOR)) is True
 
 
 def test_commit_returned_holds_freeze_when_the_next_session_fails(tmp_path, monkeypatch):
@@ -534,7 +535,7 @@ def test_unreadable_confirmation_after_cas_still_freezes_and_delivers(tmp_path, 
     service._active_executors[EXECUTOR] = executor
 
     async def column_unreadable(_executor_id):
-        return None
+        raise RuntimeError("column unreadable")
 
     service._partial_column_text = column_unreadable
 
@@ -558,6 +559,81 @@ def test_unreadable_confirmation_after_cas_still_freezes_and_delivers(tmp_path, 
     )
     assert connector.created == []
     assert asyncio.run(service._refresh_stop_mark(EXECUTOR)) is True
+
+
+def test_close_failure_after_commit_still_publishes_the_mark(tmp_path, monkeypatch):
+    """Коммит вернулся, close сессии упал — метка уже опубликована (вердикт
+    20261013-092445-71222): заморозка держится, отмены пошли."""
+    from contextlib import asynccontextmanager
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(open_id="buy-1", filled=True, close_id="sell-1")),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    service._active_executors[EXECUTOR] = executor
+
+    @asynccontextmanager
+    async def close_fails():
+        session = SimpleNamespace()
+        try:
+            yield session
+        finally:
+            # Штатный контекст сперва коммитит, потом закрывает сессию.
+            await session.commit()
+            raise RuntimeError("close failed")
+
+    service.db_manager = SimpleNamespace(get_session_context=lambda: close_fails())
+
+    import asyncio
+
+    async def call():
+        return await service.stop_executor(EXECUTOR)
+
+    answer = asyncio.run(call())
+    assert answer["status"] == "stopping"
+    assert stop_mark_visible(_stored(repo))
+    assert service._stop_mark_now(EXECUTOR) is True
+    assert recorded == ["early_stop"]
+    assert connector.cancelled == ["buy-1", "sell-1"]
+
+
+def test_close_channel_unreadable_check_holds_the_send(tmp_path, monkeypatch):
+    """Канал с НАСТОЯЩЕЙ проверкой: непрочитанная колонка держит отправку."""
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(take="101")),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    executor, _ = _channel_executor(connector)
+    executor._next_close_id = "close-5"
+    service._active_executors[EXECUTOR] = executor
+    service._install_partial_guards(EXECUTOR, executor)
+    queued = _queue_send(monkeypatch)
+    _stub_trade_types(monkeypatch)
+
+    async def column_unreadable(_executor_id):
+        raise RuntimeError("column unreadable")
+
+    service._partial_column_text = column_unreadable
+    level = SimpleNamespace(
+        id="L1",
+        price=Decimal("101"),
+        amount_quote=Decimal("1"),
+        active_open_order=SimpleNamespace(order_id="buy-1"),
+        active_close_order=None,
+    )
+
+    import asyncio
+
+    async def run():
+        assert ledger_mod.place_level_close(executor, EXECUTOR, level) == "close-5"
+        assert len(queued) == 1
+        await queued.pop()
+        assert connector.created == []
+
+    asyncio.run(run())
 
 
 def test_foreign_order_by_price_does_not_hold(tmp_path, monkeypatch):

@@ -4954,9 +4954,12 @@ class ExecutorService:
                     return None
                 executor.validate_sufficient_balance = _skip_balance_check
             await self._partial_copy_five_before_start(row["executor_id"], checkpoint, config)
-            refreshed = parse_checkpoint_cached(
-                (await self._partial_column_text(row["executor_id"])) or row.get("checkpoint")
-            )
+            try:
+                column_text = await self._partial_column_text(row["executor_id"])
+            except Exception:
+                logger.exception("checkpoint column refresh failed for %s", row["executor_id"])
+                column_text = None
+            refreshed = parse_checkpoint_cached(column_text or row.get("checkpoint"))
             if refreshed:
                 checkpoint = refreshed
             original_bans = [
@@ -6965,13 +6968,13 @@ class ExecutorService:
         return None
 
     async def _partial_column_text(self, executor_id: str) -> Optional[str]:
+        """Столбец checkpoint новой сессией. Ошибка базы БРОСАЕТСЯ, а не маскируется
+        в «записи нет»: непрочитанное — не «метки нет» (план stop-freeze п.1).
+        """
         if not self.db_manager:
             return None
-        try:
-            async with self.db_manager.get_session_context() as session:
-                row = await ExecutorRepository(session).get_executor_by_id(executor_id)
-        except Exception:
-            return None
+        async with self.db_manager.get_session_context() as session:
+            row = await ExecutorRepository(session).get_executor_by_id(executor_id)
         return row.checkpoint if row is not None else None
 
     def _partial_must_keep(self, row: Dict[str, Any]) -> bool:
@@ -7761,7 +7764,9 @@ class ExecutorService:
                 if connector is not None and pair:
                     await service._store_tick_fresh(connector, pair)
                 frozen = await service._refresh_stop_mark(executor_id)
-                if frozen and connector is not None:
+                # Доставка — только от ОПУБЛИКОВАННОЙ метки (п.1): «непрочитано»
+                # держит отправку, но не запускает отмены без заморозки.
+                if service._stop_mark_now(executor_id) and connector is not None:
                     # Доставка отмен не за готовностью списков и не за судьбой
                     # номеров (план stop-freeze п.3).
                     await service._stop_deliver_cancels(executor_id, executor, connector, pair or "")
@@ -8281,32 +8286,38 @@ class ExecutorService:
             return True
         return stop_mark_visible(self._partial_parsed(executor_id))
 
-    async def _read_stop_mark_fresh(self, executor_id: str) -> bool:
+    async def _read_stop_mark_fresh(self, executor_id: str) -> Optional[bool]:
         """Перечитка метки НОВОЙ сессией — доказательство коммита записи.
 
-        Показанная метка прогревает RAM: любая свежая перечитка, показавшая
-        метку, пишет её в память (план stop-freeze п.1).
+        Возвращает None, если прочитать не удалось: непрочитанное — это НЕ
+        «метки нет» (план stop-freeze п.1). Показанная метка прогревает RAM:
+        любая свежая перечитка, показавшая метку, пишет её в память.
         """
-        text = await self._partial_column_text(executor_id)
+        try:
+            text = await self._partial_column_text(executor_id)
+        except Exception:
+            logger.exception("stop mark re-read failed for %s", executor_id)
+            return None
         seen = stop_mark_visible(parse_checkpoint(text))
         if seen:
             self.__dict__.setdefault("_stop_mark_ram", {})[str(executor_id)] = True
         return seen
 
     async def _refresh_stop_mark(self, executor_id: str) -> bool:
-        """Свежая перечитка перед чеканкой/отправкой; без await до вызова биржи.
+        """Гейт: не чеканить и не слать, пока метка видна ИЛИ прочитать не удалось.
 
-        Непрочитанное не размораживает: гейт читает RAM ИЛИ последнюю
-        перечитанную запись чекпоинта (план п.1) — холодная RAM не значит
-        «метки нет», если колонка её уже отдала (коммит CAS публикует запись).
-        Нет метки ни там, ни там — сетка не заморожена.
+        Ошибка или нечитаемая перечитка НЕ открывает отправку (план п.2) и НЕ
+        глушится в «метки нет». Гейт читает RAM ИЛИ последнюю перечитанную
+        запись: холодная RAM не значит «метки нет», если колонка метку уже
+        отдала. Прочитано чисто и метки ни там, ни там — сетка не заморожена.
         """
-        ram = self.__dict__.setdefault("_stop_mark_ram", {})
         try:
-            if await self._read_stop_mark_fresh(executor_id):
-                ram[str(executor_id)] = True
+            seen = await self._read_stop_mark_fresh(executor_id)
         except Exception:
             logger.exception("stop mark re-read failed for %s", executor_id)
+            seen = None
+        if seen is None:
+            return True
         return self._stop_mark_now(executor_id)
 
     async def _freeze_stop_mark(self, executor_id: str) -> bool:
@@ -8333,6 +8344,7 @@ class ExecutorService:
     async def _partial_cas(self, executor_id: str, mutate: Any, visible: Any, target_id: Optional[str] = None) -> bool:
         if not self.db_manager:
             return False
+        committed = {"done": False}
         try:
             async with self.db_manager.get_session_context() as session:
                 repo = ExecutorRepository(session)
@@ -8349,13 +8361,26 @@ class ExecutorService:
                 parsed = parse_checkpoint(stored)
                 if not visible(parsed):
                     return False
-            # Публикация — СИНХРОННО из уже прочитанного тела, после возврата
-            # коммита и до всякого следующего await (план stop-freeze п.1):
-            # упавшая следующая сессия не выглядит как «не закоммичено» и не
-            # открывает `_create_order`.
-            self._publish_committed_body(executor_id, body)
+                # Публикация — сразу после возврата commit и ДО session.close()
+                # (план stop-freeze п.1): ошибка close не выглядит как
+                # «не закоммичено» и не открывает `_create_order`.
+                original_commit = getattr(session, "commit", None)
+
+                async def commit_then_publish() -> None:
+                    await original_commit()
+                    self._publish_committed_body(executor_id, body)
+                    committed["done"] = True
+
+                if original_commit is not None:
+                    session.commit = commit_then_publish
+            if not committed["done"]:
+                # Контекст без commit внутри (пробы): публикуем после выхода.
+                self._publish_committed_body(executor_id, body)
+                committed["done"] = True
             return True
         except Exception:
+            if committed["done"]:
+                return True
             logger.exception("partial compare-and-swap was not committed")
             return False
 
