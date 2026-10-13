@@ -562,8 +562,12 @@ def test_unreadable_confirmation_after_cas_still_freezes_and_delivers(tmp_path, 
 
 
 def test_close_failure_after_commit_still_publishes_the_mark(tmp_path, monkeypatch):
-    """Коммит вернулся, close сессии упал — метка уже опубликована (вердикт
-    20261013-092445-71222): заморозка держится, отмены пошли."""
+    """Коммит вернулся, close сессии упал — метка опубликована ХУКОМ commit.
+
+    Вердикт 20261013-095125-3865 (minor): сессия имеет `commit`, close падает
+    после его возврата, строки `_hold_rows` не делят dict с репозиторием —
+    публикация обязана пройти внутри commit, до close.
+    """
     from contextlib import asynccontextmanager
     connector = _Connector()
     service, repo, _ = _service_with(
@@ -573,15 +577,29 @@ def test_close_failure_after_commit_still_publishes_the_mark(tmp_path, monkeypat
     recorded = []
     executor = _stub_executor(connector, recorded)
     service._active_executors[EXECUTOR] = executor
+    # `_hold_rows` не делит dict с репозиторием: видимость — только от публикации.
+    service._set_hold_rows([dict(row) for row in repo.rows])
+    events = []
+    original_publish = service._publish_committed_body
+
+    def publish(executor_id, body):
+        events.append("publish")
+        original_publish(executor_id, body)
+
+    service._publish_committed_body = publish
+
+    async def session_commit():
+        events.append("commit")
 
     @asynccontextmanager
     async def close_fails():
-        session = SimpleNamespace()
+        session = SimpleNamespace(commit=session_commit)
         try:
             yield session
         finally:
             # Штатный контекст сперва коммитит, потом закрывает сессию.
             await session.commit()
+            events.append("close")
             raise RuntimeError("close failed")
 
     service.db_manager = SimpleNamespace(get_session_context=lambda: close_fails())
@@ -594,6 +612,10 @@ def test_close_failure_after_commit_still_publishes_the_mark(tmp_path, monkeypat
     answer = asyncio.run(call())
     assert answer["status"] == "stopping"
     assert stop_mark_visible(_stored(repo))
+    # Публикация прошла ВНУТРИ commit — между коммитом и close.
+    publish_at = events.index("publish")
+    assert events[publish_at - 1] == "commit"
+    assert events[publish_at + 1] == "close"
     assert service._stop_mark_now(EXECUTOR) is True
     assert recorded == ["early_stop"]
     assert connector.cancelled == ["buy-1", "sell-1"]
