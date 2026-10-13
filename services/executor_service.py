@@ -122,7 +122,7 @@ from utils.executor_checkpoint import (
     checkpoint_cache_reset_stats,
     checkpoint_cache_stats,
     checkpoint_view,
-    ledger_close_price_taken,
+    ledger_close_price_ids,
     ledger_journal_mark,
     ledger_min_ts,
     ledger_price_known,
@@ -2459,21 +2459,17 @@ class ExecutorService:
         return items
 
     def _ban_pairs(self, pair: str, fresh: Optional[Dict[str, Any]]):
-        """Prices already copied this tick, tagged with their numbers."""
+        """Занятые цены этого тика с их номерами (правило номера: чужой текст и
+        доказанная история не держат, голая цена и наш живой номер — держат)."""
         items = []
-        for raw in list((fresh or {}).get("opens") or []):
-            if raw.get("price") not in (None, ""):
-                items.append(str(raw.get("price")))
-        for raw in list((fresh or {}).get("finished") or []):
+        for raw in list((fresh or {}).get("opens") or []) + list((fresh or {}).get("finished") or []):
             text = str(raw.get("text") or raw.get("order_id") or "")
             price = raw.get("price")
             if price in (None, ""):
                 continue
-            if self._closed_row_filled(raw):
-                if not self._released_own_text_only(pair, fresh, text, price):
-                    items.append(str(price))
-            else:
-                items.append((text, price))
+            if not self._text_holds(text, fresh):
+                continue
+            items.append((text, price) if text else str(price))
         try:
             from utils.executor_checkpoint import read_ledger_filtered
             ledger = read_ledger_filtered()
@@ -2482,22 +2478,26 @@ class ExecutorService:
         if ledger is not None:
             for row in ledger:
                 order_id = str(row.get("order_id") or "")
-                if order_id and row.get("price") not in (None, ""):
+                if not order_id:
+                    continue
+                if row.get("price") not in (None, "") and self._text_holds(order_id, fresh):
                     items.append((order_id, row.get("price")))
-                if order_id and row.get("take_profit_price") not in (None, ""):
+                if row.get("take_profit_price") not in (None, ""):
                     items.append((order_id, row.get("take_profit_price")))
         for item in owed_records() or []:
             if order_is_unsent(str(item.get("order_id") or "")):
                 continue
             if item.get("trading_pair") not in (None, "", pair):
                 continue
-            if item.get("price") not in (None, ""):
+            if item.get("price") not in (None, "") and self._text_holds(item.get("order_id"), fresh):
                 items.append((str(item.get("order_id") or ""), item.get("price")))
         for entry in self._hold_index():
             if entry["pair"] not in (None, "", pair):
                 continue
             for hold_id, price in entry["ban_holds"]:
                 if order_is_unsent(hold_id):
+                    continue
+                if not self._text_holds(hold_id, fresh):
                     continue
                 items.append((hold_id, price))
         return items
@@ -2656,6 +2656,41 @@ class ExecutorService:
                 return True
         return False
 
+    def _own_text(self, text: str) -> bool:
+        """Наш номер (правило номера, план number-rule): журнал, чекпоинт или
+        трекер коннектора его чеканили. Неважно, жив ли его исполнитель."""
+        name = str(text or "")
+        if not name:
+            return False
+        try:
+            from utils.executor_checkpoint import ledger_order_ids
+            ids = ledger_order_ids()
+        except Exception:
+            ids = None
+        if ids and name in ids:
+            return True
+        for entry in self._hold_index():
+            if name in entry["owner_ids"] or name in entry["level_close_ids"]:
+                return True
+            if name in entry["close_price_map"] or name in entry["close_hold_price_map"]:
+                return True
+            for hold_id, _price in entry["ban_holds"]:
+                if str(hold_id) == name:
+                    return True
+        return False
+
+    def _text_holds(self, text: Any, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Держит ли запись с этим текстом цену для нового номера (правило
+        номера): голый текст (номер не прочитан) — держит и не присваивается;
+        наш номер — пока finished не доказал именно эту заявку исполненной или
+        снятой; чужой номер с прочитанным текстом — не держит и не клеится."""
+        name = str(text or "")
+        if not name:
+            return True
+        if self._proven_dead(name, fresh):
+            return False
+        return self._own_text(name)
+
     def _finished_row(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Строка finished этого номера. Живой и неизвестный номер её не имеют."""
         if not self._lists_ready(fresh):
@@ -2779,14 +2814,16 @@ class ExecutorService:
         return False
 
     def _prices_for_blocks(self, items, fresh) -> List[Any]:
-        """Price strings only. Drop a proven-dead pair, not a live price and not a bare string."""
+        """Price strings only. Правило номера: пара (номер, цена) проходит, пока
+        номер держит (наш живой или голый); чужой текст и доказанная история
+        падают. Голая цена и живая цена не падают."""
         live_prices = set()
         for item in items or []:
             if isinstance(item, tuple) and len(item) == 2:
                 order_id, price = item
                 if price in (None, "") or isinstance(price, (tuple, dict)):
                     continue
-                if not self._proven_dead_zero(order_id, fresh):
+                if self._text_holds(order_id, fresh):
                     live_prices.add(str(price))
             elif not isinstance(item, (tuple, dict)) and item not in (None, ""):
                 live_prices.add(str(item))
@@ -2797,7 +2834,7 @@ class ExecutorService:
                 order_id, price = item
                 if price in (None, "") or isinstance(price, (tuple, dict)):
                     continue
-                if self._proven_dead_zero(order_id, fresh) and str(price) not in live_prices:
+                if not self._text_holds(order_id, fresh) and str(price) not in live_prices:
                     continue
                 value = price
             elif isinstance(item, dict) or item in (None, ""):
@@ -3361,6 +3398,28 @@ class ExecutorService:
             return str((level.get("close_order") or {}).get("order_id") or "")
         return ""
 
+    def _level_close_recorded(self, executor_id: str, level: Any) -> str:
+        """Номер продажи уровня в чекпоинте ИЛИ в журнале (правило номера,
+        п.6): второй номер не чеканится — слать тот же или стоять. Журнал
+        ловит и случай после рестарта, когда чекпоинт ещё не успел запись."""
+        level_id = str(getattr(level, "id", "") or "")
+        if not level_id:
+            return ""
+        recorded = self._recorded_close_id(executor_id, level_id)
+        if recorded:
+            return recorded
+        for row in self._partial_rows() or []:
+            if str(row.get("executor_id") or "") != str(executor_id):
+                continue
+            if str(row.get("level_id") or "") != level_id:
+                continue
+            if str(row.get("role") or "") not in ("close", "market_close"):
+                continue
+            order_id = str(row.get("order_id") or "")
+            if order_id:
+                return order_id
+        return ""
+
     def _close_text_seen(self, fresh, connector, order_id: str):
         """True if the close is already on the book. None means the closed list is not proof."""
         if not self._lists_ready(fresh) or not fresh.get("finished_read") or not fresh.get("finished_done"):
@@ -3440,7 +3499,9 @@ class ExecutorService:
         if side not in ("BUY", "SELL") or not pair:
             return
         fresh = self._tick_fresh(pair)
-        close_id = self._recorded_close_id(executor_id, level_id)
+        # Правило номера, п.6: своя продажа уровня уже вычеканена (журнал или
+        # чекпоинт) — второй номер не чеканить, слать тот же или стоять.
+        close_id = self._level_close_recorded(executor_id, level)
         if close_id:
             if self._close_text_seen(fresh, connector, close_id) is not False:
                 return
@@ -3513,12 +3574,16 @@ class ExecutorService:
                 found.add(level_id)
         return found
 
-    def _foreign_open_holds(self, fresh, placement, tick, own_id: str) -> bool:
-        """A foreign open price holds this placement. Our own text does not."""
+    def _open_text_holds(self, fresh, placement, tick, own_id: str) -> bool:
+        """Наш живой номер или голая цена книги держат постановку (правило
+        номера). Чужой текст с номером не держит — своя заявка встаёт на ту же
+        цену, где стоит чужая."""
         from utils.executor_checkpoint import _same_tick
         for raw in list((fresh or {}).get("opens") or []):
             text = str(raw.get("text") or raw.get("order_id") or "")
-            if not text or text == str(own_id or ""):
+            if text == str(own_id or ""):
+                continue
+            if not self._text_holds(text, fresh):
                 continue
             price = raw.get("price")
             if price in (None, ""):
@@ -3539,7 +3604,8 @@ class ExecutorService:
         return "" if price in (None, "") else str(price)
 
     def _placement_hold_prices(self, fresh, connector, placement, own_id: str, rows=None) -> list:
-        """Other numbers whose price string equals this placement. Our take-profit is not one."""
+        """Наш живой номер (не этот) с той же строкой цены или голая цена книги.
+        Наш тейк-профит и чужой текст с номером — не из них (правило номера)."""
         found = []
         own = str(own_id or "")
 
@@ -3550,13 +3616,20 @@ class ExecutorService:
 
         book = fresh if isinstance(fresh, dict) else {}
         for raw in list(book.get("opens") or []) + list(book.get("finished") or []):
-            add(raw.get("price"), raw.get("text") or raw.get("order_id"))
+            text = str(raw.get("text") or raw.get("order_id") or "")
+            if not self._text_holds(text, book):
+                continue
+            add(raw.get("price"), text)
         inflight = getattr(connector, "in_flight_orders", None) or {}
         lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
         for order_id, order in list(inflight.items()) + list(lost.items()):
+            if not self._text_holds(order_id, book):
+                continue
             add(self._price_of(order), order_id)
         for row in rows or []:
             if str(row.get("order_id") or "") == own:
+                continue
+            if not self._text_holds(row.get("order_id"), book):
                 continue
             add(row.get("price"), row.get("order_id"))
         return found
@@ -3798,18 +3871,16 @@ class ExecutorService:
         prices = list(stored)
         prices.extend(column_prices)
         prices.extend(self.__dict__.get("_claimed_prices", []))
-        for raw in list(fresh.get("opens") or []):
-            if raw.get("price") not in (None, ""):
-                prices.append(str(raw.get("price")))
-        for raw in list(fresh.get("finished") or []):
+        for raw in list(fresh.get("opens") or []) + list(fresh.get("finished") or []):
             text = str(raw.get("text") or raw.get("order_id") or "")
             price = raw.get("price")
             if price in (None, ""):
                 continue
-            if self._closed_row_filled(raw):
-                prices.append(str(price))
-            else:
-                prices.append((text, price))
+            # Правило номера: чужой текст и доказанная история не держат;
+            # голая цена (номер не прочитан) и наш живой номер — держат.
+            if not self._text_holds(text, fresh):
+                continue
+            prices.append((text, price) if text else str(price))
         prices.extend(self._partial_flight_prices(executor))
         prices.extend(self._partial_missing_take_prices(ledger_rows, executor, pair))
         prices.extend(self._partial_live_sell_prices(executor_id, connector, self._partial_parsed(executor_id), pair))
@@ -3831,7 +3902,7 @@ class ExecutorService:
                 continue
             if self._partial_lone_five(ledger_rows, order_key):
                 continue
-            if row.get("price") not in (None, ""):
+            if row.get("price") not in (None, "") and self._text_holds(order_key, fresh):
                 journal_prices.append((order_key, row.get("price")))
             if row.get("take_profit_price") not in (None, ""):
                 journal_prices.append((order_key, row.get("take_profit_price")))
@@ -3848,18 +3919,16 @@ class ExecutorService:
         prices.extend(occupied)
         prices.extend(column_prices)
         prices.extend(self.__dict__.get("_claimed_prices", []))
-        for raw in list(fresh.get("opens") or []):
-            if raw.get("price") not in (None, ""):
-                prices.append(str(raw.get("price")))
-        for raw in list(fresh.get("finished") or []):
+        for raw in list(fresh.get("opens") or []) + list(fresh.get("finished") or []):
             text = str(raw.get("text") or raw.get("order_id") or "")
             price = raw.get("price")
             if price in (None, ""):
                 continue
-            if self._closed_row_filled(raw):
-                prices.append(str(price))
-            else:
-                prices.append((text, price))
+            # Правило номера: чужой текст и доказанная история не держат;
+            # голая цена (номер не прочитан) и наш живой номер — держат.
+            if not self._text_holds(text, fresh):
+                continue
+            prices.append((text, price) if text else str(price))
         feed_rows = [
             row for row in (self._partial_rows_with_owner_take(ledger_rows) or [])
             if not self._proven_dead(str(row.get("order_id") or ""), self._tick_fresh(pair))
@@ -3895,7 +3964,7 @@ class ExecutorService:
                 fresh_now, connector, price_text, reuse_id, ledger_rows,
             )
         if reuse_id and (
-            self._foreign_open_holds(fresh_now, price_text, tick, reuse_id)
+            self._open_text_holds(fresh_now, price_text, tick, reuse_id)
             or hold_prices
         ):
             self._log_silent_exit(
@@ -7198,6 +7267,8 @@ class ExecutorService:
         return list(fresh.get("opens") or [])
 
     def _partial_sell_is_live(self, executor_id: str, connector: Any, parsed: Optional[Dict[str, Any]], pair: str) -> bool:
+        """Наша продажа стоит — только по НАШЕМУ номеру (правило номера: цена
+        не опознаёт заявку, чужая на нашей цене не клеится к слоту)."""
         texts = self._partial_sell_texts(executor_id, parsed)
         inflight = getattr(connector, "in_flight_orders", None) or {}
         lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
@@ -7208,14 +7279,6 @@ class ExecutorService:
             for level in (parsed or {}).get("levels") or []:
                 close = level.get("close_order") or {}
                 if str(close.get("order_id") or "") == text and close.get("level_id"):
-                    return True
-        for level in (parsed or {}).get("levels") or []:
-            marks = [level.get("take_profit_price"), (level.get("close_order") or {}).get("price")]
-            for order in list(inflight.values()) + list(lost.values()):
-                price = getattr(order, "price", None)
-                if price in (None, ""):
-                    continue
-                if any(mark not in (None, "") and str(mark) == str(price) for mark in marks):
                     return True
         return False
 
@@ -7381,7 +7444,7 @@ class ExecutorService:
         if own_id:
             prices = self._without_own_placement(prices, own_id, rows)
         prices = self._prices_for_blocks(prices, fresh)
-        if own_id and self._foreign_open_holds(fresh, price_text, tick, own_id):
+        if own_id and self._open_text_holds(fresh, price_text, tick, own_id):
             return True
         if own_id and tick is None and self._placement_hold_prices(
             fresh, connector, price_text, own_id, rows,
@@ -7511,10 +7574,6 @@ class ExecutorService:
                 if str(row.get(key) or "") == wanted and not self._proven_dead(order_id, fresh):
                     return True
         return False
-
-    def _released_own_text_only(self, pair: str, fresh: Optional[Dict[str, Any]], text: str, price: Any) -> bool:
-        released = self._released_texts(pair)
-        return bool(text) and text in released and not self._price_kept_by_other(pair, fresh, price, released)
 
     def _id_still_live(self, fresh: Optional[Dict[str, Any]], connector: Any, order_id: str) -> bool:
         if not order_id:
@@ -8026,6 +8085,11 @@ class ExecutorService:
         executor._partial_owns_level = lambda level: service._partial_level_needs_take_profit(
             executor_id, executor, level,
         )
+        # Правило номера, п.6: своя продажа уровня уже вычеканена (журнал или
+        # чекпоинт) — второй номер не чеканить, слать тот же или стоять.
+        executor._refuse_second_close = lambda level: bool(
+            service._level_close_recorded(executor_id, level)
+        )
         executor._refuse_close_price = lambda price, own=None: service._close_tick_taken(executor, price, own)
         executor._refuse_market_close = lambda: bool(
             service._occupied_close_prices(executor, include_opens=False)
@@ -8056,16 +8120,21 @@ class ExecutorService:
         return same is True
 
     def _live_open_prices(self, executor: Any) -> list:
+        """Живые цены книги и трекера, которые держат (правило номера): наш
+        живой номер и голая цена без номера. Чужой текст с номером — не держит."""
         found = []
         connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
         connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
-        for order in (getattr(connector, "in_flight_orders", None) or {}).values():
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        fresh = self._tick_fresh(pair)
+        for text, order in (getattr(connector, "in_flight_orders", None) or {}).items():
             price = getattr(order, "price", None)
-            if price not in (None, ""):
+            if price not in (None, "") and self._text_holds(text, fresh):
                 found.append(price)
         for raw in getattr(connector, "opens", None) or []:
             if isinstance(raw, dict) and raw.get("price") not in (None, ""):
-                found.append(raw.get("price"))
+                if self._text_holds(raw.get("text") or raw.get("order_id"), fresh):
+                    found.append(raw.get("price"))
         return found
 
     def _remember_ban_prices(self, executor: Any, order_ids, price_map) -> None:
@@ -8122,18 +8191,19 @@ class ExecutorService:
                 continue
             if row.get("role") not in ("close", "market_close", None) and row.get("price") in (None, ""):
                 continue
-            owned = False
-            for other in self._active_executors.values():
-                bans = {str(item) for item in getattr(other, "_close_ban_ids", set()) or set()}
-                holds = {
-                    str(item.get("order_id"))
-                    for item in getattr(other, "_close_holds", []) or []
-                    if isinstance(item, dict)
-                }
-                if order_id in bans or order_id in holds:
-                    owned = True
-            if owned and row.get("price") not in (None, ""):
-                found.append(row.get("price"))
+            if not self._proven_dead(order_id, self._tick_fresh(pair or "")):
+                owned = False
+                for other in self._active_executors.values():
+                    bans = {str(item) for item in getattr(other, "_close_ban_ids", set()) or set()}
+                    holds = {
+                        str(item.get("order_id"))
+                        for item in getattr(other, "_close_holds", []) or []
+                        if isinstance(item, dict)
+                    }
+                    if order_id in bans or order_id in holds:
+                        owned = True
+                if owned and row.get("price") not in (None, ""):
+                    found.append(row.get("price"))
             if row.get("take_profit_price") not in (None, "") and order_id not in released:
                 if order_id in level_close_ids:
                     found.append(row.get("take_profit_price"))
@@ -8145,11 +8215,20 @@ class ExecutorService:
             found.extend(self._live_open_prices(executor))
         return found
 
-    def _ledger_close_price_taken(self, price: Any, ignore_id: str = "") -> bool:
+    def _ledger_close_price_taken(
+        self, price: Any, ignore_id: str = "", fresh: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Наш номер продажи на этой цене держит её, пока finished не доказал
+        именно эту заявку исполненной или снятой (правило номера)."""
         try:
-            return ledger_close_price_taken(price, ignore_id)
+            from utils.executor_checkpoint import ledger_close_price_ids
+            ids = ledger_close_price_ids(price)
         except Exception:
             return True
+        for item in ids - {str(ignore_id or "")}:
+            if not self._proven_dead(item, fresh):
+                return True
+        return False
 
     def _unpriced_close_blocks(self, executor: Any) -> bool:
         """A close id without a stored price blocks every send on this pair."""
@@ -8207,10 +8286,17 @@ class ExecutorService:
         return row.get("finish_as") in ("filled", "cancelled")
 
     def _close_tick_taken(self, executor: Any, price: Any, ignore_id: Optional[str] = None) -> bool:
+        """Quant занят нашим живым номером (правило номера): наши структуры,
+        живая книга и наш журнальный close (в т.ч. после рестарта). Чужой
+        текст с номером и доказанная история не держат."""
         if price in (None, ""):
             return False
         tick = self._pair_tick(executor)
-        return any(self._price_same(item, price, tick) for item in self._occupied_close_prices(executor, str(ignore_id or "")))
+        ignore = str(ignore_id or "")
+        if any(self._price_same(item, price, tick) for item in self._occupied_close_prices(executor, ignore)):
+            return True
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        return self._ledger_close_price_taken(price, ignore, self._tick_fresh(pair))
 
     def _partial_level_needs_take_profit(self, executor_id: str, executor: Any, level: Any) -> bool:
         """Only a level this partial buy is closing. A filled open alone is not that."""
@@ -9075,6 +9161,10 @@ class ExecutorService:
                 return False
             if price in (None, ""):
                 return True
+            # Правило номера: чужой текст с номером не держит; голая цена и наш
+            # живой номер — держат.
+            if not self._text_holds(text, fresh):
+                return False
             same = _same_tick(price, quant, tick)
             return same is None or same is True
 
@@ -9197,7 +9287,7 @@ class ExecutorService:
             return
         if self._close_tick_taken(executor, quant, order_id) or self._unpriced_close_blocks(executor):
             return
-        if self._ledger_close_price_taken(quant, order_id):
+        if self._ledger_close_price_taken(quant, order_id, fresh):
             return
         reserves = self.__dict__.setdefault("_quant_reserves", {})
         connector_key = str(id(connector))

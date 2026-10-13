@@ -664,12 +664,17 @@ def ledger_journal_mark(order_id: Any) -> tuple:
     return "unowned", None
 
 
+def ledger_close_price_ids(price: Any) -> set:
+    """Номера строк role=close/market_close на этой цене (правило номера: сам
+    журнал решает, наш номер; живость решает finished)."""
+    return set(_rows_answers(ledger_raw_rows())["close_price_ids"].get(str(price)) or set())
+
+
 def ledger_close_price_taken(price: Any, ignore_id: Any = "") -> bool:
     """Занята ли цена строки role=close/market_close: та же вычитающая форма
     петли _ledger_close_price_taken (строка без номера и пустой ignore_id отсекают
     друг друга)."""
-    ids = _rows_answers(ledger_raw_rows())["close_price_ids"].get(str(price)) or set()
-    return bool(ids - {str(ignore_id or "")})
+    return bool(ledger_close_price_ids(price) - {str(ignore_id or "")})
 
 
 def ledger_unowned_ids() -> set:
@@ -4171,6 +4176,11 @@ def place_level_close(executor: Any, executor_id: str, level: Any) -> Optional[s
         return None
     owns = getattr(executor, "_partial_owns_level", None)
     if owns is not None and owns(level):
+        return None
+    # Правило номера, п.6: своя продажа уровня уже вычеканена (журнал или
+    # чекпоинт) — второй номер не чеканить, слать тот же или стоять.
+    second = getattr(executor, "_refuse_second_close", None)
+    if second is not None and second(level):
         return None
     connector = getattr(getattr(executor, "_strategy", None), "connectors", None)
     order_id = getattr(executor, "_next_close_id", None)
