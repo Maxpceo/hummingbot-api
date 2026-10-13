@@ -463,3 +463,33 @@ def test_stored_block_prices_release_the_filled_buy_price(monkeypatch, tmp_path)
     assert recorded_price_blocks(blocked, "0.10", TICK) is True, (
         "тейк открытой позиции держит quant"
     )
+
+
+# ── 11. вердикт 20261013-221347-72133: тейк отпущен, когда продажа покрыла ───
+
+
+def test_take_releases_when_the_sell_covered_the_buy(monkeypatch, tmp_path):
+    """Тейк отпущен, только когда позиция доказанно закрыта: продажа уровня
+    исполнена finished и её база покрыла покупку. Покупка без продажи — тейк
+    держит (вердикт 20261013-221347-72133)."""
+    from utils.executor_checkpoint import recorded_price_blocks
+
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True),
+    ])
+    covered = _level(level_id="L1", open_id="buy-1", close_id="sell-1", take="0.10", filled=True)
+    covered["partial_bought"] = "1"
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(covered))
+    sold = _fresh(finished=[
+        {"text": "buy-1", "finish_as": "filled", "price": "0.09487", "amount": "1", "left": "0"},
+        {"text": "sell-1", "finish_as": "filled", "price": "0.10", "amount": "1", "left": "0"},
+    ])
+    blocked = service._prices_for_blocks(service._ban_pairs(PAIR, sold), sold)
+    assert recorded_price_blocks(blocked, "0.10", TICK) is False, (
+        "продажа покрыла покупку — позиция закрыта, тейк quant не держит"
+    )
+    unsold = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "price": "0.09487"}])
+    blocked_open = service._prices_for_blocks(service._ban_pairs(PAIR, unsold), unsold)
+    assert recorded_price_blocks(blocked_open, "0.10", TICK) is True, (
+        "покупка исполнена, продажи нет — тейк открытой позиции держит"
+    )

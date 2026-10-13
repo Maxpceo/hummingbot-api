@@ -2680,16 +2680,65 @@ class ExecutorService:
         return False
 
     def _take_holds(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
-        """Тейк держит quant, пока позиция не закрыта (план number-rule, п.2):
-        живой или неизвестный номер ещё не кончил держание; исполненный —
-        позиция открыта, тейк жив; отмена без позиции и тейк без номера позиции
-        quant не держат (вердикт 20261013-151226-99598)."""
+        """Тейк держит quant, пока позиция не закрыта (план number-rule, п.2 и п.7):
+        живой или неизвестный номер ещё не кончил держание; отмена без позиции
+        не держит. Исполненный держит, только пока позиция номера открыта: продажа уровня
+        доказана finished и база продажи покрыла покупку (как `_level_position_open` ложь) — тейк
+        отпущен; пока продажа не доказана, тейк держит (вердикт 20261013-221347-72133)."""
         name = str(order_id or "")
         if not name:
             return False
         if not self._proven_dead(name, fresh):
             return True
-        return self._proven_dead_filled(name, fresh)
+        if not self._proven_dead_filled(name, fresh):
+            return False
+        return self._number_position_open(name, fresh)
+
+    def _number_position_open(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Позиция номера открыта, пока продажа её уровня не доказана: уровень из
+        чекпоинта, дальше как `_level_position_open`. Уровень не найден или журнал не
+        прочитан — продажа не доказана, позиция считается открытой."""
+        level, body = self._level_of_number(order_id)
+        if level is None:
+            return True
+        return self._level_position_open(level, body, fresh)
+
+    def _level_of_number(self, order_id: str):
+        """Уровень чекпоинта, которому принадлежит номер: по слоту уровня, иначе по
+        level_id журнальной строки. Не нашли — (None, None)."""
+        name = str(order_id or "")
+        bodies = []
+        for row in getattr(self, "_hold_rows", None) or []:
+            raw = row.get("checkpoint")
+            body = raw if isinstance(raw, dict) else checkpoint_view(raw)
+            if isinstance(body, dict):
+                bodies.append(body)
+        for body in bodies:
+            for level in body.get("levels") or []:
+                if not isinstance(level, dict):
+                    continue
+                ids = [
+                    str((level.get("open_order") or {}).get("order_id") or ""),
+                    str((level.get("close_order") or {}).get("order_id") or ""),
+                ]
+                ids.extend(
+                    str(item.get("order_id") or "")
+                    for item in level.get("partial_closes") or []
+                    if isinstance(item, dict)
+                )
+                if name and name in ids:
+                    return level, body
+        level_id = ""
+        for row in self._partial_rows() or []:
+            if str(row.get("order_id") or "") == name and row.get("level_id"):
+                level_id = str(row.get("level_id"))
+                break
+        if level_id:
+            for body in bodies:
+                for level in body.get("levels") or []:
+                    if isinstance(level, dict) and str(level.get("id") or "") == level_id:
+                        return level, body
+        return None, None
 
     def _quant_held(
         self, executor_id: str, executor: Any, connector: Any, pair: str, quant: Any, own_id: str,
