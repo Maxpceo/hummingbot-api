@@ -441,6 +441,15 @@ class StopExecutorResponse(BaseModel):
         default=None,
         description="Why a POSITION_HOLD terminal was involuntary (e.g. close_retries_exhausted); None for voluntary holds"
     )
+    pending: Optional[str] = Field(
+        default=None,
+        description="Order ids whose cancels the stop is still delivering "
+                    "('undelivered-cancel ids=…'); None when nothing is pending"
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        description="Why the stop was not accepted (status 'not_accepted'); None otherwise"
+    )
 
 
 class OrphanedPositionRecord(BaseModel):

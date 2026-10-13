@@ -1148,3 +1148,62 @@ def test_close_channel_check_error_holds_the_send(tmp_path, monkeypatch):
         assert connector.created == []
 
     asyncio.run(run())
+
+
+# ── 6. ответ кнопки переживает модель роутера ────────────────────────────────
+
+
+def test_stop_refusal_reason_survives_the_response_model(monkeypatch):
+    """Причина отказа не теряется на `StopExecutorResponse(**result)` (роутер)."""
+    from models.executors import StopExecutorResponse
+
+    service, repo, _ = _service_with(monkeypatch, _checkpoint(_level()))
+    recorded = []
+    service._active_executors[EXECUTOR] = _stub_executor(_Connector(), recorded)
+
+    async def no_read(_executor_id):
+        return False
+
+    async def no_cas(*args, **kwargs):
+        return False
+
+    service._read_stop_mark_fresh = no_read
+    service._partial_cas = no_cas
+
+    import asyncio
+
+    async def call():
+        return await service.stop_executor(EXECUTOR)
+
+    answer = asyncio.run(call())
+    body = StopExecutorResponse(**answer).model_dump()
+    assert body["status"] == "not_accepted"
+    assert body["reason"] == answer["reason"]
+    assert body["pending"] is None
+
+
+def test_stop_pending_ids_survive_the_response_model(tmp_path, monkeypatch):
+    """Номера недоставленных отмен не теряются на `StopExecutorResponse(**result)`."""
+    from models.executors import StopExecutorResponse
+
+    _journal(tmp_path, monkeypatch, [_row("sell-1", role="close", sent=True, price="101")])
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(open_id="buy-1", filled=True, close_id="sell-1")),
+        connector=connector,
+    )
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    executor._close_holds = [{"order_id": "sell-1", "role": "close", "level_id": "L1", "price": "101"}]
+    service._active_executors[EXECUTOR] = executor
+
+    import asyncio
+
+    async def call():
+        return await service.stop_executor(EXECUTOR)
+
+    answer = asyncio.run(call())
+    body = StopExecutorResponse(**answer).model_dump()
+    assert body["status"] == "stopping"
+    assert body["pending"] == answer["pending"]
+    assert "undelivered-cancel" in body["pending"]
