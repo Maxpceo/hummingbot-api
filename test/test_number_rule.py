@@ -407,3 +407,34 @@ def test_fill_down_does_not_mint_on_a_tracker_number(monkeypatch, tmp_path):
 
     asyncio.run(service._one_sell_after_fill_down(EXECUTOR, executor, connector, level))
     assert minted == [], "quant занят номером трекера — чеканки нет"
+
+
+# ── 9. вердикт 20261013-195754-25863: голая строка снимка тика держит чеканку ─
+
+
+def test_place_level_close_refuses_on_a_bare_tick_snapshot(monkeypatch, tmp_path):
+    """Голая строка СНИМКА ТИКА (номер не прочитан) держит quant до чеканки:
+    `get_new_client_order_id` не вызывается и запись журнала не происходит.
+    Пустой текст строки — не «повтор своего номера» даже при пустом own_id."""
+    service, repo, connector, executor = _prepare(
+        monkeypatch, tmp_path, _checkpoint(_level(level_id="L1", take="101")), [],
+    )
+    executor._partial_owns_level = lambda level: False  # owns не отсекает — проверяем цену
+    service._remember_tick_fresh(PAIR, _fresh(opens=[{"price": "100"}]))  # только снимок тика
+    minted = []
+
+    def no_mint(*args, **kwargs):
+        minted.append(True)
+        return "close-9"
+
+    import hummingbot.connector.utils as connector_utils
+
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", no_mint)
+    before = _ledger_rows_count()
+    assert executor._refuse_close_price(Decimal("100")) is True, (
+        "голая цена снимка тика держит quant и при пустом своем номере"
+    )
+    assert ledger_mod.place_level_close(executor, EXECUTOR, _level_stub("L1", "100")) is None
+    assert minted == [], "get_new_client_order_id не вызывался — чеканки не было"
+    assert _ledger_rows_count() == before, "записи журнала не было"
+    assert connector.created == []

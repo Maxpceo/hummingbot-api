@@ -3642,7 +3642,7 @@ class ExecutorService:
         from utils.executor_checkpoint import _same_tick
         for raw in list((fresh or {}).get("opens") or []):
             text = str(raw.get("text") or raw.get("order_id") or "")
-            if text == str(own_id or ""):
+            if text and text == str(own_id or ""):
                 continue
             if not self._text_holds(text, fresh):
                 continue
@@ -3671,7 +3671,7 @@ class ExecutorService:
         own = str(own_id or "")
 
         def add(price, text):
-            if not price or str(text or "") == own or str(price) != str(placement):
+            if not price or (text and str(text) == own) or str(price) != str(placement):
                 return
             found.append(str(price))
 
@@ -9239,7 +9239,10 @@ class ExecutorService:
         tick = getattr(rules.get(pair) if isinstance(rules, dict) else None, "min_price_increment", None)
 
         def occupied(price: Any, text: str) -> bool:
-            if text == str(own_id):
+            # «Повтор своего номера» — только непустой номер, равный своему:
+            # пустой текст (голая цена снимка тика) — не повтор и держит quant
+            # даже при пустом own_id на чеканке (редакция плана 5).
+            if text and text == str(own_id):
                 return False
             if price in (None, ""):
                 return True
