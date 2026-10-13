@@ -531,3 +531,47 @@ def test_take_releases_after_the_sell_slot_was_cleared(monkeypatch, tmp_path):
     assert recorded_price_blocks(blocked_open, "0.10", TICK) is True, (
         "продажи в finished нет — тейк открытой позиции держит"
     )
+
+
+def test_old_cycle_sell_does_not_release_the_new_open_take(monkeypatch, tmp_path):
+    """Продажа прошлого круга того же уровня не закрывает новую покупку."""
+    from utils.executor_checkpoint import recorded_price_blocks
+
+    level = _level(level_id="L1", open_id="buy-2", close_id="", take="0.10", filled=True)
+    level["partial_bought"] = "1"
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True, ts=10),
+        _row("sell-1", level_id="L1", role="close", price="0.10", sent=True, ts=20),
+        _row("buy-2", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True, ts=30),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    fresh = _fresh(finished=[
+        {"text": "buy-1", "finish_as": "filled", "price": "0.09487", "amount": "1", "left": "0"},
+        {"text": "sell-1", "finish_as": "filled", "price": "0.10", "amount": "1", "left": "0"},
+        {"text": "buy-2", "finish_as": "filled", "price": "0.09487", "amount": "1", "left": "0"},
+    ])
+    blocked = service._prices_for_blocks(service._ban_pairs(PAIR, fresh), fresh)
+    assert recorded_price_blocks(blocked, "0.10", TICK) is True, (
+        "продажа раньше новой покупки — тейк открытой позиции держит"
+    )
+
+
+def test_other_executor_sell_does_not_release_our_take(monkeypatch, tmp_path):
+    """Продажа другого исполнителя с тем же level_id нашу покупку не покрывает."""
+    from utils.executor_checkpoint import recorded_price_blocks
+
+    level = _level(level_id="L1", open_id="buy-a", close_id="", take="0.10", filled=True)
+    level["partial_bought"] = "1"
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-a", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True, ts=10),
+        _row("sell-b", level_id="L1", role="close", price="0.10", sent=True, ts=20, executor_id="grid-b"),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    fresh = _fresh(finished=[
+        {"text": "buy-a", "finish_as": "filled", "price": "0.09487", "amount": "1", "left": "0"},
+        {"text": "sell-b", "finish_as": "filled", "price": "0.10", "amount": "1", "left": "0"},
+    ])
+    blocked = service._prices_for_blocks(service._ban_pairs(PAIR, fresh), fresh)
+    assert recorded_price_blocks(blocked, "0.10", TICK) is True, (
+        "продажа другого исполнителя — тейк нашей открытой позиции держит"
+    )

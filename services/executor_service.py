@@ -2704,11 +2704,12 @@ class ExecutorService:
             return True
         if not self._level_position_open(level, body, fresh):
             return False
-        return not self._journal_sell_covered(level, fresh)
+        return not self._journal_sell_covered(order_id, level, fresh)
 
-    def _journal_sell_covered(self, level: Dict[str, Any], fresh: Optional[Dict[str, Any]]) -> bool:
-        """Продажа уровня доказана без слота: строка журнала role=close или
-        market_close того же level_id, finished показал её исполненной, база покрыла покупку."""
+    def _journal_sell_covered(self, order_id: str, level: Dict[str, Any], fresh: Optional[Dict[str, Any]]) -> bool:
+        """Продажа этой покупки без слота: строка журнала role=close или market_close того же
+        level_id и того же исполнителя, не старше строки покупки. Продажа прошлого круга и чужого
+        исполнителя покупку не покрывает. Finished доказал исполнение, база покрыла partial_bought."""
         level_id = str(level.get("id") or "")
         bought = partial_decimal(level.get("partial_bought"))
         if not level_id or bought is None or bought <= 0:
@@ -2716,12 +2717,26 @@ class ExecutorService:
         rows = self._partial_rows()
         if not rows:
             return False
+        buy = None
+        for row in rows:
+            if str(row.get("order_id") or "") == str(order_id or ""):
+                buy = row
+                break
+        owner = str((buy or {}).get("executor_id") or "")
+        buy_ts = partial_decimal((buy or {}).get("ts"))
+        if not owner or buy_ts is None:
+            return False
         sold = Decimal("0")
         seen = set()
         for row in rows:
             if str(row.get("level_id") or "") != level_id:
                 continue
+            if str(row.get("executor_id") or "") != owner:
+                continue
             if str(row.get("role") or "") not in ("close", "market_close"):
+                continue
+            sell_ts = partial_decimal(row.get("ts"))
+            if sell_ts is None or sell_ts < buy_ts:
                 continue
             name = str(row.get("order_id") or "")
             if not name or name in seen:
