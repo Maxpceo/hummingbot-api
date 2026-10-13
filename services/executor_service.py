@@ -8346,8 +8346,13 @@ class ExecutorService:
                 parsed = parse_checkpoint(stored)
                 if not visible(parsed):
                     return False
-                self._set_hold_rows(await repo.get_checkpoint_rows())
-                return True
+            # Публикация записи — только после возврата коммита сессии
+            # (план stop-freeze п.1): до коммита метку не видит никто, и отмены
+            # не уходят раньше закрепления.
+            async with self.db_manager.get_session_context() as session:
+                rows = await ExecutorRepository(session).get_checkpoint_rows()
+            self._set_hold_rows(rows)
+            return True
         except Exception:
             logger.exception("partial compare-and-swap was not committed")
             return False

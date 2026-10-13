@@ -4115,7 +4115,9 @@ def install_connector_close_channel(connector: Any) -> None:
                             )
                             return
                     except Exception:
+                        # Ошибка проверки — не слать (план stop-freeze п.2).
                         logger.exception("close channel stop mark check failed")
+                        return
                 await create(**fields)
 
             try:

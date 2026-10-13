@@ -415,6 +415,48 @@ def test_unreadable_reread_does_not_erase_the_mark(monkeypatch):
     assert asyncio.run(service._refresh_stop_mark(EXECUTOR)) is True
 
 
+def test_failed_commit_publishes_no_mark_and_sends_no_cancels(tmp_path, monkeypatch):
+    """Коммит метки не завершён: метка не видна никому, отмены не ушли (проба 9)."""
+    from contextlib import asynccontextmanager
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(open_id="buy-1", filled=True, close_id="sell-1")),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    service._active_executors[EXECUTOR] = executor
+    saved = dict(repo.rows[0])
+
+    @asynccontextmanager
+    async def commit_fails():
+        try:
+            yield SimpleNamespace()
+        finally:
+            # Коммит не вернулся: незакреплённая запись исчезает, как в транзакции.
+            repo.rows[0].clear()
+            repo.rows[0].update(saved)
+            raise RuntimeError("commit failed")
+
+    service.db_manager = SimpleNamespace(get_session_context=lambda: commit_fails())
+
+    import asyncio
+
+    async def call():
+        return await service.stop_executor(EXECUTOR)
+
+    answer = asyncio.run(call())
+    assert answer["status"] == "not_accepted"
+    assert answer.get("reason")
+    # Отмены до возврата коммита не уходят и цену не освобождают.
+    assert recorded == []
+    assert connector.cancelled == []
+    assert connector.created == []
+    # Метка не опубликована: ни RAM, ни запись её не несут.
+    assert service._stop_mark_now(EXECUTOR) is False
+    assert asyncio.run(service._refresh_stop_mark(EXECUTOR)) is False
+
+
 def test_unreadable_confirmation_after_cas_still_freezes_and_delivers(tmp_path, monkeypatch):
     """CAS прошёл, новая сессия вернула None, RAM холодный — заморозка держится.
 
@@ -908,6 +950,43 @@ def test_market_close_channel_task_holds_the_send_under_the_mark(tmp_path, monke
         assert ledger_mod.place_market_close(executor, EXECUTOR) == "close-3"
         assert len(queued) == 1
         assert await service._freeze_stop_mark(EXECUTOR) is True
+        await queued.pop()
+        assert connector.created == []
+
+    asyncio.run(run())
+
+
+def test_close_channel_check_error_holds_the_send(tmp_path, monkeypatch):
+    """Ошибка проверки метки в канале — заявка не уходит (проба 10)."""
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(take="101")),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    executor, _ = _channel_executor(connector)
+    executor._next_close_id = "close-4"
+    service._active_executors[EXECUTOR] = executor
+    service._install_partial_guards(EXECUTOR, executor)
+    queued = _queue_send(monkeypatch)
+    _stub_trade_types(monkeypatch)
+
+    async def broken():
+        raise RuntimeError("mark check failed")
+
+    executor._refuse_frozen_close = broken
+    level = SimpleNamespace(
+        id="L1",
+        price=Decimal("101"),
+        amount_quote=Decimal("1"),
+        active_open_order=SimpleNamespace(order_id="buy-1"),
+        active_close_order=None,
+    )
+
+    import asyncio
+
+    async def run():
+        assert ledger_mod.place_level_close(executor, EXECUTOR, level) == "close-4"
+        assert len(queued) == 1
         await queued.pop()
         assert connector.created == []
 
