@@ -410,8 +410,52 @@ def test_unreadable_reread_does_not_erase_the_mark(monkeypatch):
     service._read_stop_mark_fresh = unreadable
 
     import asyncio
-    assert asyncio.run(service._freeze_stop_mark(EXECUTOR)) is False
+    assert asyncio.run(service._freeze_stop_mark(EXECUTOR)) is True
     assert service._stop_mark_now(EXECUTOR) is True
+    assert asyncio.run(service._refresh_stop_mark(EXECUTOR)) is True
+
+
+def test_unreadable_confirmation_after_cas_still_freezes_and_delivers(tmp_path, monkeypatch):
+    """CAS прошёл, новая сессия вернула None, RAM холодный — заморозка держится.
+
+    Вердикт 20261013-075243-9283 и план п.1: гейты читают RAM ИЛИ запись —
+    уже стоящая отправка не уходит (`_create_order` не вызван), доставка отмен
+    по нашим номерам всё равно идёт.
+    """
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(open_id="buy-1", filled=True, close_id="sell-1")),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    service._active_executors[EXECUTOR] = executor
+
+    async def column_unreadable(_executor_id):
+        return None
+
+    service._partial_column_text = column_unreadable
+
+    import asyncio
+
+    async def call():
+        return await service.stop_executor(EXECUTOR)
+
+    answer = asyncio.run(call())
+    assert answer["status"] == "stopping"
+    assert stop_mark_visible(_stored(repo))
+    # RAM холодный, а заморозка держится из перечитанной записи.
+    assert (service.__dict__.get("_stop_mark_ram") or {}).get(EXECUTOR) is not True
+    assert service._stop_mark_now(EXECUTOR) is True
+    # Доставка отмен по нашим номерам пошла, несмотря на непрочитанную перечитку.
+    assert recorded == ["early_stop"]
+    assert connector.cancelled == ["buy-1", "sell-1"]
+
+    # Уже стоящая отправка не уходит: гейт читает RAM ИЛИ запись.
+    asyncio.run(
+        service._partial_send_committed(EXECUTOR, executor, connector, PAIR, "sell-2", "L1", "101", Decimal("1"))
+    )
+    assert connector.created == []
     assert asyncio.run(service._refresh_stop_mark(EXECUTOR)) is True
 
 

@@ -8293,8 +8293,10 @@ class ExecutorService:
     async def _refresh_stop_mark(self, executor_id: str) -> bool:
         """Свежая перечитка перед чеканкой/отправкой; без await до вызова биржи.
 
-        Непрочитанное не размораживает: RAM-копия, записанная при стопе,
-        остаётся истиной. Нет метки и в памяти — сетка не заморожена.
+        Непрочитанное не размораживает: гейт читает RAM ИЛИ последнюю
+        перечитанную запись чекпоинта (план п.1) — холодная RAM не значит
+        «метки нет», если колонка её уже отдала (коммит CAS публикует запись).
+        Нет метки ни там, ни там — сетка не заморожена.
         """
         ram = self.__dict__.setdefault("_stop_mark_ram", {})
         try:
@@ -8302,7 +8304,7 @@ class ExecutorService:
                 ram[str(executor_id)] = True
         except Exception:
             logger.exception("stop mark re-read failed for %s", executor_id)
-        return bool(ram.get(str(executor_id)))
+        return self._stop_mark_now(executor_id)
 
     async def _freeze_stop_mark(self, executor_id: str) -> bool:
         """Метка «стоп запрошен»: CAS → коммит (выход из сессии) → новая сессия."""
@@ -8319,10 +8321,11 @@ class ExecutorService:
             logger.exception("stop mark write failed for %s", executor_id)
         ram = self.__dict__.setdefault("_stop_mark_ram", {})
         confirmed = await self._read_stop_mark_fresh(executor_id)
-        # Непрочитанное не размораживает: ложь поверх истины метку не стирает.
+        # Непрочитанное не размораживает: ложь поверх истины метку не стирает, а
+        # закоммиченная CAS метка уже видна в перечитанной записи (план п.1).
         if confirmed:
             ram[key] = True
-        return confirmed
+        return confirmed or self._stop_mark_now(executor_id)
 
     async def _partial_cas(self, executor_id: str, mutate: Any, visible: Any, target_id: Optional[str] = None) -> bool:
         if not self.db_manager:
