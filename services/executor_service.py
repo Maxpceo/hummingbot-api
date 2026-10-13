@@ -177,6 +177,9 @@ from utils.trading_pair import InvalidTradingPair, split_trading_pair
 
 logger = logging.getLogger(__name__)
 _OKX_JOURNAL_UNSET = object()
+
+# Доводка заморозки: пауза между досылками отмен (план stop-freeze п.3).
+STOP_FINISH_RETRY_SECONDS = 30.0
 _OKX_TERMINAL_STATES = {"filled", "canceled", "mmp_canceled"}
 
 
@@ -5739,18 +5742,10 @@ class ExecutorService:
         # размораживает: метку из памяти перечитка не снимает.
         already = await self._read_stop_mark_fresh(executor_id) or self._stop_mark_now(executor_id)
         if not already:
-            hold_reason = await self._stop_freeze_holds(executor_id, executor)
-            if hold_reason:
-                self._log_silent_exit(
-                    "stop-aside", pair, hold_reason, executor_id,
-                    interval=0.0, label="silent stop exit:", key=executor_id,
-                )
-                return {
-                    "executor_id": executor_id,
-                    "status": "not_accepted",
-                    "reason": hold_reason,
-                    "keep_position": keep_position,
-                }
+            # Держателей по цене нет (правило номера, план stop-freeze п.3):
+            # чужая заявка на цене тейка и нечитаемые списки биржи ни на что
+            # не влияют. Метка пишется всегда и сразу — одно нажатие доводится
+            # программой сама.
             confirmed = False
             try:
                 confirmed = await self._freeze_stop_mark(executor_id)
@@ -5764,6 +5759,16 @@ class ExecutorService:
                     "keep_position": keep_position,
                 }
 
+        # Судьба наших номеров держит только доведение, не заморозку и не
+        # первую досылку отмен: доводку досылает сама программа (план п.3).
+        pending = self._stop_unproven_reason(executor_id)
+        if pending:
+            self._log_silent_exit(
+                "stop-aside", pair, pending, executor_id,
+                interval=0.0, label="silent stop exit:", key=executor_id,
+            )
+        self.__dict__.setdefault("_stop_keep_position", {})[str(executor_id)] = bool(keep_position)
+
         # Trigger early stop
         try:
             executor.early_stop(keep_position=keep_position)
@@ -5776,7 +5781,8 @@ class ExecutorService:
         return {
             "executor_id": executor_id,
             "status": "frozen" if already else "stopping",
-            "keep_position": keep_position
+            "pending": pending,
+            "keep_position": keep_position,
         }
 
     async def get_orphaned_positions(self) -> List[Dict[str, Any]]:
@@ -5902,13 +5908,12 @@ class ExecutorService:
         logger.info(f"Orphaned position for executor {executor_id} marked resolved")
         return {"executor_id": executor_id, "orphan_resolved": True}
 
-    async def _stop_freeze_holds(self, executor_id: str, executor: Any) -> Optional[str]:
-        """Чужая склейка по цене и неподтверждённая отправка держат команду.
+    def _stop_unproven_reason(self, executor_id: str) -> Optional[str]:
+        """Судьба наших номеров неизвестна: они ещё могут оказаться на бирже.
 
-        Свой номер не держит: штатная отмена снимает его той же командой.
-        Чужая заявка на цене тейка сверяется ещё и со СВЕЖИМ списком opens
-        биржи: после перезапуска локальные книги пусты (план stop-freeze п.3).
-        Сверка идёт ДО записи метки.
+        Держит только доведение отмен, не заморозку (план stop-freeze п.3):
+        заявки опознаются ТОЛЬКО по номеру, чужая заявка на цене и нечитаемые
+        списки биржи сюда не входят. Нечитаемый miss — судьба неизвестна всем.
         """
         parsed = self._partial_parsed(executor_id)
         if order_miss_unreadable():
@@ -5932,38 +5937,35 @@ class ExecutorService:
                 continue
             if order_is_unsent(text) or order_send_unknown(text):
                 unproven.append(text)
-        if unproven:
-            return "unproven-send ids=" + ",".join(str(item)[-8:] for item in unproven)
-        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
-        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
-        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
-        if connector is None:
+        if not unproven:
             return None
-        texts = self._partial_sell_texts(executor_id, parsed)
-        fresh = await self._fresh_raw_lists(connector, pair, None)
-        inflight = getattr(connector, "in_flight_orders", None) or {}
-        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
-        tick = self._pair_tick(executor)
-        seen = [
-            (
-                str(getattr(order, "client_order_id", "") or getattr(order, "order_id", "") or ""),
-                getattr(order, "price", None),
-            )
-            for order in list(inflight.values()) + list(lost.values())
-        ]
-        seen.extend((str(raw.get("text") or ""), raw.get("price")) for raw in (fresh or {}).get("opens") or [])
-        for level in (parsed or {}).get("levels") or []:
-            marks = [level.get("take_profit_price"), (level.get("close_order") or {}).get("price")]
-            for text, price in seen:
-                # Свой номер не держит: numbers — журнал, слоты и holds, texts —
-                # продажи без level_id. Чужой только тот, чьего имени нет ни там,
-                # ни там: свой close с журнальной строкой level_id — не чужой
-                # (вердикт 20261013-005043-97561).
-                if not text or text in numbers or text in texts:
-                    continue
-                if any(self._mark_price_hit(mark, price, tick) for mark in marks):
-                    return f"foreign-glue id=…{text[-8:]}"
-        return None
+        return "unproven-send ids=" + ",".join(str(item)[-8:] for item in unproven)
+
+    def _stop_finish_repeat(self, executor_id: str, executor: Any, pair: str = "") -> None:
+        """Доводка заморозки: досылает отмены сама, пока судьба номеров неизвестна.
+
+        Одно нажатие (план stop-freeze п.3): метка уже есть, досылка идёт тем же
+        `early_stop`, с паузой, без повторного нажатия кнопки. После перезагрузки
+        доводка продолжается сама: метка живёт в записи, судьба номеров — в
+        журнале.
+        """
+        reason = self._stop_unproven_reason(executor_id)
+        if not reason:
+            return
+        stamps = self.__dict__.setdefault("_stop_finish_last", {})
+        now = time.time()
+        if stamps.get(str(executor_id)) is not None and now - stamps[str(executor_id)] < STOP_FINISH_RETRY_SECONDS:
+            return
+        stamps[str(executor_id)] = now
+        self._log_silent_exit(
+            "stop-aside", pair or "", reason, executor_id,
+            interval=300.0, label="silent stop exit:", key=executor_id,
+        )
+        try:
+            keep = bool((self.__dict__.get("_stop_keep_position") or {}).get(str(executor_id)))
+            executor.early_stop(keep_position=keep)
+        except Exception:
+            logger.exception("stop finish repeat failed for %s", executor_id)
 
     async def _handle_executor_completion(self, executor_id: str):
         """Handle cleanup when an executor completes."""
@@ -7716,6 +7718,8 @@ class ExecutorService:
                     service.__dict__.setdefault("_stock_tick_ids", {})[executor_id] = set(service._partial_close_ids(executor_id))
                 if frozen:
                     witness = ""
+                    # Доводка заморозки без повторного нажатия (план п.3).
+                    service._stop_finish_repeat(executor_id, executor, pair or "")
                 else:
                     await service._partial_tick(executor_id, executor)
                     witness = await service._hand_stock_picture(executor_id, executor, connector, pair or "")
@@ -7983,16 +7987,6 @@ class ExecutorService:
             return str(left) == str(right)
         same = _same_tick(left, right, tick)
         return same is True
-
-    def _mark_price_hit(self, mark: Any, price: Any, tick: Any) -> bool:
-        """Цена чужой заявки совпала с нашей. Формат строки не оправдание."""
-        if mark in (None, "") or price in (None, ""):
-            return False
-        if self._price_same(mark, price, tick):
-            return True
-        left = partial_decimal(mark)
-        right = partial_decimal(price)
-        return left is not None and right is not None and left == right
 
     def _live_open_prices(self, executor: Any) -> list:
         found = []

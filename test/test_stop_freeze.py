@@ -9,8 +9,10 @@
 Плюс пробы вердикта кода 20261012-212613-69817: гонка mutate (метка в теле CAS
 после гейта — запись не проходит, цена тейка цела); перезагрузка после коммита
 метки (RAM холодный — метка прогрета, обёртка не отказывает, отмены ушли);
-чужая заявка на цене тейка из свежего opens держит команду; задача канала
-закрытия уже в очереди, метка закоммичена — `_create_order` не вызван.
+чужая заявка на цене тейка НЕ держит команду (правило номера), нечитаемые
+списки биржи ни на что не влияют, неподтверждённая отправка не держит
+заморозку — доводка отмен идёт сама; задача канала закрытия уже в очереди,
+метка закоммичена — `_create_order` не вызван.
 """
 
 import json
@@ -284,9 +286,14 @@ def test_wrap_stop_does_not_refuse_or_reset_running_under_the_mark(monkeypatch):
 # ── 3. свидетели: чужая склейка и неподтверждённая отправка ─────────────────
 
 
-def test_stop_holds_on_unproven_send_and_names_the_reason(tmp_path, monkeypatch):
+def test_unproven_send_freezes_now_and_finishes_itself(tmp_path, monkeypatch):
+    """Неподтверждённая отправка не держит заморозку: метка сразу, доводка сама.
+
+    План stop-freeze п.3: судьба наших номеров держит только завершение;
+    повторного нажатия кнопки нет — отмены досылает сама программа.
+    """
     _journal(tmp_path, monkeypatch, [_row("buy-1")])
-    from utils.executor_checkpoint import add_miss_order
+    from utils.executor_checkpoint import add_miss_order, add_sent_order, remove_miss_order
     add_miss_order("buy-1")
     try:
         service, repo, _ = _service_with(monkeypatch, _checkpoint(_level(open_id="buy-1")))
@@ -300,16 +307,29 @@ def test_stop_holds_on_unproven_send_and_names_the_reason(tmp_path, monkeypatch)
             return await service.stop_executor(EXECUTOR)
 
         answer = asyncio.run(call())
-        assert answer["status"] == "not_accepted"
-        assert "unproven-send" in answer["reason"]
-        assert recorded == []
-        assert not stop_mark_visible(_stored(repo))
+        # Заморозка сразу: метка записана, отмены ушли, отказа нет.
+        assert answer["status"] == "stopping"
+        assert "unproven-send" in (answer.get("pending") or "")
+        assert stop_mark_visible(_stored(repo))
+        assert recorded == ["early_stop"]
+
+        # Доводка сама, и холодная RAM ей не помеха (перезагрузка).
+        service.__dict__.pop("_stop_mark_ram", None)
+        service.__dict__.setdefault("_stop_finish_last", {})[EXECUTOR] = 0.0
+        service._stop_finish_repeat(EXECUTOR, executor)
+        assert recorded == ["early_stop", "early_stop"]
+
+        # Судьба номера ясна — доводка молчит.
+        add_sent_order("buy-1")
+        service.__dict__.setdefault("_stop_finish_last", {})[EXECUTOR] = 0.0
+        service._stop_finish_repeat(EXECUTOR, executor)
+        assert recorded == ["early_stop", "early_stop"]
     finally:
-        from utils.executor_checkpoint import remove_miss_order
         remove_miss_order("buy-1")
 
 
-def test_stop_holds_on_foreign_glue_by_price(tmp_path, monkeypatch):
+def test_foreign_order_by_price_does_not_hold(tmp_path, monkeypatch):
+    """Чужая заявка на цене тейка — не помеха и не держатель (правило номера)."""
     connector = _Connector()
     connector.in_flight_orders["foreign-1"] = SimpleNamespace(price="101", client_order_id="foreign-1")
     service, repo, _ = _service_with(
@@ -320,16 +340,55 @@ def test_stop_holds_on_foreign_glue_by_price(tmp_path, monkeypatch):
     executor = _stub_executor(connector, recorded)
     service._active_executors[EXECUTOR] = executor
 
+    async def fresh(_connector, _pair, _ts=None):
+        return {
+            "opens_read": True,
+            "opens_done": True,
+            "finished_read": True,
+            "finished_done": True,
+            "opens": [{"text": "foreign-2", "status": "open", "price": "101.0000"}],
+            "finished": [],
+        }
+
+    service._fresh_raw_lists = fresh
+
     import asyncio
 
     async def call():
         return await service.stop_executor(EXECUTOR)
 
     answer = asyncio.run(call())
-    assert answer["status"] == "not_accepted"
-    assert "foreign-glue" in answer["reason"]
-    assert recorded == []
-    assert not stop_mark_visible(_stored(repo))
+    assert answer["status"] == "stopping"
+    assert answer.get("pending") is None
+    assert stop_mark_visible(_stored(repo))
+    assert recorded == ["early_stop"]
+
+
+def test_unreadable_opens_do_not_hold(tmp_path, monkeypatch):
+    """Нечитаемые списки биржи ни на что не влияют: стоп принят, метка записана."""
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(open_id="buy-1", close_id="sell-1")),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    service._active_executors[EXECUTOR] = executor
+
+    async def broken(_connector, _pair, _ts=None):
+        raise OSError("lists unreadable")
+
+    service._fresh_raw_lists = broken
+
+    import asyncio
+
+    async def call():
+        return await service.stop_executor(EXECUTOR)
+
+    answer = asyncio.run(call())
+    assert answer["status"] == "stopping"
+    assert stop_mark_visible(_stored(repo))
+    assert recorded == ["early_stop"]
 
 
 # ── 4. под меткой ничего не чеканится и не шлётся, записи целы ──────────────
@@ -563,41 +622,6 @@ def test_restart_after_mark_commit_warms_ram_and_sends_the_cancels(tmp_path, mon
 
 
 # ── чужая склейка по свежему opens ──────────────────────────────────────────
-
-
-def test_stop_holds_on_foreign_glue_from_fresh_opens(tmp_path, monkeypatch):
-    """Чужая заявка на цене тейка из СВЕЖЕГО opens держит команду."""
-    connector = _Connector()
-    service, repo, _ = _service_with(
-        monkeypatch, _checkpoint(_level(open_id="buy-1", close_id="sell-1")),
-        connector=connector, journal_lines=[], tmp_path=tmp_path,
-    )
-    recorded = []
-    executor = _stub_executor(connector, recorded)
-    service._active_executors[EXECUTOR] = executor
-
-    async def fresh(_connector, _pair, _ts=None):
-        return {
-            "opens_read": True,
-            "opens_done": True,
-            "finished_read": True,
-            "finished_done": True,
-            "opens": [{"text": "foreign-1", "status": "open", "price": "101.0000"}],
-            "finished": [],
-        }
-
-    service._fresh_raw_lists = fresh
-
-    import asyncio
-
-    async def call():
-        return await service.stop_executor(EXECUTOR)
-
-    answer = asyncio.run(call())
-    assert answer["status"] == "not_accepted"
-    assert "foreign-glue" in answer["reason"]
-    assert recorded == []
-    assert not stop_mark_visible(_stored(repo))
 
 
 def test_stop_passes_when_the_take_price_in_opens_is_our_own(tmp_path, monkeypatch):
