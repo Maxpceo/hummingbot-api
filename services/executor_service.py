@@ -2482,7 +2482,7 @@ class ExecutorService:
                     continue
                 if row.get("price") not in (None, "") and self._text_holds(order_id, fresh):
                     items.append((order_id, row.get("price")))
-                if row.get("take_profit_price") not in (None, ""):
+                if row.get("take_profit_price") not in (None, "") and self._take_holds(order_id, fresh):
                     items.append((order_id, row.get("take_profit_price")))
         for item in owed_records() or []:
             if order_is_unsent(str(item.get("order_id") or "")):
@@ -2679,7 +2679,30 @@ class ExecutorService:
                     return True
         return False
 
-    def _text_holds(self, text: Any, fresh: Optional[Dict[str, Any]]) -> bool:
+    def _take_holds(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Тейк держит quant, пока позиция не закрыта (план number-rule, п.2):
+        живой или неизвестный номер ещё не кончил держание; исполненный —
+        позиция открыта, тейк жив; отмена без позиции и тейк без номера позиции
+        quant не держат (вердикт 20261013-151226-99598)."""
+        name = str(order_id or "")
+        if not name:
+            return False
+        if not self._proven_dead(name, fresh):
+            return True
+        return self._proven_dead_filled(name, fresh)
+
+    def _pair_holds(self, order_id: Any, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Пара (номер, цена) держит quant: голая пара без номера — как голая
+        цена; чужой текст — нет; отмена без позиции (finished, база ноль)
+        отпускает. Исполненная пара остаётся — её тейк держит позицию."""
+        name = str(order_id or "")
+        if not name:
+            return True
+        if not self._own_text(name):
+            return False
+        return not self._proven_dead_zero(name, fresh)
+
+    def _text_holds(self, text: Any, fresh: Optional[Dict[str, Any]], extra_own: Any = None) -> bool:
         """Держит ли запись с этим текстом цену для нового номера (правило
         номера): голый текст (номер не прочитан) — держит и не присваивается;
         наш номер — пока finished не доказал именно эту заявку исполненной или
@@ -2689,6 +2712,8 @@ class ExecutorService:
             return True
         if self._proven_dead(name, fresh):
             return False
+        if extra_own is not None and name in extra_own:
+            return True
         return self._own_text(name)
 
     def _finished_row(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -2814,16 +2839,16 @@ class ExecutorService:
         return False
 
     def _prices_for_blocks(self, items, fresh) -> List[Any]:
-        """Price strings only. Правило номера: пара (номер, цена) проходит, пока
-        номер держит (наш живой или голый); чужой текст и доказанная история
-        падают. Голая цена и живая цена не падают."""
+        """Price strings only. Пара (номер, цена) держит, пока держит `_pair_holds`:
+        чужой текст и отмена без позиции падают; исполненная пара (тейк открытой
+        позиции), голая цена и голая пара остаются."""
         live_prices = set()
         for item in items or []:
             if isinstance(item, tuple) and len(item) == 2:
                 order_id, price = item
                 if price in (None, "") or isinstance(price, (tuple, dict)):
                     continue
-                if self._text_holds(order_id, fresh):
+                if self._pair_holds(order_id, fresh):
                     live_prices.add(str(price))
             elif not isinstance(item, (tuple, dict)) and item not in (None, ""):
                 live_prices.add(str(item))
@@ -2834,7 +2859,7 @@ class ExecutorService:
                 order_id, price = item
                 if price in (None, "") or isinstance(price, (tuple, dict)):
                     continue
-                if not self._text_holds(order_id, fresh) and str(price) not in live_prices:
+                if not self._pair_holds(order_id, fresh) and str(price) not in live_prices:
                     continue
                 value = price
             elif isinstance(item, dict) or item in (None, ""):
@@ -3537,6 +3562,12 @@ class ExecutorService:
             return
         if await self._refresh_stop_mark(executor_id):
             return
+        # Правило номера: quant занят нашим живым номером/записью или голой
+        # ценой — второй номер не чеканить (план number-rule, «По местам» п.5).
+        if self._close_tick_taken(executor, str(quant), buy_id) or self._partial_foreign_booked(
+            executor_id, connector, pair, str(quant), buy_id, fresh,
+        ):
+            return
         from hummingbot.connector.utils import get_new_client_order_id
         close_id = get_new_client_order_id(
             is_buy=side == "SELL",
@@ -3615,21 +3646,24 @@ class ExecutorService:
             found.append(str(price))
 
         book = fresh if isinstance(fresh, dict) else {}
+        tracker_texts = set(getattr(connector, "in_flight_orders", None) or {}) | set(
+            getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
+        )
         for raw in list(book.get("opens") or []) + list(book.get("finished") or []):
             text = str(raw.get("text") or raw.get("order_id") or "")
-            if not self._text_holds(text, book):
+            if not self._text_holds(text, book, tracker_texts):
                 continue
             add(raw.get("price"), text)
         inflight = getattr(connector, "in_flight_orders", None) or {}
         lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
         for order_id, order in list(inflight.items()) + list(lost.items()):
-            if not self._text_holds(order_id, book):
+            if not self._text_holds(order_id, book, tracker_texts):
                 continue
             add(self._price_of(order), order_id)
         for row in rows or []:
             if str(row.get("order_id") or "") == own:
                 continue
-            if not self._text_holds(row.get("order_id"), book):
+            if not self._text_holds(row.get("order_id"), book, tracker_texts):
                 continue
             add(row.get("price"), row.get("order_id"))
         return found
@@ -3904,7 +3938,7 @@ class ExecutorService:
                 continue
             if row.get("price") not in (None, "") and self._text_holds(order_key, fresh):
                 journal_prices.append((order_key, row.get("price")))
-            if row.get("take_profit_price") not in (None, ""):
+            if row.get("take_profit_price") not in (None, "") and self._take_holds(order_key, fresh):
                 journal_prices.append((order_key, row.get("take_profit_price")))
         released_text = set()
         for row in ledger_rows:
@@ -8161,6 +8195,7 @@ class ExecutorService:
         for entry in self._hold_index():
             released.update(entry["price_released_ids"])
             level_close_ids.update(entry["level_close_ids"])
+        fresh = self._tick_fresh(pair or "")
         for other in self._active_executors.values():
             other_pair = getattr(getattr(other, "config", None), "trading_pair", None)
             if pair and other_pair and other_pair != pair:
@@ -8191,7 +8226,7 @@ class ExecutorService:
                 continue
             if row.get("role") not in ("close", "market_close", None) and row.get("price") in (None, ""):
                 continue
-            if not self._proven_dead(order_id, self._tick_fresh(pair or "")):
+            if not self._proven_dead(order_id, fresh):
                 owned = False
                 for other in self._active_executors.values():
                     bans = {str(item) for item in getattr(other, "_close_ban_ids", set()) or set()}
@@ -8205,11 +8240,11 @@ class ExecutorService:
                 if owned and row.get("price") not in (None, ""):
                     found.append(row.get("price"))
             if row.get("take_profit_price") not in (None, "") and order_id not in released:
-                if order_id in level_close_ids:
+                if order_id in level_close_ids and self._take_holds(order_id, fresh):
                     found.append(row.get("take_profit_price"))
         for entry in self._hold_index():
             for close_id, price in entry["level_close_prices"]:
-                if close_id != ignore and close_id not in released:
+                if close_id != ignore and close_id not in released and not self._proven_dead(close_id, fresh):
                     found.append(price)
         if include_opens:
             found.extend(self._live_open_prices(executor))
@@ -8851,8 +8886,13 @@ class ExecutorService:
                 return
         ready_map[executor_id] = True
 
-    def _partial_foreign_booked(self, executor_id: str, connector: Any, pair: str, quant: str, own_id: str) -> bool:
-        """A price already in the column or journal holds the tick even before the text is open."""
+    def _partial_foreign_booked(
+        self, executor_id: str, connector: Any, pair: str, quant: str, own_id: str,
+        fresh: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Наша запись в колонке или журнале держит тик, пока finished не доказал
+        именно эту заявку (правило номера): цена — нашим живым номером, тейк —
+        пока позиция не закрыта. Чужой текст не держит."""
         rules = getattr(connector, "trading_rules", None) or {}
         tick = getattr(rules.get(pair) if isinstance(rules, dict) else None, "min_price_increment", None)
         rows = self._partial_rows() or []
@@ -8880,26 +8920,32 @@ class ExecutorService:
             order_id = str(row.get("order_id") or "")
             if not order_id or order_id in own or order_id in released:
                 continue
-            if row.get("price") not in (None, ""):
+            if row.get("price") not in (None, "") and self._text_holds(order_id, fresh):
                 prices.append(row.get("price"))
-            if row.get("take_profit_price") not in (None, ""):
+            if row.get("take_profit_price") not in (None, "") and self._take_holds(order_id, fresh):
                 prices.append(row.get("take_profit_price"))
         for row in getattr(self, "_hold_rows", None) or []:
             body = checkpoint_master(row.get("checkpoint"))
             for level in (body or {}).get("levels") or []:
                 close = (level or {}).get("close_order") or {}
-                if str(close.get("order_id") or "") in own:
+                close_id = str(close.get("order_id") or "")
+                if close_id in own:
                     continue
-                if close.get("price") not in (None, ""):
+                if close.get("price") not in (None, "") and self._text_holds(close_id, fresh):
                     prices.append(close.get("price"))
-                if level.get("take_profit_price") not in (None, "") and str((level.get("open_order") or {}).get("order_id") or "") not in own:
+                slot_id = str((level.get("open_order") or {}).get("order_id") or "")
+                if (
+                    level.get("take_profit_price") not in (None, "")
+                    and slot_id not in own
+                    and self._take_holds(slot_id, fresh)
+                ):
                     prices.append(level.get("take_profit_price"))
             for hold in (body or {}).get("holds") or []:
                 if str(hold.get("order_id") or "") in own:
                     continue
                 if order_is_unsent(str(hold.get("order_id") or "")):
                     continue
-                if hold.get("price") not in (None, ""):
+                if hold.get("price") not in (None, "") and self._text_holds(hold.get("order_id"), fresh):
                     prices.append(str(hold.get("price")))
         for price in prices:
             same = _same_tick(price, quant, tick)
@@ -9162,11 +9208,13 @@ class ExecutorService:
             if price in (None, ""):
                 return True
             # Правило номера: чужой текст с номером не держит; голая цена и наш
-            # живой номер — держат.
-            if not self._text_holds(text, fresh):
+            # живой номер (журнал, чекпоинт, трекер) — держат.
+            if not self._text_holds(text, fresh, tracker_texts):
                 return False
             same = _same_tick(price, quant, tick)
             return same is None or same is True
+
+        tracker_texts = set(inflight) | set(lost)
 
         for raw in fresh.get("opens") or []:
             if occupied(raw.get("price"), str(raw.get("text") or "")):
@@ -9283,7 +9331,7 @@ class ExecutorService:
             self._drop_unsent_local(connector, order_id)
         if self._partial_tick_taken(connector, pair, quant, order_id, fresh, inflight, lost):
             return
-        if self._partial_foreign_booked(executor_id, connector, pair, quant, order_id):
+        if self._partial_foreign_booked(executor_id, connector, pair, quant, order_id, fresh):
             return
         if self._close_tick_taken(executor, quant, order_id) or self._unpriced_close_blocks(executor):
             return

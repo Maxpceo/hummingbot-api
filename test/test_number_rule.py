@@ -235,3 +235,105 @@ def test_buy_gate_follows_the_number_rule(monkeypatch, tmp_path):
     assert service._partial_refuses_open(EXECUTOR, executor, _level_stub("L2", "100"), "100", TICK) is True, (
         "свой номер уровня держит слот (не ставить вторую покупку в ту же цену)"
     )
+
+
+# ── 6. вердикт 20261013-151226-99598: тейк держит после фильтра, история нет ──
+
+
+def test_take_of_open_position_survives_the_block_filter(monkeypatch, tmp_path):
+    """Тейк исполненной покупки держит тик ДАЖЕ после `_prices_for_blocks` —
+    тем списком, которым `recorded_price_blocks` режет новую покупку."""
+    from utils.executor_checkpoint import recorded_price_blocks
+
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
+    fresh = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "price": "0.09487"}])
+    blocked = service._prices_for_blocks(service._ban_pairs(PAIR, fresh), fresh)
+    assert recorded_price_blocks(blocked, "0.10", TICK) is True, (
+        "тейк открытой позиции держит тик: вторая покупка на него не уходит"
+    )
+    assert recorded_price_blocks(blocked, "0.09487", TICK) is False, (
+        "цена самой исполненной покупки quant не держит"
+    )
+
+
+def test_cancelled_take_without_position_does_not_hold(monkeypatch, tmp_path):
+    """Отмена без позиции: ни цена, ни тейк строки quant не держат."""
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
+    fresh = _fresh(finished=[{"text": "buy-1", "finish_as": "cancelled", "price": "0.09487"}])
+    held = _held_prices(service._ban_pairs(PAIR, fresh))
+    assert "0.09487" not in held
+    assert "0.10" not in held, "тейк без открытой позиции quant не держит"
+
+
+def test_tracker_only_number_holds_the_quant(monkeypatch):
+    """Номер, который живёт только в трекере коннектора, — наш и держит quant."""
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
+    inflight = {"send-77": SimpleNamespace(price=Decimal("100"))}
+    fresh = _fresh(opens=[{"text": "send-77", "price": "100"}])
+    assert service._partial_tick_taken(connector, PAIR, "100", "sell-1", fresh, inflight, {}) is True, (
+        "номер из трекера на книге держит quant"
+    )
+    assert service._partial_tick_taken(connector, PAIR, "100", "sell-1", _fresh(), inflight, {}) is True, (
+        "сам трекер держит quant, пока finished не доказал номер"
+    )
+
+
+def test_filled_row_releases_the_price_on_the_sell_gate(monkeypatch, tmp_path):
+    """Продажные ворота: исполненную строку finished доказал — quant свободен."""
+    _journal(tmp_path, monkeypatch, [
+        _row("gone-1", level_id="L2", role="close", price="0.09487", sent=True),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
+    assert service._partial_foreign_booked(EXECUTOR, connector, PAIR, "0.09487", "sell-1", _fresh()) is True, (
+        "недоказанная запись держит quant"
+    )
+    proven = _fresh(finished=[{"text": "gone-1", "finish_as": "filled", "price": "0.09487"}])
+    assert service._partial_foreign_booked(EXECUTOR, connector, PAIR, "0.09487", "sell-1", proven) is False, (
+        "finished доказал строку — quant свободен"
+    )
+
+
+# ── 7. вердикт 20261013-151226-99598: сверка до чеканки в fill-down ──────────
+
+
+def test_one_sell_after_fill_down_does_not_mint_on_a_held_quant(monkeypatch, tmp_path):
+    """`_one_sell_after_fill_down` не чеканит второй номер, если quant держит
+    наш живой номер соседа; на свободном quant — чеканит."""
+    service, repo, connector, executor = _prepare(
+        monkeypatch, tmp_path,
+        _checkpoint(_level(level_id="L1", open_id="buy-1", filled=True, take="101")),
+        [_row("sell-n", level_id="L9", role="close", price="101", sent=True)],
+    )
+    monkeypatch.setattr(mod, "partial_take_profit_quant", lambda *args, **kwargs: "101")
+    monkeypatch.setattr(service, "_filled_down_open", lambda *args, **kwargs: "buy-1")
+    minted = []
+
+    async def fake_write(*args, **kwargs):
+        minted.append(args[5] if len(args) > 5 else kwargs.get("close_id"))
+        return True
+
+    monkeypatch.setattr(service, "_write_fill_down_close", fake_write)
+    level = SimpleNamespace(
+        id="L1", price=Decimal("100"), take_profit=Decimal("0.01"),
+        active_open_order=SimpleNamespace(order=SimpleNamespace(
+            executed_amount_base=Decimal("1"), price=Decimal("100"),
+        )),
+    )
+    before = _ledger_rows_count()
+
+    import asyncio
+
+    asyncio.run(service._one_sell_after_fill_down(EXECUTOR, executor, connector, level))
+    assert minted == [], "quant занят нашим живым номером — второй номер не чеканится"
+    assert _ledger_rows_count() == before
+    assert connector.created == []
+
+    service._remember_tick_fresh(PAIR, _fresh(finished=[{"text": "sell-n", "finish_as": "filled", "price": "101"}]))
+    asyncio.run(service._one_sell_after_fill_down(EXECUTOR, executor, connector, level))
+    assert len(minted) == 1, "quant свободен (finished доказал номер) — чеканка идёт"
