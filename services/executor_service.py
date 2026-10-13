@@ -2691,6 +2691,38 @@ class ExecutorService:
             return True
         return self._proven_dead_filled(name, fresh)
 
+    def _quant_held(
+        self, executor_id: str, executor: Any, connector: Any, pair: str, quant: Any, own_id: str,
+        fresh: Optional[Dict[str, Any]] = None, inflight: Any = None, lost: Any = None,
+    ) -> bool:
+        """Quant занят (правило номера) — ОДНА сверка для ворот отправки и для
+        чеканки/отправки закрытия: голая цена книги, номер трекера, тейк
+        открытой позиции и наш живой номер держат; чужой текст с номером и
+        доказанная история — нет (вердикт 20261013-192315-55275)."""
+        if fresh is None:
+            fresh = self._tick_fresh(pair or "")
+        fresh = fresh or {}
+        if inflight is None:
+            inflight = getattr(connector, "in_flight_orders", None) or {}
+        if lost is None:
+            lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
+        if self._partial_tick_taken(connector, pair, quant, own_id, fresh, inflight, lost):
+            return True
+        if self._partial_foreign_booked(executor_id, connector, pair, quant, own_id, fresh):
+            return True
+        if self._close_tick_taken(executor, quant, own_id):
+            return True
+        return self._ledger_close_price_taken(quant, own_id, fresh)
+
+    def _close_quant_held(self, executor_id: str, executor: Any, price: Any, own_id: Any = "") -> bool:
+        """Та же занятость для хука `_refuse_close_price` (чеканка закрытия)."""
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        return self._quant_held(
+            executor_id, executor, connector, pair, price, str(own_id or ""), self._tick_fresh(pair),
+        )
+
     def _pair_holds(self, order_id: Any, fresh: Optional[Dict[str, Any]]) -> bool:
         """Пара (номер, цена) держит quant: голая пара без номера — как голая
         цена; чужой текст — нет; отмена без позиции (finished, база ноль)
@@ -3562,11 +3594,9 @@ class ExecutorService:
             return
         if await self._refresh_stop_mark(executor_id):
             return
-        # Правило номера: quant занят нашим живым номером/записью или голой
-        # ценой — второй номер не чеканить (план number-rule, «По местам» п.5).
-        if self._close_tick_taken(executor, str(quant), buy_id) or self._partial_foreign_booked(
-            executor_id, connector, pair, str(quant), buy_id, fresh,
-        ):
+        # Правило номера: занятость — та же, что у ворот отправки (вердикт
+        # 20261013-192315-55275): quant занят — второй номер не чеканить.
+        if self._quant_held(executor_id, executor, connector, pair, str(quant), buy_id, fresh):
             return
         from hummingbot.connector.utils import get_new_client_order_id
         close_id = get_new_client_order_id(
@@ -8124,7 +8154,9 @@ class ExecutorService:
         executor._refuse_second_close = lambda level: bool(
             service._level_close_recorded(executor_id, level)
         )
-        executor._refuse_close_price = lambda price, own=None: service._close_tick_taken(executor, price, own)
+        executor._refuse_close_price = lambda price, own=None: service._close_quant_held(
+            executor_id, executor, price, own,
+        )
         executor._refuse_market_close = lambda: bool(
             service._occupied_close_prices(executor, include_opens=False)
         ) or service._unpriced_close_blocks(executor)
@@ -8155,19 +8187,23 @@ class ExecutorService:
 
     def _live_open_prices(self, executor: Any) -> list:
         """Живые цены книги и трекера, которые держат (правило номера): наш
-        живой номер и голая цена без номера. Чужой текст с номером — не держит."""
+        живой номер (включая номер только из трекера) и голая цена без номера.
+        Чужой текст с номером — не держит."""
         found = []
         connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
         connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
         pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
         fresh = self._tick_fresh(pair)
+        tracker_texts = set(getattr(connector, "in_flight_orders", None) or {}) | set(
+            getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
+        )
         for text, order in (getattr(connector, "in_flight_orders", None) or {}).items():
             price = getattr(order, "price", None)
-            if price not in (None, "") and self._text_holds(text, fresh):
+            if price not in (None, "") and self._text_holds(text, fresh, tracker_texts):
                 found.append(price)
         for raw in getattr(connector, "opens", None) or []:
             if isinstance(raw, dict) and raw.get("price") not in (None, ""):
-                if self._text_holds(raw.get("text") or raw.get("order_id"), fresh):
+                if self._text_holds(raw.get("text") or raw.get("order_id"), fresh, tracker_texts):
                     found.append(raw.get("price"))
         return found
 
@@ -9329,13 +9365,9 @@ class ExecutorService:
             if partial_find_text(fresh.get("finished"), order_id) is not None:
                 return
             self._drop_unsent_local(connector, order_id)
-        if self._partial_tick_taken(connector, pair, quant, order_id, fresh, inflight, lost):
+        if self._quant_held(executor_id, executor, connector, pair, quant, order_id, fresh, inflight, lost):
             return
-        if self._partial_foreign_booked(executor_id, connector, pair, quant, order_id, fresh):
-            return
-        if self._close_tick_taken(executor, quant, order_id) or self._unpriced_close_blocks(executor):
-            return
-        if self._ledger_close_price_taken(quant, order_id, fresh):
+        if self._unpriced_close_blocks(executor):
             return
         reserves = self.__dict__.setdefault("_quant_reserves", {})
         connector_key = str(id(connector))

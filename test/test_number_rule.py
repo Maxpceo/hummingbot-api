@@ -170,6 +170,7 @@ def _prepare(monkeypatch, tmp_path, checkpoint, journal_lines):
     recorded = []
     executor = _stub_executor(connector, recorded)
     executor._strategy = SimpleNamespace(connectors={"gate_io": connector})
+    connector.trading_rules = {PAIR: SimpleNamespace(min_price_increment=TICK)}
     service._active_executors[EXECUTOR] = executor
     service._remember_tick_fresh(PAIR, _fresh())
     service._install_partial_guards(EXECUTOR, executor)
@@ -337,3 +338,72 @@ def test_one_sell_after_fill_down_does_not_mint_on_a_held_quant(monkeypatch, tmp
     service._remember_tick_fresh(PAIR, _fresh(finished=[{"text": "sell-n", "finish_as": "filled", "price": "101"}]))
     asyncio.run(service._one_sell_after_fill_down(EXECUTOR, executor, connector, level))
     assert len(minted) == 1, "quant свободен (finished доказал номер) — чеканка идёт"
+
+
+# ── 8. вердикт 20261013-192315-55275: чеканка держится занятостью ворот ──────
+
+
+def test_place_level_close_refuses_on_tracker_and_bare_book(monkeypatch, tmp_path):
+    """`place_level_close` не чеканит и не шлёт, если quant держит номер трекера
+    или голая цена книги — та же занятость, что у ворот отправки."""
+    service, repo, connector, executor = _prepare(
+        monkeypatch, tmp_path, _checkpoint(_level(level_id="L1", open_id="buy-1", filled=True, take="101")), [],
+    )
+    connector.in_flight_orders["send-77"] = SimpleNamespace(price=Decimal("100"))
+    assert executor._refuse_close_price(Decimal("100")) is True
+    before = _ledger_rows_count()
+    assert ledger_mod.place_level_close(executor, EXECUTOR, _level_stub("L1", "100")) is None
+    assert _ledger_rows_count() == before, "чеканки не было"
+    assert connector.created == []
+    connector.in_flight_orders.clear()
+    connector.opens = [{"price": "100"}]
+    assert executor._refuse_close_price(Decimal("100")) is True, "голая цена книги без номера держит quant"
+    assert ledger_mod.place_level_close(executor, EXECUTOR, _level_stub("L1", "100")) is None
+    assert _ledger_rows_count() == before
+
+
+def test_place_level_close_refuses_on_the_take_of_an_open_position(monkeypatch, tmp_path):
+    """Соседний `place_level_close` не чеканит продажу на тик тейка открытой
+    позиции (вердикт: close_tick ложь при тейке 0.10 — худшее место чеканки)."""
+    service, repo, connector, executor = _prepare(
+        monkeypatch, tmp_path,
+        _checkpoint(_level(level_id="L2", take="0.10")),
+        [_row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True)],
+    )
+    service._remember_tick_fresh(
+        PAIR, _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "price": "0.09487"}]),
+    )
+    assert executor._refuse_close_price(Decimal("0.10")) is True, "тейк открытой позиции держит quant"
+    before = _ledger_rows_count()
+    assert ledger_mod.place_level_close(executor, EXECUTOR, _level_stub("L2", "0.10")) is None
+    assert _ledger_rows_count() == before, "вторая продажа на тик тейка не чеканится"
+    assert connector.created == []
+
+
+def test_fill_down_does_not_mint_on_a_tracker_number(monkeypatch, tmp_path):
+    """`_one_sell_after_fill_down` не чеканит второй номер, когда quant держит
+    номер только из трекера коннектора."""
+    service, repo, connector, executor = _prepare(
+        monkeypatch, tmp_path, _checkpoint(_level(level_id="L1", open_id="buy-1", filled=True, take="101")), [],
+    )
+    monkeypatch.setattr(mod, "partial_take_profit_quant", lambda *args, **kwargs: "101")
+    monkeypatch.setattr(service, "_filled_down_open", lambda *args, **kwargs: "buy-1")
+    minted = []
+
+    async def fake_write(*args, **kwargs):
+        minted.append(True)
+        return True
+
+    monkeypatch.setattr(service, "_write_fill_down_close", fake_write)
+    level = SimpleNamespace(
+        id="L1", price=Decimal("100"), take_profit=Decimal("0.01"),
+        active_open_order=SimpleNamespace(order=SimpleNamespace(
+            executed_amount_base=Decimal("1"), price=Decimal("100"),
+        )),
+    )
+    connector.in_flight_orders["send-77"] = SimpleNamespace(price=Decimal("101"))
+
+    import asyncio
+
+    asyncio.run(service._one_sell_after_fill_down(EXECUTOR, executor, connector, level))
+    assert minted == [], "quant занят номером трекера — чеканки нет"
