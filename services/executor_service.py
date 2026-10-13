@@ -3383,6 +3383,9 @@ class ExecutorService:
     ) -> bool:
         """One compare-and-write. A failed write does not mean the id was kept."""
         def mutate(body: Dict[str, Any]) -> None:
+            # Гонка CAS: метка в прочитанном теле — запись не меняется (п.2).
+            if stop_mark_visible(body):
+                raise RuntimeError("stop mark")
             levels = body.setdefault("levels", [])
             target = None
             for level in levels:
@@ -8346,16 +8349,28 @@ class ExecutorService:
                 parsed = parse_checkpoint(stored)
                 if not visible(parsed):
                     return False
-            # Публикация записи — только после возврата коммита сессии
-            # (план stop-freeze п.1): до коммита метку не видит никто, и отмены
-            # не уходят раньше закрепления.
-            async with self.db_manager.get_session_context() as session:
-                rows = await ExecutorRepository(session).get_checkpoint_rows()
-            self._set_hold_rows(rows)
+            # Публикация — СИНХРОННО из уже прочитанного тела, после возврата
+            # коммита и до всякого следующего await (план stop-freeze п.1):
+            # упавшая следующая сессия не выглядит как «не закоммичено» и не
+            # открывает `_create_order`.
+            self._publish_committed_body(executor_id, body)
             return True
         except Exception:
             logger.exception("partial compare-and-swap was not committed")
             return False
+
+    def _publish_committed_body(self, executor_id: str, body: str) -> None:
+        """Закоммиченное тело — в запись и RAM без ожиданий (план stop-freeze п.1)."""
+        rows = [dict(row) for row in getattr(self, "_hold_rows", None) or []]
+        for row in rows:
+            if row.get("executor_id") == executor_id:
+                row["checkpoint"] = body
+                break
+        else:
+            rows.append({"executor_id": executor_id, "checkpoint": body})
+        self._set_hold_rows(rows)
+        if stop_mark_visible(parse_checkpoint(body)):
+            self.__dict__.setdefault("_stop_mark_ram", {})[str(executor_id)] = True
 
     async def _partial_copy_five_before_start(self, executor_id: str, checkpoint: Optional[Dict[str, Any]], config: Dict[str, Any]) -> None:
         rows = self._partial_rows()

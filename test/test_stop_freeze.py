@@ -457,6 +457,66 @@ def test_failed_commit_publishes_no_mark_and_sends_no_cancels(tmp_path, monkeypa
     assert asyncio.run(service._refresh_stop_mark(EXECUTOR)) is False
 
 
+def test_commit_returned_holds_freeze_when_the_next_session_fails(tmp_path, monkeypatch):
+    """Коммит вернулся, вторая сессия упала — заморозка держится (проба 11)."""
+    from contextlib import asynccontextmanager
+    connector = _Connector()
+    service, repo, _ = _service_with(
+        monkeypatch, _checkpoint(_level(open_id="buy-1", filled=True, close_id="sell-1")),
+        connector=connector, journal_lines=[], tmp_path=tmp_path,
+    )
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    service._active_executors[EXECUTOR] = executor
+    calls = {"n": 0}
+
+    @asynccontextmanager
+    async def third_fails():
+        calls["n"] += 1
+        try:
+            yield SimpleNamespace()
+        finally:
+            if calls["n"] >= 3:
+                raise RuntimeError("session failed")
+
+    service.db_manager = SimpleNamespace(get_session_context=lambda: third_fails())
+
+    import asyncio
+
+    async def call():
+        return await service.stop_executor(EXECUTOR)
+
+    answer = asyncio.run(call())
+    # Ответ честный: стоп принят, отмены и доставка пошли от опубликованного тела.
+    assert answer["status"] == "stopping"
+    assert stop_mark_visible(_stored(repo))
+    assert service._stop_mark_now(EXECUTOR) is True
+    assert recorded == ["early_stop"]
+    assert connector.cancelled == ["buy-1", "sell-1"]
+
+    # Упавшая перечитка не открывает отправку: гейт видит опубликованное тело.
+    asyncio.run(
+        service._partial_send_committed(EXECUTOR, executor, connector, PAIR, "sell-2", "L1", "101", Decimal("1"))
+    )
+    assert connector.created == []
+
+
+def test_fill_down_writer_refuses_a_marked_body(monkeypatch):
+    """Дверь постановки не пишет close_order с level_id на теле с меткой."""
+    text = _marked(_checkpoint(_level(open_id="buy-1", filled=True)))
+    service, repo, connector = _service_with(monkeypatch, text)
+    recorded = []
+    executor = _stub_executor(connector, recorded)
+    service._active_executors[EXECUTOR] = executor
+    before = _stored(repo)
+
+    import asyncio
+    assert asyncio.run(
+        service._write_fill_down_close(EXECUTOR, "L2", "buy-2", Decimal("100"), Decimal("1"), "sell-2", "101")
+    ) is False
+    assert _stored(repo) == before
+
+
 def test_unreadable_confirmation_after_cas_still_freezes_and_delivers(tmp_path, monkeypatch):
     """CAS прошёл, новая сессия вернула None, RAM холодный — заморозка держится.
 
@@ -486,8 +546,7 @@ def test_unreadable_confirmation_after_cas_still_freezes_and_delivers(tmp_path, 
     answer = asyncio.run(call())
     assert answer["status"] == "stopping"
     assert stop_mark_visible(_stored(repo))
-    # RAM холодный, а заморозка держится из перечитанной записи.
-    assert (service.__dict__.get("_stop_mark_ram") or {}).get(EXECUTOR) is not True
+    # Закоммиченное тело опубликовано синхронно: заморозка держится без перечитки.
     assert service._stop_mark_now(EXECUTOR) is True
     # Доставка отмен по нашим номерам пошла, несмотря на непрочитанную перечитку.
     assert recorded == ["early_stop"]
