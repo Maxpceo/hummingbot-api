@@ -9307,15 +9307,18 @@ class ExecutorService:
             return
         await self._partial_send_committed(executor_id, executor, connector, pair, text, level_id, str(quant), amount)
 
-    def _buy_row_for_level(self, executor_id: str, level_id: str) -> Optional[Dict[str, Any]]:
+    def _buy_row_for_level(
+        self, executor_id: str, level_id: str, rows: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Строка покупки, к которой относится чеканка закрытия: слот уровня, иначе
-        поздняя покупка этого исполнителя в журнале."""
+        поздняя покупка этого исполнителя в журнале. None журнала сюда не передавать."""
         slot_id = ""
         for level in (self._partial_parsed(executor_id) or {}).get("levels") or []:
             if str(level.get("id") or "") == str(level_id):
                 slot_id = str((level.get("open_order") or {}).get("order_id") or "")
                 break
-        rows = self._partial_rows() or []
+        if rows is None:
+            rows = []
         if slot_id:
             for row in rows:
                 if str(row.get("order_id") or "") == slot_id:
@@ -9338,10 +9341,15 @@ class ExecutorService:
                 latest_ts = ts
         return latest
 
-    def _sell_of_this_buy(self, executor_id: str, level_id: str) -> str:
+    def _sell_of_this_buy(
+        self, executor_id: str, level_id: str, rows: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         """Продажа этой покупки в журнале: тот же исполнитель, не старше покупки.
-        Продажа прошлого круга и чужого исполнителя номер этой покупки не занимает."""
-        buy = self._buy_row_for_level(executor_id, level_id)
+        Продажа прошлого круга и чужого исполнителя номер этой покупки не занимает.
+        Журнал передаёт вызывающий: None здесь не значит «прочитано и пусто»."""
+        if rows is None:
+            return ""
+        buy = self._buy_row_for_level(executor_id, level_id, rows)
         if not isinstance(buy, dict):
             return ""
         owner = str(buy.get("executor_id") or "")
@@ -9350,7 +9358,7 @@ class ExecutorService:
             return ""
         found = ""
         found_ts = None
-        for row in self._partial_rows() or []:
+        for row in rows:
             if str(row.get("level_id") or "") != str(level_id):
                 continue
             if str(row.get("executor_id") or "") != owner:
@@ -9404,14 +9412,15 @@ class ExecutorService:
             return None
         if await self._refresh_stop_mark(executor_id):
             return None
-        # Непрочитанный журнал — не «продажи нет»: стоять, новый не чеканить.
-        if self._partial_rows() is None:
+        # Один прочитанный журнал. None — не «продажи нет»: стоять, новый не чеканить.
+        rows = self._partial_rows()
+        if rows is None:
             return None
         # Номер этой покупки уже в журнале — новый не чеканить. Продажа прошлого
         # круга слот не занимает. Живая книга, непрочитанные списки и исполненная
         # продажа, покрывшая покупку, — стоять. Снятая, покупку не покрывшая, —
         # тот же номер в пустой слот.
-        own = self._sell_of_this_buy(executor_id, level_id)
+        own = self._sell_of_this_buy(executor_id, level_id, rows)
         fresh = self._tick_fresh(pair)
         if own:
             if not self._lists_ready(fresh) or self._id_still_live(fresh, connector, own):
@@ -9678,8 +9687,12 @@ class ExecutorService:
             return
         if partial_text_in(fresh.get("opens"), order_id):
             return
-        # Досылка снятого номера этой покупки: старая строка не повод чеканить замену.
-        if self._sell_of_this_buy(executor_id, level_id) == str(order_id):
+        # Досылка снятого номера: непрочитанный журнал и старая строка того же
+        # номера не повод чеканить замену. None не схлопывать в пустой список.
+        rows = self._partial_rows()
+        if rows is None:
+            return
+        if self._sell_of_this_buy(executor_id, level_id, rows) == str(order_id):
             return
         filled = partial_raw_base(row) or Decimal("0")
         before = self._partial_parsed(executor_id)

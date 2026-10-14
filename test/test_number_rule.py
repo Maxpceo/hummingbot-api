@@ -682,6 +682,81 @@ def test_partial_commit_stands_when_the_journal_is_unread(monkeypatch, tmp_path)
     assert slot is None
 
 
+def test_unread_journal_on_the_reject_does_not_mint_a_replacement(monkeypatch, tmp_path):
+    """Отказ досылки при непрочитанном журнале не чеканит замену в слот."""
+    import asyncio
+
+    level = _level(level_id="L1", open_id="buy-1", close_id="sell-1", take="0.10", filled=True)
+    level["partial_bought"] = "1"
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True, ts=10),
+        _row("sell-1", level_id="L1", role="close", price="0.10", sent=True, ts=20),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    cancelled = _fresh(finished=[{
+        "text": "sell-1", "finish_as": "cancelled", "price": "0.10", "amount": "1", "left": "1",
+    }])
+    minted = []
+    written = {}
+
+    async def no_stop(executor_id):
+        return False
+
+    async def same_lists(*args, **kwargs):
+        return cancelled
+
+    async def fake_cas(executor_id, mutate, visible, target_id=None):
+        import json
+        body = json.loads(service._hold_rows[0]["checkpoint"])
+        mutate(body)
+        written["body"] = body
+        return True
+
+    def no_mint(*args, **kwargs):
+        minted.append("new")
+        return "new"
+
+    import hummingbot.connector.utils as connector_utils
+
+    monkeypatch.setattr(service, "_refresh_stop_mark", no_stop)
+    monkeypatch.setattr(service, "_fresh_raw_lists", same_lists)
+    monkeypatch.setattr(service, "_partial_rows", lambda: None)
+    monkeypatch.setattr(service, "_partial_cas", fake_cas)
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", no_mint)
+    asyncio.run(service._partial_reject(
+        EXECUTOR, None, connector, PAIR, "sell-1", "L1", "0.10", Decimal("1"), RuntimeError("rejected"),
+    ))
+    assert minted == []
+    assert written == {}, "непрочитанный журнал слот не переписывает"
+
+
+def test_commit_does_not_mint_when_the_second_journal_read_fails(monkeypatch, tmp_path):
+    """Второй провал чтения в той же чеканке не значит «продажи нет»."""
+    level = _level(level_id="L1", open_id="buy-1", close_id="", take="0.10", filled=True)
+    level["partial_bought"] = "1"
+    lines = [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True, ts=10),
+        _row("sell-1", level_id="L1", role="close", price="0.10", sent=True, ts=20),
+    ]
+    _journal(tmp_path, monkeypatch, lines)
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    service._remember_tick_fresh(PAIR, _fresh())
+    calls = {"n": 0}
+    real = service._partial_rows
+
+    def once_then_unread():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real()
+        return None
+
+    monkeypatch.setattr(service, "_partial_rows", once_then_unread)
+    minted, result, slot = _commit_close(monkeypatch, service, connector)
+    assert minted == []
+    assert result == "sell-1"
+    assert (slot or {}).get("order_id") == "sell-1"
+
+
 def test_partial_commit_rewrites_a_cancelled_sell_that_did_not_cover(monkeypatch, tmp_path):
     """Снятая продажа, покупку не покрывшая, возвращается в пустой слот тем же номером."""
     level = _level(level_id="L1", open_id="buy-1", close_id="", take="0.10", filled=True)
