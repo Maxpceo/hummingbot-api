@@ -294,3 +294,33 @@ def test_two_journal_lines_of_one_partial_sell_do_not_cover(monkeypatch, tmp_pat
         {"text": "flat-1", "finish_as": "filled", "amount": "4", "left": "0"},
     ])
     assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("6")
+
+
+def test_missing_shutdown_sell_is_sent_again_as_the_same_number(monkeypatch, tmp_path):
+    """Номер гашения есть в журнале, но его нет ни на книге, ни в finished.
+    Шлём тот же номер, второй не чеканим."""
+    level = _level(level_id="L1", open_id="buy-1", filled=True)
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", sent=True, ts=10),
+        _row("flat-1", level_id="", role="market_close", sent=True, ts=20),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    fresh = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "9", "left": "0"}])
+    service._remember_tick_fresh(PAIR, fresh)
+    executor, sold = _arm(monkeypatch, service, connector, None)
+    minted = []
+
+    def mint(*args, **kwargs):
+        minted.append("new")
+        return "new"
+
+    import hummingbot.connector.utils as connector_utils
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+    monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
+    assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("9")
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert minted == []
+    assert sold and sold[0][1] == Decimal("9")
+    assert getattr(executor, "_shutdown_close_id", None) == "flat-1"
+    assert service._shutdown_close_proven(EXECUTOR) is False

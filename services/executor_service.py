@@ -5704,6 +5704,15 @@ class ExecutorService:
                 return str(row.get("order_id"))
         return held
 
+    def _shutdown_sell_missing(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Номера нет ни на книге, ни в finished. Это не смерть и не покрытие."""
+        if not self._lists_ready(fresh):
+            return False
+        text = str(order_id or "")
+        if not text or partial_text_in((fresh or {}).get("opens"), text):
+            return False
+        return self._finished_row(text, fresh) is None
+
     def _shutdown_remainder(self, executor_id: str, fresh: Optional[Dict[str, Any]]) -> Optional[Decimal]:
         """Остаток сетки по своим номерам. Не доказан — None, продажу не слать."""
         rows = self._partial_rows()
@@ -5729,6 +5738,8 @@ class ExecutorService:
             if not sell and not buy:
                 return None
             finished = self._finished_row(name, fresh)
+            if sell and role == "market_close" and self._shutdown_sell_missing(name, fresh):
+                continue
             if sell and not self._proven_dead(name, fresh):
                 return None
             if buy and (finished is None or not self._closed_row_filled(finished)):
