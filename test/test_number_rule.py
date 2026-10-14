@@ -663,3 +663,141 @@ def test_partial_commit_mints_when_only_an_older_sell_is_in_the_journal(monkeypa
     assert result == "sell-new"
     assert (slot or {}).get("order_id") == "sell-new"
     assert (slot or {}).get("order_id") != "sell-1"
+
+
+def test_partial_commit_stands_when_the_journal_is_unread(monkeypatch, tmp_path):
+    """Непрочитанный журнал — не «продажи нет»: чеканки нет, слот пуст."""
+    level = _level(level_id="L1", open_id="buy-1", close_id="", take="0.10", filled=True)
+    level["partial_bought"] = "1"
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True, ts=10),
+        _row("sell-1", level_id="L1", role="close", price="0.10", sent=True, ts=20),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    service._remember_tick_fresh(PAIR, _fresh())
+    monkeypatch.setattr(service, "_partial_rows", lambda: None)
+    minted, result, slot = _commit_close(monkeypatch, service, connector)
+    assert minted == []
+    assert result is None
+    assert slot is None
+
+
+def test_partial_commit_rewrites_a_cancelled_sell_that_did_not_cover(monkeypatch, tmp_path):
+    """Снятая продажа, покупку не покрывшая, возвращается в пустой слот тем же номером."""
+    level = _level(level_id="L1", open_id="buy-1", close_id="", take="0.10", filled=True)
+    level["partial_bought"] = "1"
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True, ts=10),
+        _row("sell-1", level_id="L1", role="close", price="0.10", sent=True, ts=20),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    service._remember_tick_fresh(PAIR, _fresh(finished=[{
+        "text": "sell-1", "finish_as": "cancelled", "price": "0.10", "amount": "1", "left": "1",
+    }]))
+    minted, result, slot = _commit_close(monkeypatch, service, connector)
+    assert minted == []
+    assert result == "sell-1"
+    assert (slot or {}).get("order_id") == "sell-1"
+
+
+def test_filled_cover_does_not_send_and_a_cancel_resend_does(monkeypatch, tmp_path):
+    """Покрывшая продажа не уходит на биржу. Снятая досылается тем же номером,
+    и ошибка отправки замену не чеканит."""
+    import asyncio
+
+    created = []
+
+    async def create_order(**kwargs):
+        created.append(kwargs.get("order_id"))
+
+    async def no_stop(executor_id):
+        return False
+
+    def test_level(close_id=""):
+        level = _level(level_id="L1", open_id="buy-1", close_id=close_id, take="0.10", filled=True)
+        level["partial_bought"] = "1"
+        level["price"] = "0.09487"
+        level["side"] = "BUY"
+        level["open_order"]["order"] = {"executed_amount_base": "1"}
+        return level
+
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True, ts=10),
+        _row("sell-1", level_id="L1", role="close", price="0.10", sent=True, ts=20),
+    ])
+    covered = _fresh(finished=[
+        {"text": "buy-1", "state": "filled", "finish_as": "filled", "fill_size": "1", "price": "0.09487", "amount": "1", "left": "0"},
+        {"text": "sell-1", "finish_as": "filled", "price": "0.10", "amount": "1", "left": "0"},
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(test_level()))
+    service._remember_tick_fresh(PAIR, covered)
+    monkeypatch.setattr(service, "_refresh_stop_mark", no_stop)
+    monkeypatch.setattr(service, "_okx_window_open", lambda *args, **kwargs: True)
+    monkeypatch.setattr(mod, "partial_take_profit_quant", lambda *args, **kwargs: "0.10")
+    monkeypatch.setattr(service, "_amount_from_contracts", lambda *args, **kwargs: Decimal("1"))
+    connector._create_order = create_order
+    executor = _stub_executor(connector, [])
+    asyncio.run(service._partial_filled_okx_buy(
+        EXECUTOR, executor, connector, PAIR, "buy-1", "L1", 10, covered,
+    ))
+    assert created == [], "покрывшая продажа на биржу не уходит"
+
+    cancelled = _fresh(finished=[
+        {"text": "buy-1", "state": "filled", "finish_as": "filled", "fill_size": "1", "price": "0.09487", "amount": "1", "left": "0"},
+        {"text": "sell-1", "finish_as": "cancelled", "price": "0.10", "amount": "1", "left": "1"},
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(test_level()))
+    service._remember_tick_fresh(PAIR, cancelled)
+    written = {}
+
+    async def fake_cas(executor_id, mutate, visible, target_id=None):
+        import json
+        body = json.loads(service._hold_rows[0]["checkpoint"])
+        mutate(body)
+        written["body"] = body
+        service._hold_rows[0]["checkpoint"] = json.dumps(body)
+        return True
+
+    async def same_lists(*args, **kwargs):
+        return cancelled
+
+    monkeypatch.setattr(service, "_refresh_stop_mark", no_stop)
+    monkeypatch.setattr(service, "_okx_window_open", lambda *args, **kwargs: True)
+    monkeypatch.setattr(service, "_partial_cas", fake_cas)
+    monkeypatch.setattr(service, "_fresh_raw_lists", same_lists)
+    monkeypatch.setattr(mod, "partial_take_profit_quant", lambda *args, **kwargs: "0.10")
+    monkeypatch.setattr(service, "_amount_from_contracts", lambda *args, **kwargs: Decimal("1"))
+    async def place_order(*args, **kwargs):
+        return None
+
+    connector._create_order = create_order
+    connector._place_order = place_order
+    created.clear()
+    asyncio.run(service._partial_filled_okx_buy(
+        EXECUTOR, executor, connector, PAIR, "buy-1", "L1", 10, cancelled,
+    ))
+    assert created == ["sell-1"], "снятая досылается тем же номером"
+    slot = ((written.get("body") or {}).get("levels") or [{}])[0].get("close_order") or {}
+    assert slot.get("order_id") == "sell-1"
+
+    async def boom(**kwargs):
+        raise RuntimeError("rejected")
+
+    connector._create_order = boom
+    minted = []
+
+    def no_mint(*args, **kwargs):
+        minted.append(True)
+        return "sell-new"
+
+    import hummingbot.connector.utils as connector_utils
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", no_mint)
+
+    async def same_lists(*args, **kwargs):
+        return cancelled
+
+    monkeypatch.setattr(service, "_fresh_raw_lists", same_lists)
+    asyncio.run(service._partial_filled_okx_buy(
+        EXECUTOR, executor, connector, PAIR, "buy-1", "L1", 10, cancelled,
+    ))
+    assert minted == [], "ошибка досылки снятого номера замену не чеканит"

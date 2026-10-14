@@ -8837,7 +8837,13 @@ class ExecutorService:
         if text and (
             not fresh.get("finished_read")
             or not fresh.get("finished_done")
-            or partial_find_text(fresh.get("finished"), text) is not None
+            or (
+                partial_find_text(fresh.get("finished"), text) is not None
+                and not self._cancelled_uncovered_sell(
+                    executor_id, str(level.get("id") or level_id),
+                    self._finished_row(text, fresh),
+                )
+            )
         ):
             return True
         if not text:
@@ -9362,6 +9368,28 @@ class ExecutorService:
                 found_ts = sell_ts
         return found
 
+    def _cancelled_uncovered_sell(
+        self, executor_id: str, level_id: str, row: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Снятая продажа этой покупки, база которой покупку не покрыла.
+        Исполненная и покрывшая — не она."""
+        if not isinstance(row, dict):
+            return False
+        finish = str(row.get("finish_as") or "").lower()
+        state = str(row.get("state") or "").lower()
+        if finish != "cancelled" and state not in ("canceled", "cancelled", "mmp_canceled"):
+            return False
+        if finish == "filled" or state == "filled":
+            return False
+        bought = None
+        for level in (self._partial_parsed(executor_id) or {}).get("levels") or []:
+            if str(level.get("id") or "") == str(level_id):
+                bought = partial_decimal(level.get("partial_bought"))
+                break
+        if bought is None or bought <= 0:
+            return False
+        return self._shutdown_sold_base(row) < bought
+
     async def _partial_commit_close(
         self,
         executor_id: str,
@@ -9376,13 +9404,20 @@ class ExecutorService:
             return None
         if await self._refresh_stop_mark(executor_id):
             return None
-        # П.6 и редакция 6: номер этой покупки уже в журнале — новый не чеканить.
-        # Продажа прошлого круга слот не занимает. Уже на книге или списки не
-        # прочитаны — стоять, в слот другой номер не писать.
+        # Непрочитанный журнал — не «продажи нет»: стоять, новый не чеканить.
+        if self._partial_rows() is None:
+            return None
+        # Номер этой покупки уже в журнале — новый не чеканить. Продажа прошлого
+        # круга слот не занимает. Живая книга, непрочитанные списки и исполненная
+        # продажа, покрывшая покупку, — стоять. Снятая, покупку не покрывшая, —
+        # тот же номер в пустой слот.
         own = self._sell_of_this_buy(executor_id, level_id)
+        fresh = self._tick_fresh(pair)
         if own:
-            seen = self._close_text_seen(self._tick_fresh(pair), connector, own)
-            if seen is None or seen is True:
+            if not self._lists_ready(fresh) or self._id_still_live(fresh, connector, own):
+                return None
+            finished = self._finished_row(own, fresh)
+            if finished is not None and not self._cancelled_uncovered_sell(executor_id, level_id, finished):
                 return None
             order_id = own
         else:
@@ -9575,7 +9610,10 @@ class ExecutorService:
         reserves[key] = order_id
         self._chain_place_once(connector, reached)
         passed_ts = journal_ts if given_ts else None
-        if given_ts and self._okx_close_blocks(fresh, order_id, passed_ts, explicit=True):
+        resend = self._cancelled_uncovered_sell(
+            executor_id, level_id, self._finished_row(order_id, fresh),
+        )
+        if given_ts and not resend and self._okx_close_blocks(fresh, order_id, passed_ts, explicit=True):
             if reserves.get(key) == order_id:
                 reserves.pop(key, None)
             return
@@ -9639,6 +9677,9 @@ class ExecutorService:
         if row is None or row.get("finish_as") != "cancelled":
             return
         if partial_text_in(fresh.get("opens"), order_id):
+            return
+        # Досылка снятого номера этой покупки: старая строка не повод чеканить замену.
+        if self._sell_of_this_buy(executor_id, level_id) == str(order_id):
             return
         filled = partial_raw_base(row) or Decimal("0")
         before = self._partial_parsed(executor_id)
