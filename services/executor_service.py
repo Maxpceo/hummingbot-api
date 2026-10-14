@@ -5704,6 +5704,30 @@ class ExecutorService:
                 return str(row.get("order_id"))
         return held
 
+    def _shutdown_close_ids(self, executor_id: str) -> Optional[List[str]]:
+        """Все записанные номера продажи гашения: журнал по порядку, потом holds.
+
+        Непрочитанный журнал — None, не пустой список: пустой список значит «номеров нет»,
+        и чеканка следующего была бы законна.
+        """
+        rows = self._partial_rows()
+        if rows is None:
+            return None
+        found: List[str] = []
+        for row in rows:
+            if str(row.get("executor_id") or "") != str(executor_id):
+                continue
+            if str(row.get("role") or "") == "market_close" and row.get("order_id"):
+                name = str(row.get("order_id"))
+                if name not in found:
+                    found.append(name)
+        for hold in (self._partial_parsed(executor_id) or {}).get("holds") or []:
+            if isinstance(hold, dict) and hold.get("role") == "market_close" and hold.get("order_id"):
+                name = str(hold.get("order_id"))
+                if name not in found:
+                    found.append(name)
+        return found
+
     def _shutdown_sell_missing(self, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
         """Номера нет ни на книге, ни в finished. Это не смерть и не покрытие."""
         if not self._lists_ready(fresh):
@@ -5800,20 +5824,25 @@ class ExecutorService:
         remainder = self._shutdown_remainder(executor_id, fresh)
         if remainder is None or remainder <= 0:
             return
-        recorded = self._recorded_market_close(executor_id)
-        pending = getattr(executor, "_shutdown_close_id", None)
-        if recorded is None and not pending:
+        recorded_ids = self._shutdown_close_ids(executor_id)
+        if recorded_ids is None:
             return
+        known = list(recorded_ids)
+        pending = getattr(executor, "_shutdown_close_id", None)
+        if pending and str(pending) not in known:
+            known.append(str(pending))
 
         def dead(text: str) -> bool:
             return bool(text) and self._finished_row(text, fresh) is not None
 
         order_id = ""
-        if pending and not dead(pending):
-            order_id = pending
-        elif recorded and not dead(recorded):
-            order_id = recorded
-        if not order_id:
+        unfinished = [text for text in known if not dead(text)]
+        if unfinished:
+            for text in unfinished:
+                if self._id_still_live(fresh, connector, text):
+                    return
+            order_id = unfinished[0]
+        else:
             from hummingbot.connector.utils import get_new_client_order_id
             order_id = get_new_client_order_id(
                 is_buy=False,

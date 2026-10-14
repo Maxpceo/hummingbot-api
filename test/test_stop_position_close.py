@@ -393,3 +393,63 @@ def test_finished_partial_close_mints_the_next_number_once(monkeypatch, tmp_path
     assert minted == ["flat-2"]
     assert sold and sold[0][1] == Decimal("6")
     assert getattr(executor, "_shutdown_close_id", None) == "flat-2"
+
+
+def _two_shutdown_numbers(tmp_path, monkeypatch):
+    """Память пустая: первый номер гашения закрыт частью, второй записан, но не в finished."""
+    level = _level(level_id="L1", open_id="buy-1", filled=True)
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", sent=True, ts=10),
+        _row("flat-1", level_id="", role="market_close", sent=True, ts=20),
+        _row("flat-2", level_id="", role="market_close", sent=True, ts=30),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    fresh = _fresh(finished=[
+        {"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"},
+        {"text": "flat-1", "finish_as": "filled", "amount": "4", "left": "0"},
+    ])
+    service._remember_tick_fresh(PAIR, fresh)
+    executor, sold = _arm(monkeypatch, service, connector, None)
+    return service, connector, executor, sold, fresh
+
+
+def test_restart_resends_the_unfinished_shutdown_number(monkeypatch, tmp_path):
+    """Новый объект исполнителя после перезапуска: памяти нет, а второй номер
+    уже в журнале и не в finished. Третьего номера нет, уходит тот же второй."""
+    service, connector, executor, sold, fresh = _two_shutdown_numbers(tmp_path, monkeypatch)
+    minted = []
+
+    def mint(*args, **kwargs):
+        minted.append("flat-3")
+        return "flat-3"
+
+    import hummingbot.connector.utils as connector_utils
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+    monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
+    assert getattr(executor, "_shutdown_close_id", None) in (None, "")
+    assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("6")
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert minted == []
+    assert sold and sold[0][1] == Decimal("6")
+    assert getattr(executor, "_shutdown_close_id", None) == "flat-2"
+
+
+def test_restart_with_a_live_unfinished_number_is_silent(monkeypatch, tmp_path):
+    """Тот же журнал, но второй номер ещё в полёте. Тишина: ни продажи, ни чеканки."""
+    service, connector, executor, sold, fresh = _two_shutdown_numbers(tmp_path, monkeypatch)
+    connector.in_flight_orders = {"flat-2": object()}
+    minted = []
+
+    def mint(*args, **kwargs):
+        minted.append("flat-3")
+        return "flat-3"
+
+    import hummingbot.connector.utils as connector_utils
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+    monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
+    assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("6")
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert minted == []
+    assert sold == []
