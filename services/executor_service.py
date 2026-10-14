@@ -5762,6 +5762,13 @@ class ExecutorService:
             if not sell and not buy:
                 return None
             finished = self._finished_row(name, fresh)
+            if self._exchange_gone_end(executor_id, name):
+                if partial_text_in((fresh or {}).get("opens"), name):
+                    return None
+                if sell and (finished is None or not self._closed_row_filled(finished)):
+                    return None
+                if buy and (finished is None or not self._closed_row_filled(finished)):
+                    continue
             if sell and role == "market_close" and self._shutdown_sell_missing(name, fresh):
                 continue
             if sell and not self._proven_dead(name, fresh):
@@ -6402,7 +6409,7 @@ class ExecutorService:
             out.append(text)
         return out
 
-    async def _stop_deliver_cancel(self, executor: Any, connector: Any, text: str, pair: str) -> bool:
+    async def _stop_deliver_cancel(self, executor: Any, connector: Any, text: str, pair: str, executor_id: str = "") -> bool:
         """Доставка отмены по нашему номеру до биржи (план stop-freeze п.3).
 
         Номер в трекере — штатный путь (`strategy.cancel` → `_api_delete`); наш
@@ -6434,11 +6441,52 @@ class ExecutorService:
             if asyncio.iscoroutine(result):
                 result = await result
             return result is True
-        except Exception:
+        except Exception as exc:
+            if self._exchange_says_gone(exc) and await self._remember_exchange_gone(executor_id, text, pair):
+                return True
             logger.exception("stop cancel delivery failed for %s", text)
             return False
         finally:
             _cancel_delivery_id.reset(token)
+
+    def _exchange_says_gone(self, exc: BaseException) -> bool:
+        """Биржа назвала этот номер снятым, исполненным или несуществующим.
+
+        Только код 51400. Отказ часов и прочая ошибка сюда не входят.
+        """
+        blob = " ".join([str(exc), *[str(item) for item in (getattr(exc, "args", ()) or ())]])
+        if "50102" in blob or "50113" in blob:
+            return False
+        return "'sCode': '51400'" in blob or '"sCode": "51400"' in blob
+
+    def _exchange_gone_end(self, executor_id: str, order_id: str) -> bool:
+        mark = ((self._partial_parsed(executor_id) or {}).get("partial_ends") or {}).get(str(order_id)) or {}
+        return isinstance(mark, dict) and mark.get("kind") == "gone" and mark.get("exchange") == "51400"
+
+    async def _remember_exchange_gone(self, executor_id: str, order_id: str, pair: str) -> bool:
+        """Конец номера до того, как отмену перестанем повторять. Запись не прошла — не отпускать."""
+        text = str(order_id or "")
+        if not executor_id or not text:
+            return False
+        fresh = self._tick_fresh(pair or "")
+        if self._lists_ready(fresh) and partial_text_in((fresh or {}).get("opens"), text):
+            return False
+        if self._exchange_gone_end(executor_id, text):
+            return True
+
+        def mutate(body: Dict[str, Any]) -> None:
+            ends = dict(body.get("partial_ends") or {})
+            current = ends.get(text) or {}
+            if isinstance(current, dict) and current.get("kind") == "gone":
+                return
+            ends[text] = {"kind": "gone", "order_ids": [text], "exchange": "51400"}
+            body["partial_ends"] = ends
+
+        def visible(parsed: Optional[Dict[str, Any]]) -> bool:
+            mark = ((parsed or {}).get("partial_ends") or {}).get(text) or {}
+            return isinstance(mark, dict) and mark.get("kind") == "gone" and mark.get("exchange") == "51400" and "price" not in mark
+
+        return await self._partial_cas(executor_id, mutate, visible)
 
     async def _stop_deliver_cancels(self, executor_id: str, executor: Any, connector: Any, pair: str = "") -> None:
         """Доводка заморозки: доставка отмены по каждому нашему номеру.
@@ -6464,7 +6512,7 @@ class ExecutorService:
             executor_id, interval=300.0, label="silent stop exit:", key=executor_id,
         )
         for text in pending:
-            await self._stop_deliver_cancel(executor, connector, text, pair or "")
+            await self._stop_deliver_cancel(executor, connector, text, pair or "", executor_id)
 
     async def _handle_executor_completion(self, executor_id: str):
         """Handle cleanup when an executor completes."""

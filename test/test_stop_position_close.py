@@ -458,3 +458,67 @@ def test_restart_with_a_live_unfinished_number_is_silent(monkeypatch, tmp_path):
     asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
     assert minted == []
     assert sold == []
+
+
+def _gone_error(code="51400"):
+    return OSError(
+        "Error cancelling order buy-2: "
+        + str({"code": "1", "data": [{"clOrdId": "buy-2", "sCode": code, "sMsg": "gone"}]})
+    )
+
+
+def test_exchange_gone_stops_the_cancel_and_a_clock_error_does_not(monkeypatch, tmp_path):
+    """51400 пишет конец и больше не шлёт отмену. 50102 конец не пишет."""
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-2", level_id="L1", role="open", sent=True, ts=10),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level(level_id="L1", open_id="buy-2")))
+    fresh = _fresh()
+    service._remember_tick_fresh(PAIR, fresh)
+    executor, _sold = _arm(monkeypatch, service, connector, None)
+    calls = []
+
+    async def place_cancel(order_id, row):
+        calls.append(str(order_id))
+        raise _gone_error()
+
+    connector._place_cancel = place_cancel
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "buy-2", PAIR, EXECUTOR)) is True
+    assert service._exchange_gone_end(EXECUTOR, "buy-2") is True
+    assert "buy-2" not in service._stop_unfinished_ids(EXECUTOR, fresh)
+    calls.clear()
+    service.__dict__.setdefault("_stop_finish_last", {})[EXECUTOR] = 0.0
+    asyncio.run(service._stop_deliver_cancels(EXECUTOR, executor, connector, PAIR))
+    assert calls == []
+
+    async def clock_cancel(order_id, row):
+        raise _gone_error("50102")
+
+    connector._place_cancel = clock_cancel
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "buy-3", PAIR, EXECUTOR)) is False
+    assert service._exchange_gone_end(EXECUTOR, "buy-3") is False
+
+
+def test_exchange_gone_buy_does_not_freeze_and_a_gone_sell_has_no_size(monkeypatch, tmp_path):
+    """Снятая покупка остаток не держит. Продажа без размера остаток не открывает."""
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", sent=True, ts=10),
+        _row("buy-2", level_id="L2", role="open", sent=True, ts=11),
+    ])
+    body = json.loads(_checkpoint(_level(level_id="L1", open_id="buy-1", filled=True)))
+    body["partial_ends"] = {"buy-2": {"kind": "gone", "order_ids": ["buy-2"], "exchange": "51400"}}
+    service, repo, connector = _service_with(monkeypatch, json.dumps(body))
+    fresh = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"}])
+    assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("10")
+
+    body["partial_ends"]["sell-9"] = {"kind": "gone", "order_ids": ["sell-9"], "exchange": "51400"}
+    service._hold_rows[0]["checkpoint"] = json.dumps(body)
+    from utils.executor_checkpoint import reset_ledger_process_state
+    ledger = tmp_path / "bots" / "data" / "order-ledger.jsonl"
+    ledger.write_text("".join(json.dumps(line) + "\n" for line in [
+        _row("buy-1", level_id="L1", role="open", sent=True, ts=10),
+        _row("buy-2", level_id="L2", role="open", sent=True, ts=11),
+        _row("sell-9", level_id="L1", role="close", sent=True, ts=12),
+    ]), encoding="utf-8")
+    reset_ledger_process_state()
+    assert service._shutdown_remainder(EXECUTOR, fresh) is None
