@@ -499,8 +499,9 @@ def test_exchange_gone_stops_the_cancel_and_a_clock_error_does_not(monkeypatch, 
     assert service._exchange_gone_end(EXECUTOR, "buy-3") is False
 
 
-def test_exchange_gone_buy_does_not_freeze_and_a_gone_sell_has_no_size(monkeypatch, tmp_path):
-    """Снятая покупка остаток не держит. Продажа без размера остаток не открывает."""
+def test_exchange_gone_buy_without_finished_does_not_prove_the_remainder(monkeypatch, tmp_path):
+    """Покупка с концом 51400 и без finished остаток не доказывает.
+    finished с исполнением входит в остаток. Снятие с нулём не морозит."""
     _journal(tmp_path, monkeypatch, [
         _row("buy-1", level_id="L1", role="open", sent=True, ts=10),
         _row("buy-2", level_id="L2", role="open", sent=True, ts=11),
@@ -509,7 +510,17 @@ def test_exchange_gone_buy_does_not_freeze_and_a_gone_sell_has_no_size(monkeypat
     body["partial_ends"] = {"buy-2": {"kind": "gone", "order_ids": ["buy-2"], "exchange": "51400"}}
     service, repo, connector = _service_with(monkeypatch, json.dumps(body))
     fresh = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"}])
-    assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("10")
+    service._remember_tick_fresh(PAIR, fresh)
+    executor, sold = _arm(monkeypatch, service, connector, None)
+    assert service._shutdown_remainder(EXECUTOR, fresh) is None
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert sold == []
+
+    filled = _fresh(finished=[
+        {"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"},
+        {"text": "buy-2", "finish_as": "filled", "amount": "10", "left": "0"},
+    ])
+    assert service._shutdown_remainder(EXECUTOR, filled) == Decimal("20")
 
     body["partial_ends"]["sell-9"] = {"kind": "gone", "order_ids": ["sell-9"], "exchange": "51400"}
     service._hold_rows[0]["checkpoint"] = json.dumps(body)
@@ -517,8 +528,32 @@ def test_exchange_gone_buy_does_not_freeze_and_a_gone_sell_has_no_size(monkeypat
     ledger = tmp_path / "bots" / "data" / "order-ledger.jsonl"
     ledger.write_text("".join(json.dumps(line) + "\n" for line in [
         _row("buy-1", level_id="L1", role="open", sent=True, ts=10),
-        _row("buy-2", level_id="L2", role="open", sent=True, ts=11),
         _row("sell-9", level_id="L1", role="close", sent=True, ts=12),
     ]), encoding="utf-8")
     reset_ledger_process_state()
-    assert service._shutdown_remainder(EXECUTOR, fresh) is None
+    cancelled = _fresh(finished=[
+        {"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"},
+        {"text": "sell-9", "status": "closed", "finish_as": "cancelled", "amount": "4", "left": "4"},
+    ])
+    assert service._shutdown_remainder(EXECUTOR, cancelled) == Decimal("10")
+    unproven = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"}])
+    assert service._shutdown_remainder(EXECUTOR, unproven) is None
+
+
+def test_unread_book_does_not_write_the_gone_end(monkeypatch, tmp_path):
+    """Книга этого тика не прочитана — конец не писать и отмену не считать доставленной."""
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-2", level_id="L1", role="open", sent=True, ts=10),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level(level_id="L1", open_id="buy-2")))
+    unread = _fresh()
+    unread["opens_read"] = False
+    service._remember_tick_fresh(PAIR, unread)
+    executor, _sold = _arm(monkeypatch, service, connector, None)
+
+    async def place_cancel(order_id, row):
+        raise _gone_error()
+
+    connector._place_cancel = place_cancel
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "buy-2", PAIR, EXECUTOR)) is False
+    assert service._exchange_gone_end(EXECUTOR, "buy-2") is False

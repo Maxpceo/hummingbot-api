@@ -5763,12 +5763,14 @@ class ExecutorService:
                 return None
             finished = self._finished_row(name, fresh)
             if self._exchange_gone_end(executor_id, name):
-                if partial_text_in((fresh or {}).get("opens"), name):
+                if partial_text_in((fresh or {}).get("opens"), name) or finished is None:
                     return None
-                if sell and (finished is None or not self._closed_row_filled(finished)):
-                    return None
-                if buy and (finished is None or not self._closed_row_filled(finished)):
+                if self._closed_row_filled(finished):
+                    pass
+                elif str(finished.get("finish_as") or "").lower() == "cancelled" and gate_base_is_zero(finished):
                     continue
+                else:
+                    return None
             if sell and role == "market_close" and self._shutdown_sell_missing(name, fresh):
                 continue
             if sell and not self._proven_dead(name, fresh):
@@ -6469,7 +6471,7 @@ class ExecutorService:
         if not executor_id or not text:
             return False
         fresh = self._tick_fresh(pair or "")
-        if self._lists_ready(fresh) and partial_text_in((fresh or {}).get("opens"), text):
+        if not self._lists_ready(fresh) or partial_text_in((fresh or {}).get("opens"), text):
             return False
         if self._exchange_gone_end(executor_id, text):
             return True
