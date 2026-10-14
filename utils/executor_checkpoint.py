@@ -4113,7 +4113,11 @@ def install_connector_close_channel(connector: Any) -> None:
                 # до buy/sell этот разрыв не закрывает (план stop-freeze п.2).
                 if frozen is not None:
                     try:
-                        if await frozen():
+                        try:
+                            held = frozen(reserved)
+                        except TypeError:
+                            held = frozen()
+                        if await held if hasattr(held, "__await__") else held:
                             logger.info(
                                 "close channel held the send under the stop mark id=…%s",
                                 str(reserved)[-8:],
@@ -4250,14 +4254,22 @@ def _mint_close_id(executor: Any, is_buy: bool) -> Optional[str]:
 
 def place_market_close(executor: Any, executor_id: str) -> Optional[str]:
     """One market flatten. Original place_order is not called."""
-    refuse_market = getattr(executor, "_refuse_market_close", None)
-    if refuse_market is not None and refuse_market():
+    seated = getattr(executor, "_shutdown_close_id", None)
+    shutdown = bool(seated) and bool(getattr(executor, "_shutdown_close_seated", False))
+    if seated and not shutdown:
         return None
-    refuse_bare = getattr(executor, "_refuse_unpriced_close", None)
-    if refuse_bare is not None and refuse_bare():
-        return None
-    order_id = getattr(executor, "_next_close_id", None) or _mint_close_id(executor, is_buy=False)
+    if not shutdown:
+        refuse_market = getattr(executor, "_refuse_market_close", None)
+        if refuse_market is not None and refuse_market():
+            return None
+        refuse_bare = getattr(executor, "_refuse_unpriced_close", None)
+        if refuse_bare is not None and refuse_bare():
+            return None
+    order_id = seated or getattr(executor, "_next_close_id", None) or _mint_close_id(executor, is_buy=False)
     if not order_id:
+        return None
+    amount = getattr(executor, "_shutdown_close_amount", None) if seated else 1
+    if seated and (amount is None or amount <= 0):
         return None
     quiet = line_for_send(executor_id, order_id, "market_close", sent=False)
     if not append_durable_row(quiet):
@@ -4270,7 +4282,7 @@ def place_market_close(executor: Any, executor_id: str) -> Optional[str]:
         market = _executor_connector(executor)
         if market is not None:
             install_connector_close_channel(market)
-            market.sell(executor.config.trading_pair, 1, None, None)
+            market.sell(executor.config.trading_pair, amount, None, None)
     finally:
         _RESERVED_CLOSE_ID.reset(token)
         _CLOSE_FROZEN_CHECK.reset(frozen_token)

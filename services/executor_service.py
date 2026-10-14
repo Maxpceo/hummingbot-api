@@ -3670,6 +3670,8 @@ class ExecutorService:
         """Stock asked for the close. Record the id, then send that id once."""
         if await self._refresh_stop_mark(executor_id):
             return
+        if self._recorded_market_close(executor_id):
+            return
         level_id = str(getattr(level, "id", "") or "")
         buy_id = self._filled_down_open(executor_id, executor, level)
         if not level_id or not buy_id or connector is None:
@@ -5684,6 +5686,105 @@ class ExecutorService:
             return
         ends[text] = {"kind": "flat", "order_ids": [text]}
 
+    def _recorded_market_close(self, executor_id: str) -> str:
+        """Номер продажи гашения: журнал или hold чекпоинта. Непрочитанный журнал — пусто, не «номера нет» для чеканки."""
+        rows = self._partial_rows()
+        if rows is None:
+            return ""
+        for row in rows:
+            if str(row.get("executor_id") or "") != str(executor_id):
+                continue
+            if str(row.get("role") or "") == "market_close" and row.get("order_id"):
+                return str(row.get("order_id"))
+        for hold in (self._partial_parsed(executor_id) or {}).get("holds") or []:
+            if isinstance(hold, dict) and hold.get("role") == "market_close" and hold.get("order_id"):
+                return str(hold.get("order_id"))
+        return ""
+
+    def _shutdown_remainder(self, executor_id: str, fresh: Optional[Dict[str, Any]]) -> Optional[Decimal]:
+        """Остаток сетки по своим номерам. Не доказан — None, продажу не слать."""
+        rows = self._partial_rows()
+        if rows is None or not self._lists_ready(fresh):
+            return None
+        bought = Decimal("0")
+        sold = Decimal("0")
+        for row in rows:
+            if str(row.get("executor_id") or "") != str(executor_id):
+                continue
+            role = str(row.get("role") or "")
+            name = str(row.get("order_id") or "")
+            if not name or role not in ("open", "close", "market_close"):
+                continue
+            finished = self._finished_row(name, fresh)
+            if role == "open" and (finished is None or not self._closed_row_filled(finished)):
+                if finished is None or str(finished.get("finish_as") or "").lower() != "cancelled":
+                    return None
+                continue
+            if finished is None or not self._closed_row_filled(finished):
+                continue
+            base = self._shutdown_sold_base(finished)
+            if role == "open":
+                bought += base
+            else:
+                sold += base
+        if bought <= 0 or sold >= bought:
+            return Decimal("0")
+        return bought - sold
+
+    async def _seat_market_close(self, executor_id: str, order_id: str) -> bool:
+        """Номер гашения в чекпоинт до продажи. Метку не снимает."""
+        def mutate(body: Dict[str, Any]) -> None:
+            holds = list(body.get("holds") or [])
+            for item in holds:
+                if isinstance(item, dict) and str(item.get("order_id") or "") == order_id:
+                    return
+            holds.append({"order_id": order_id, "role": "market_close"})
+            body["holds"] = holds
+
+        def visible(parsed: Optional[Dict[str, Any]]) -> bool:
+            for item in (parsed or {}).get("holds") or []:
+                if isinstance(item, dict) and str(item.get("order_id") or "") == order_id and item.get("role") == "market_close":
+                    return True
+            return False
+
+        return await self._partial_cas(executor_id, mutate, visible)
+
+    async def _send_shutdown_close(
+        self, executor_id: str, executor: Any, connector: Any, pair: str, fresh: Optional[Dict[str, Any]],
+    ) -> None:
+        """Одна продажа доказанного остатка. Запись не прошла — продажу не звать."""
+        if connector is None or self._partial_rows() is None or not self._lists_ready(fresh):
+            return
+        remainder = self._shutdown_remainder(executor_id, fresh)
+        if remainder is None or remainder <= 0:
+            return
+        order_id = self._recorded_market_close(executor_id)
+        minted = False
+        if not order_id:
+            from hummingbot.connector.utils import get_new_client_order_id
+            order_id = get_new_client_order_id(
+                is_buy=False,
+                trading_pair=pair,
+                hbot_order_id_prefix=getattr(connector, "client_order_id_prefix", ""),
+                max_id_len=getattr(connector, "client_order_id_max_length", 32),
+            )
+            minted = True
+        if not order_id:
+            return
+        if self._id_still_live(fresh, connector, order_id):
+            return
+        if not await self._seat_market_close(executor_id, order_id):
+            return
+        from utils.executor_checkpoint import place_market_close
+        executor._shutdown_close_id = order_id
+        executor._shutdown_close_amount = remainder
+        executor._shutdown_close_seated = True
+        if minted:
+            executor._next_close_id = None
+        sent = place_market_close(executor, executor_id)
+        if sent and getattr(executor, "_close_order", None) is not None:
+            return
+
     async def _shutdown_release_step(self, executor_id: str, executor: Any) -> None:
         """Сборка концов гашения: снимает только доказанно мёртвые следы.
 
@@ -5717,6 +5818,7 @@ class ExecutorService:
             inflight = {}
         if not isinstance(lost, dict):
             lost = {}
+        await self._send_shutdown_close(executor_id, executor, connector, pair, fresh)
 
         def proven_dead(order_id: str) -> bool:
             text = str(order_id or "")
@@ -8285,8 +8387,16 @@ class ExecutorService:
         ) or service._unpriced_close_blocks(executor)
         executor._refuse_unpriced_close = lambda: service._unpriced_close_blocks(executor)
 
-        async def _refuse_frozen_close() -> bool:
-            """Свежая перечитка метки для задачи канала закрытия перед _create_order."""
+        async def _refuse_frozen_close(order_id=None) -> bool:
+            """Метка держит новую заявку. Уже зафиксированный номер гашения — одна продажа."""
+            allowed = getattr(executor, "_shutdown_close_id", None)
+            if (
+                order_id
+                and allowed
+                and str(order_id) == str(allowed)
+                and getattr(executor, "_shutdown_close_seated", False)
+            ):
+                return False
             return await service._refresh_stop_mark(executor_id)
 
         executor._refuse_frozen_close = _refuse_frozen_close
