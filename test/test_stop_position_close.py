@@ -339,6 +339,9 @@ def test_shutdown_sell_reaches_create_as_a_market_order(monkeypatch, tmp_path):
     created = []
 
     async def create_order(**kwargs):
+        action = kwargs.get("position_action")
+        if getattr(action, "name", None) != "CLOSE":
+            raise ValueError(f"Invalid position action {action}")
         created.append(kwargs)
 
     async def place_order(*args, **kwargs):
@@ -363,6 +366,8 @@ def test_shutdown_sell_reaches_create_as_a_market_order(monkeypatch, tmp_path):
     assert created[0]["amount"] == Decimal("6")
     assert created[0]["order_type"].name == "MARKET"
     assert created[0]["trade_type"].name == "SELL"
+    assert created[0]["position_action"].name == "CLOSE"
+    assert executor._close_order.is_done is False
 
 
 def test_finished_partial_close_mints_the_next_number_once(monkeypatch, tmp_path):

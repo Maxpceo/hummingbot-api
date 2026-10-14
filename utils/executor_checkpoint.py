@@ -4100,14 +4100,20 @@ def install_connector_close_channel(connector: Any) -> None:
             frozen = _CLOSE_FROZEN_CHECK.get()
             order_type = args[2] if len(args) > 2 else kwargs.get("order_type")
             trade_type = "BUY" if name == "buy" else "SELL"
+            position_action = kwargs.get("position_action")
             try:
-                from hummingbot.core.data_type.common import OrderType, TradeType
+                from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
                 trade_type = TradeType.BUY if name == "buy" else TradeType.SELL
                 market = getattr(OrderType, "MARKET", None)
                 if order_type is None and market is not None:
                     order_type = market
+                if position_action is None:
+                    position_action = PositionAction.CLOSE
             except Exception:
                 logger.exception("close channel could not name the order")
+            if position_action is None or getattr(position_action, "name", "") == "NIL":
+                logger.warning("close channel refused an unnamed position action id=…%s", str(reserved)[-8:])
+                return reserved
             fields = {
                 "trade_type": trade_type,
                 "order_id": reserved,
@@ -4115,6 +4121,7 @@ def install_connector_close_channel(connector: Any) -> None:
                 "amount": args[1] if len(args) > 1 else kwargs.get("amount"),
                 "order_type": order_type,
                 "price": args[3] if len(args) > 3 else kwargs.get("price"),
+                "position_action": position_action,
             }
 
             async def queued_create():
@@ -4297,10 +4304,15 @@ def place_market_close(executor: Any, executor_id: str) -> Optional[str]:
         _RESERVED_CLOSE_ID.reset(token)
         _CLOSE_FROZEN_CHECK.reset(frozen_token)
     remember_hold(executor, order_id, role="market_close")
-    tracked = type("Tracked", (), {})()
-    tracked.order_id = order_id
-    tracked.order = None
-    executor._close_order = tracked
+    try:
+        from hummingbot.strategy_v2.models.executors import TrackedOrder
+        executor._close_order = TrackedOrder(order_id=order_id)
+    except Exception:
+        logger.exception("shutdown close could not use TrackedOrder")
+        tracked = type("Tracked", (), {"is_done": False, "executed_amount_base": Decimal("0")})()
+        tracked.order_id = order_id
+        tracked.order = None
+        executor._close_order = tracked
     return order_id
 
 
