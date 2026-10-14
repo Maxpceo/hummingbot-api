@@ -4365,10 +4365,7 @@ def install_close_without_level(executor: Any, executor_id: str, frozen: Any = N
             return False
         marked = False
         if frozen is not None:
-            try:
-                marked = frozen(place)
-            except TypeError:
-                marked = frozen()
+            marked = frozen()
         if marked:
             _brake_held(executor_id, place, "frozen: awaiting stage 2")
             return True

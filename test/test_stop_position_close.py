@@ -102,6 +102,46 @@ def test_failed_seat_does_not_sell(monkeypatch, tmp_path):
     assert sold == []
 
 
+def test_brake_reads_the_mark_without_passing_the_place(monkeypatch):
+    """Боевая лямбда принимает номер исполнителя. Имя места ей передавать нельзя."""
+    from utils.executor_checkpoint import install_close_without_level
+
+    seen = []
+
+    def mark_now(executor_id="grid-a"):
+        seen.append(executor_id)
+        return True
+
+    async def original_shutdown():
+        return "ran"
+
+    executor = SimpleNamespace(
+        _close_brake=False,
+        _close_seat_ready=True,
+        _close_list_ready=True,
+        _close_ban_ids=set(),
+        _column_close_ids=[],
+        _close_order=None,
+        _close_holds=[],
+        grid_levels=[],
+        get_close_orders_to_create=lambda: ["level-sell"],
+        control_close_order=lambda: None,
+        control_shutdown_process=original_shutdown,
+        _shutdown_close_proven=False,
+    )
+    assert install_close_without_level(executor, EXECUTOR, frozen=lambda eid=EXECUTOR: mark_now(eid))
+    assert executor.get_close_orders_to_create() == []
+    assert seen == [EXECUTOR]
+    executor._shutdown_close_proven = True
+    seen.clear()
+
+    async def run():
+        return await executor.control_shutdown_process()
+
+    assert asyncio.run(run()) == "ran"
+    assert seen == []
+
+
 def test_mark_lets_only_the_seated_close_through(monkeypatch, tmp_path):
     service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
     executor, sold = _arm(monkeypatch, service, connector, None)
