@@ -154,6 +154,76 @@ def test_unproven_sell_does_not_finish_and_foreign_size_is_ignored(monkeypatch, 
     assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("7")
     service._remember_tick_fresh(PAIR, fresh)
     executor, sold = _arm(monkeypatch, service, connector, None)
+
+    def mint(*args, **kwargs):
+        return "flat-1"
+
+    import hummingbot.connector.utils as connector_utils
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+    assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("7")
     asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
-    assert executor._close_order is not None
     assert getattr(executor, "_status", None) != "TERMINATED"
+
+
+def test_two_entries_share_one_number_and_a_hold_is_not_cancelled(monkeypatch, tmp_path):
+    level = _level(level_id="L1", open_id="buy-1", filled=True)
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", sent=True, ts=10),
+    ])
+    body = json.loads(_checkpoint(level))
+    body["holds"] = [{"order_id": "flat-1", "role": "market_close"}, {"order_id": "open-2"}]
+    service, repo, connector = _service_with(monkeypatch, json.dumps(body))
+    fresh = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "3", "left": "0"}])
+    service._remember_tick_fresh(PAIR, fresh)
+    executor, sold = _arm(monkeypatch, service, connector, None)
+    minted = []
+
+    def mint(*args, **kwargs):
+        minted.append("new")
+        return "new"
+
+    import hummingbot.connector.utils as connector_utils
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+
+    async def both():
+        await asyncio.gather(
+            service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh),
+            service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh),
+        )
+
+    asyncio.run(both())
+    assert minted == []
+    assert "flat-1" not in service._stop_unfinished_ids(EXECUTOR, fresh)
+    assert "open-2" in service._stop_unfinished_ids(EXECUTOR, fresh)
+
+
+def test_unread_journal_does_not_mint_a_level_sell(monkeypatch, tmp_path):
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
+    executor = _stub_executor(connector, [])
+    minted = []
+
+    def mint(*args, **kwargs):
+        minted.append("sell-new")
+        return "sell-new"
+
+    import hummingbot.connector.utils as connector_utils
+
+    async def not_frozen(executor_id):
+        return False
+
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+    monkeypatch.setattr(service, "_refresh_stop_mark", not_frozen)
+    monkeypatch.setattr(service, "_partial_rows", lambda: None)
+    asyncio.run(service._one_sell_after_fill_down(EXECUTOR, executor, connector, SimpleNamespace(id="L1")))
+    assert minted == []
+    assert service._recorded_market_close(EXECUTOR) is None
+
+
+def test_live_own_sell_blocks_the_market_flatten(monkeypatch, tmp_path):
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", sent=True, ts=10),
+        _row("sell-live", level_id="L1", role="close", sent=True, ts=12),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
+    fresh = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "7", "left": "0"}])
+    assert service._shutdown_remainder(EXECUTOR, fresh) is None

@@ -4361,7 +4361,15 @@ def install_close_without_level(executor: Any, executor_id: str, frozen: Any = N
 
     def hold(place: str) -> bool:
         """Заморозка держит путь гашения всегда; тормоз — как прежде."""
-        if frozen is not None and frozen():
+        if place == "control_shutdown" and getattr(executor, "_shutdown_close_proven", False):
+            return False
+        marked = False
+        if frozen is not None:
+            try:
+                marked = frozen(place)
+            except TypeError:
+                marked = frozen()
+        if marked:
             _brake_held(executor_id, place, "frozen: awaiting stage 2")
             return True
         if blocked():

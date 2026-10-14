@@ -3670,7 +3670,8 @@ class ExecutorService:
         """Stock asked for the close. Record the id, then send that id once."""
         if await self._refresh_stop_mark(executor_id):
             return
-        if self._recorded_market_close(executor_id):
+        recorded = self._recorded_market_close(executor_id)
+        if recorded is None or recorded:
             return
         level_id = str(getattr(level, "id", "") or "")
         buy_id = self._filled_down_open(executor_id, executor, level)
@@ -5688,18 +5689,20 @@ class ExecutorService:
 
     def _recorded_market_close(self, executor_id: str) -> str:
         """Номер продажи гашения: журнал или hold чекпоинта. Непрочитанный журнал — пусто, не «номера нет» для чеканки."""
+        held = ""
+        for hold in (self._partial_parsed(executor_id) or {}).get("holds") or []:
+            if isinstance(hold, dict) and hold.get("role") == "market_close" and hold.get("order_id"):
+                held = str(hold.get("order_id"))
+                break
         rows = self._partial_rows()
         if rows is None:
-            return ""
+            return held or None
         for row in rows:
             if str(row.get("executor_id") or "") != str(executor_id):
                 continue
             if str(row.get("role") or "") == "market_close" and row.get("order_id"):
                 return str(row.get("order_id"))
-        for hold in (self._partial_parsed(executor_id) or {}).get("holds") or []:
-            if isinstance(hold, dict) and hold.get("role") == "market_close" and hold.get("order_id"):
-                return str(hold.get("order_id"))
-        return ""
+        return held
 
     def _shutdown_remainder(self, executor_id: str, fresh: Optional[Dict[str, Any]]) -> Optional[Decimal]:
         """Остаток сетки по своим номерам. Не доказан — None, продажу не слать."""
@@ -5716,6 +5719,8 @@ class ExecutorService:
             if not name or role not in ("open", "close", "market_close"):
                 continue
             finished = self._finished_row(name, fresh)
+            if role in ("close", "market_close") and not self._proven_dead(name, fresh):
+                return None
             if role == "open" and (finished is None or not self._closed_row_filled(finished)):
                 if finished is None or str(finished.get("finish_as") or "").lower() != "cancelled":
                     return None
@@ -5730,6 +5735,18 @@ class ExecutorService:
         if bought <= 0 or sold >= bought:
             return Decimal("0")
         return bought - sold
+
+    def _shutdown_close_proven(self, executor_id: str) -> bool:
+        """Продажа остатка доказана finished. Непрочитанное — не доказательство."""
+        pair = ""
+        executor = (getattr(self, "_active_executors", None) or {}).get(executor_id)
+        if executor is not None:
+            pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        fresh = self._tick_fresh(pair)
+        if self._partial_rows() is None or not self._lists_ready(fresh):
+            return False
+        remainder = self._shutdown_remainder(executor_id, fresh)
+        return remainder == 0
 
     async def _seat_market_close(self, executor_id: str, order_id: str) -> bool:
         """Номер гашения в чекпоинт до продажи. Метку не снимает."""
@@ -5758,8 +5775,9 @@ class ExecutorService:
         remainder = self._shutdown_remainder(executor_id, fresh)
         if remainder is None or remainder <= 0:
             return
-        order_id = self._recorded_market_close(executor_id)
-        minted = False
+        order_id = getattr(executor, "_shutdown_close_id", None) or self._recorded_market_close(executor_id)
+        if order_id is None:
+            return
         if not order_id:
             from hummingbot.connector.utils import get_new_client_order_id
             order_id = get_new_client_order_id(
@@ -5768,9 +5786,10 @@ class ExecutorService:
                 hbot_order_id_prefix=getattr(connector, "client_order_id_prefix", ""),
                 max_id_len=getattr(connector, "client_order_id_max_length", 32),
             )
-            minted = True
-        if not order_id:
-            return
+            if not order_id:
+                return
+            executor._shutdown_close_id = order_id
+            executor._shutdown_close_seated = False
         if self._id_still_live(fresh, connector, order_id):
             return
         if not await self._seat_market_close(executor_id, order_id):
@@ -5779,8 +5798,6 @@ class ExecutorService:
         executor._shutdown_close_id = order_id
         executor._shutdown_close_amount = remainder
         executor._shutdown_close_seated = True
-        if minted:
-            executor._next_close_id = None
         sent = place_market_close(executor, executor_id)
         if sent and getattr(executor, "_close_order", None) is not None:
             return
@@ -6311,7 +6328,7 @@ class ExecutorService:
                 if isinstance(item, dict) and item.get("order_id"):
                     numbers.add(str(item.get("order_id")))
         for hold in (parsed or {}).get("holds") or []:
-            if isinstance(hold, dict) and hold.get("order_id"):
+            if isinstance(hold, dict) and hold.get("order_id") and hold.get("role") != "market_close":
                 numbers.add(str(hold.get("order_id")))
         out = []
         for text in sorted(numbers):
@@ -8118,6 +8135,12 @@ class ExecutorService:
                     # Доставка отмен не за готовностью списков и не за судьбой
                     # номеров (план stop-freeze п.3).
                     await service._stop_deliver_cancels(executor_id, executor, connector, pair or "")
+                    fresh_now = service._tick_fresh(pair or "")
+                    if service._lists_ready(fresh_now):
+                        await service._send_shutdown_close(
+                            executor_id, executor, connector, pair or "", fresh_now,
+                        )
+                        executor._shutdown_close_proven = service._shutdown_close_proven(executor_id)
                 fresh = service._tick_fresh(pair or "")
                 if not service._lists_ready(fresh):
                     if service._partial_forbids(executor_id):
