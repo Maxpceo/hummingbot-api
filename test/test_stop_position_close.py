@@ -127,11 +127,13 @@ def test_brake_reads_the_mark_without_passing_the_place(monkeypatch):
         get_close_orders_to_create=lambda: ["level-sell"],
         control_close_order=lambda: None,
         control_shutdown_process=original_shutdown,
+        stop=lambda: "stopped",
         _shutdown_close_proven=False,
     )
     assert install_close_without_level(executor, EXECUTOR, frozen=lambda eid=EXECUTOR: mark_now(eid))
     assert executor.get_close_orders_to_create() == []
-    assert seen == [EXECUTOR]
+    assert executor.stop() is None
+    assert seen == [EXECUTOR, EXECUTOR]
     executor._shutdown_close_proven = True
     seen.clear()
 
@@ -139,6 +141,7 @@ def test_brake_reads_the_mark_without_passing_the_place(monkeypatch):
         return await executor.control_shutdown_process()
 
     assert asyncio.run(run()) == "ran"
+    assert executor.stop() == "stopped"
     assert seen == []
 
 
@@ -267,3 +270,27 @@ def test_live_own_sell_blocks_the_market_flatten(monkeypatch, tmp_path):
     service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
     fresh = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "7", "left": "0"}])
     assert service._shutdown_remainder(EXECUTOR, fresh) is None
+
+
+def test_a_buy_without_role_is_the_remainder(monkeypatch, tmp_path):
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", sent=True, ts=10),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
+    fresh = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "8", "left": "0"}])
+    assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("8")
+    assert service._shutdown_close_proven(EXECUTOR) is False
+
+
+def test_two_journal_lines_of_one_partial_sell_do_not_cover(monkeypatch, tmp_path):
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", sent=True, ts=10),
+        _row("flat-1", level_id="", role="market_close", sent=False, ts=20),
+        _row("flat-1", level_id="", role="market_close", sent=True, ts=21),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
+    fresh = _fresh(finished=[
+        {"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"},
+        {"text": "flat-1", "finish_as": "filled", "amount": "4", "left": "0"},
+    ])
+    assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("6")

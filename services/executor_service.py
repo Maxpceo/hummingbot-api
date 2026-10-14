@@ -5709,30 +5709,44 @@ class ExecutorService:
         rows = self._partial_rows()
         if rows is None or not self._lists_ready(fresh):
             return None
-        bought = Decimal("0")
-        sold = Decimal("0")
+        by_id: Dict[str, str] = {}
         for row in rows:
             if str(row.get("executor_id") or "") != str(executor_id):
                 continue
-            role = str(row.get("role") or "")
             name = str(row.get("order_id") or "")
-            if not name or role not in ("open", "close", "market_close"):
+            if not name:
                 continue
-            finished = self._finished_row(name, fresh)
-            if role in ("close", "market_close") and not self._proven_dead(name, fresh):
+            role = str(row.get("role") or "")
+            if name not in by_id or role:
+                by_id[name] = role
+        if not by_id:
+            return Decimal("0")
+        bought = Decimal("0")
+        sold = Decimal("0")
+        for name, role in by_id.items():
+            sell = role in ("close", "market_close")
+            buy = role in ("", "open", "open_order")
+            if not sell and not buy:
                 return None
-            if role == "open" and (finished is None or not self._closed_row_filled(finished)):
+            finished = self._finished_row(name, fresh)
+            if sell and not self._proven_dead(name, fresh):
+                return None
+            if buy and (finished is None or not self._closed_row_filled(finished)):
                 if finished is None or str(finished.get("finish_as") or "").lower() != "cancelled":
                     return None
                 continue
             if finished is None or not self._closed_row_filled(finished):
                 continue
+            if partial_raw_base(finished) is None and partial_decimal(finished.get("fill_size")) is None:
+                return None
             base = self._shutdown_sold_base(finished)
-            if role == "open":
+            if buy:
                 bought += base
             else:
                 sold += base
-        if bought <= 0 or sold >= bought:
+        if bought <= 0:
+            return None
+        if sold >= bought:
             return Decimal("0")
         return bought - sold
 
@@ -5835,7 +5849,6 @@ class ExecutorService:
             inflight = {}
         if not isinstance(lost, dict):
             lost = {}
-        await self._send_shutdown_close(executor_id, executor, connector, pair, fresh)
 
         def proven_dead(order_id: str) -> bool:
             text = str(order_id or "")
