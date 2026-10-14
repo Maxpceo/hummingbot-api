@@ -4098,12 +4098,22 @@ def install_connector_close_channel(connector: Any) -> None:
             if create is None:
                 return reserved
             frozen = _CLOSE_FROZEN_CHECK.get()
+            order_type = args[2] if len(args) > 2 else kwargs.get("order_type")
+            trade_type = "BUY" if name == "buy" else "SELL"
+            try:
+                from hummingbot.core.data_type.common import OrderType, TradeType
+                trade_type = TradeType.BUY if name == "buy" else TradeType.SELL
+                market = getattr(OrderType, "MARKET", None)
+                if order_type is None and market is not None:
+                    order_type = market
+            except Exception:
+                logger.exception("close channel could not name the order")
             fields = {
-                "trade_type": "BUY" if name == "buy" else "SELL",
+                "trade_type": trade_type,
                 "order_id": reserved,
                 "trading_pair": args[0] if args else kwargs.get("trading_pair"),
                 "amount": args[1] if len(args) > 1 else kwargs.get("amount"),
-                "order_type": args[2] if len(args) > 2 else kwargs.get("order_type"),
+                "order_type": order_type,
                 "price": args[3] if len(args) > 3 else kwargs.get("price"),
             }
 

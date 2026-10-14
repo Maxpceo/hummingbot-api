@@ -5800,9 +5800,19 @@ class ExecutorService:
         remainder = self._shutdown_remainder(executor_id, fresh)
         if remainder is None or remainder <= 0:
             return
-        order_id = getattr(executor, "_shutdown_close_id", None) or self._recorded_market_close(executor_id)
-        if order_id is None:
+        recorded = self._recorded_market_close(executor_id)
+        pending = getattr(executor, "_shutdown_close_id", None)
+        if recorded is None and not pending:
             return
+
+        def dead(text: str) -> bool:
+            return bool(text) and self._finished_row(text, fresh) is not None
+
+        order_id = ""
+        if pending and not dead(pending):
+            order_id = pending
+        elif recorded and not dead(recorded):
+            order_id = recorded
         if not order_id:
             from hummingbot.connector.utils import get_new_client_order_id
             order_id = get_new_client_order_id(

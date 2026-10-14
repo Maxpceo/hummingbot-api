@@ -324,3 +324,72 @@ def test_missing_shutdown_sell_is_sent_again_as_the_same_number(monkeypatch, tmp
     assert sold and sold[0][1] == Decimal("9")
     assert getattr(executor, "_shutdown_close_id", None) == "flat-1"
     assert service._shutdown_close_proven(EXECUTOR) is False
+
+
+def test_shutdown_sell_reaches_create_as_a_market_order(monkeypatch, tmp_path):
+    """Канал не подменяем: в создание заявки уходят MARKET и сторона продажи."""
+    level = _level(level_id="L1", open_id="buy-1", filled=True)
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", sent=True, ts=10),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    fresh = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "6", "left": "0"}])
+    service._remember_tick_fresh(PAIR, fresh)
+    executor, sold = _arm(monkeypatch, service, connector, None)
+    created = []
+
+    async def create_order(**kwargs):
+        created.append(kwargs)
+
+    async def place_order(*args, **kwargs):
+        return None
+
+    connector._create_order = create_order
+    connector._place_order = place_order
+
+    def mint(*args, **kwargs):
+        return "flat-1"
+
+    import hummingbot.connector.utils as connector_utils
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+
+    async def go():
+        await service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh)
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert created
+    assert created[0]["order_id"] == "flat-1"
+    assert created[0]["amount"] == Decimal("6")
+    assert created[0]["order_type"].name == "MARKET"
+    assert created[0]["trade_type"].name == "SELL"
+
+
+def test_finished_partial_close_mints_the_next_number_once(monkeypatch, tmp_path):
+    level = _level(level_id="L1", open_id="buy-1", filled=True)
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", sent=True, ts=10),
+        _row("flat-1", level_id="", role="market_close", sent=True, ts=20),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    fresh = _fresh(finished=[
+        {"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"},
+        {"text": "flat-1", "finish_as": "filled", "amount": "4", "left": "0"},
+    ])
+    service._remember_tick_fresh(PAIR, fresh)
+    executor, sold = _arm(monkeypatch, service, connector, None)
+    minted = []
+
+    def mint(*args, **kwargs):
+        minted.append("flat-2")
+        return "flat-2"
+
+    import hummingbot.connector.utils as connector_utils
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+    monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert minted == ["flat-2"]
+    assert sold and sold[0][1] == Decimal("6")
+    assert getattr(executor, "_shutdown_close_id", None) == "flat-2"
