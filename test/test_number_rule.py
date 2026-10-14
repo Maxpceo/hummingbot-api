@@ -575,3 +575,91 @@ def test_other_executor_sell_does_not_release_our_take(monkeypatch, tmp_path):
     assert recorded_price_blocks(blocked, "0.10", TICK) is True, (
         "продажа другого исполнителя — тейк нашей открытой позиции держит"
     )
+
+
+# ── 12. редакция 6: частичный тик не чеканит второй номер продажи ─────────────
+
+
+def _commit_close(monkeypatch, service, connector, level_id="L1"):
+    """Вызов `_partial_commit_close` без базы: CAS пишет в переданное тело."""
+    import asyncio
+    import json
+
+    written = {}
+    minted = []
+
+    async def no_stop(executor_id):
+        return False
+
+    async def fake_cas(executor_id, mutate, visible, target_id=None):
+        body = json.loads(service._hold_rows[0]["checkpoint"])
+        mutate(body)
+        written["body"] = body
+        return True
+
+    def mint(*args, **kwargs):
+        minted.append("sell-new")
+        return "sell-new"
+
+    import hummingbot.connector.utils as connector_utils
+
+    monkeypatch.setattr(service, "_refresh_stop_mark", no_stop)
+    monkeypatch.setattr(service, "_partial_cas", fake_cas)
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+    result = asyncio.run(service._partial_commit_close(
+        EXECUTOR, None, connector, PAIR, level_id, "0.10", Decimal("1"),
+    ))
+    slot = ((written.get("body") or {}).get("levels") or [{}])[0].get("close_order")
+    return minted, result, slot
+
+
+def test_partial_commit_reuses_this_buy_sell_and_does_not_mint(monkeypatch, tmp_path):
+    """Слот пуст, в журнале продажа этой покупки, на книге её нет — пишем тот же
+    номер, новый не чеканится."""
+    level = _level(level_id="L1", open_id="buy-1", close_id="", take="0.10", filled=True)
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True, ts=10),
+        _row("sell-1", level_id="L1", role="close", price="0.10", sent=True, ts=20),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    service._remember_tick_fresh(PAIR, _fresh())
+    minted, result, slot = _commit_close(monkeypatch, service, connector)
+    assert minted == [], "номер этой покупки уже есть — второй не чеканится"
+    assert result == "sell-1"
+    assert (slot or {}).get("order_id") == "sell-1", "в пустой слот пишется тот же номер"
+
+
+def test_partial_commit_stands_when_this_buy_sell_is_already_on_the_book(monkeypatch, tmp_path):
+    """Продажа этой покупки уже в finished — стоим: ни нового номера, ни записи в слот."""
+    level = _level(level_id="L1", open_id="buy-1", close_id="", take="0.10", filled=True)
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True, ts=10),
+        _row("sell-1", level_id="L1", role="close", price="0.10", sent=True, ts=20),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    service._remember_tick_fresh(PAIR, _fresh(finished=[{
+        "text": "sell-1", "finish_as": "filled", "price": "0.10", "amount": "1", "left": "0",
+    }]))
+    minted, result, slot = _commit_close(monkeypatch, service, connector)
+    assert minted == []
+    assert result is None
+    assert slot is None, "уже на книге — в слот другой номер не пишется"
+
+
+def test_partial_commit_mints_when_only_an_older_sell_is_in_the_journal(monkeypatch, tmp_path):
+    """Продажа прошлого круга не занимает слот и не запрещает чеканку новой."""
+    level = _level(level_id="L1", open_id="buy-2", close_id="", take="0.10", filled=True)
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True, ts=10),
+        _row("sell-1", level_id="L1", role="close", price="0.10", sent=True, ts=20),
+        _row("buy-2", level_id="L1", role="open", price="0.09487", take_profit_price="0.10", sent=True, ts=30),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    service._remember_tick_fresh(PAIR, _fresh(finished=[{
+        "text": "sell-1", "finish_as": "filled", "price": "0.10", "amount": "1", "left": "0",
+    }]))
+    minted, result, slot = _commit_close(monkeypatch, service, connector)
+    assert minted == ["sell-new"], "продажа прошлого круга чеканку новой не запрещает"
+    assert result == "sell-new"
+    assert (slot or {}).get("order_id") == "sell-new"
+    assert (slot or {}).get("order_id") != "sell-1"

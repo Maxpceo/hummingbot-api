@@ -9301,6 +9301,67 @@ class ExecutorService:
             return
         await self._partial_send_committed(executor_id, executor, connector, pair, text, level_id, str(quant), amount)
 
+    def _buy_row_for_level(self, executor_id: str, level_id: str) -> Optional[Dict[str, Any]]:
+        """Строка покупки, к которой относится чеканка закрытия: слот уровня, иначе
+        поздняя покупка этого исполнителя в журнале."""
+        slot_id = ""
+        for level in (self._partial_parsed(executor_id) or {}).get("levels") or []:
+            if str(level.get("id") or "") == str(level_id):
+                slot_id = str((level.get("open_order") or {}).get("order_id") or "")
+                break
+        rows = self._partial_rows() or []
+        if slot_id:
+            for row in rows:
+                if str(row.get("order_id") or "") == slot_id:
+                    return row
+            return None
+        latest = None
+        latest_ts = None
+        for row in rows:
+            if str(row.get("executor_id") or "") != str(executor_id):
+                continue
+            if str(row.get("level_id") or "") != str(level_id):
+                continue
+            if str(row.get("role") or "") != "open":
+                continue
+            ts = partial_decimal(row.get("ts"))
+            if ts is None:
+                continue
+            if latest_ts is None or ts >= latest_ts:
+                latest = row
+                latest_ts = ts
+        return latest
+
+    def _sell_of_this_buy(self, executor_id: str, level_id: str) -> str:
+        """Продажа этой покупки в журнале: тот же исполнитель, не старше покупки.
+        Продажа прошлого круга и чужого исполнителя номер этой покупки не занимает."""
+        buy = self._buy_row_for_level(executor_id, level_id)
+        if not isinstance(buy, dict):
+            return ""
+        owner = str(buy.get("executor_id") or "")
+        buy_ts = partial_decimal(buy.get("ts"))
+        if not owner or buy_ts is None:
+            return ""
+        found = ""
+        found_ts = None
+        for row in self._partial_rows() or []:
+            if str(row.get("level_id") or "") != str(level_id):
+                continue
+            if str(row.get("executor_id") or "") != owner:
+                continue
+            if str(row.get("role") or "") not in ("close", "market_close"):
+                continue
+            sell_ts = partial_decimal(row.get("ts"))
+            if sell_ts is None or sell_ts < buy_ts:
+                continue
+            name = str(row.get("order_id") or "")
+            if not name:
+                continue
+            if found_ts is None or sell_ts < found_ts:
+                found = name
+                found_ts = sell_ts
+        return found
+
     async def _partial_commit_close(
         self,
         executor_id: str,
@@ -9315,13 +9376,23 @@ class ExecutorService:
             return None
         if await self._refresh_stop_mark(executor_id):
             return None
-        from hummingbot.connector.utils import get_new_client_order_id
-        order_id = get_new_client_order_id(
-            is_buy=False,
-            trading_pair=pair,
-            hbot_order_id_prefix=getattr(connector, "client_order_id_prefix", ""),
-            max_id_len=getattr(connector, "client_order_id_max_length", 32),
-        )
+        # П.6 и редакция 6: номер этой покупки уже в журнале — новый не чеканить.
+        # Продажа прошлого круга слот не занимает. Уже на книге или списки не
+        # прочитаны — стоять, в слот другой номер не писать.
+        own = self._sell_of_this_buy(executor_id, level_id)
+        if own:
+            seen = self._close_text_seen(self._tick_fresh(pair), connector, own)
+            if seen is None or seen is True:
+                return None
+            order_id = own
+        else:
+            from hummingbot.connector.utils import get_new_client_order_id
+            order_id = get_new_client_order_id(
+                is_buy=False,
+                trading_pair=pair,
+                hbot_order_id_prefix=getattr(connector, "client_order_id_prefix", ""),
+                max_id_len=getattr(connector, "client_order_id_max_length", 32),
+            )
 
         def mutate(body: Dict[str, Any]) -> None:
             # Гонка CAS: метка в прочитанном теле — level_id не пишем, запись
