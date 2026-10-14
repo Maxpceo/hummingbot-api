@@ -5767,7 +5767,7 @@ class ExecutorService:
                     return None
                 if self._closed_row_filled(finished):
                     pass
-                elif str(finished.get("finish_as") or "").lower() == "cancelled" and gate_base_is_zero(finished):
+                elif self._finished_zero_cancel(finished):
                     continue
                 else:
                     return None
@@ -5776,7 +5776,7 @@ class ExecutorService:
             if sell and not self._proven_dead(name, fresh):
                 return None
             if buy and (finished is None or not self._closed_row_filled(finished)):
-                if finished is None or str(finished.get("finish_as") or "").lower() != "cancelled":
+                if finished is None or not self._finished_zero_cancel(finished):
                     return None
                 continue
             if finished is None or not self._closed_row_filled(finished):
@@ -6460,6 +6460,20 @@ class ExecutorService:
         if "50102" in blob or "50113" in blob:
             return False
         return "'sCode': '51400'" in blob or '"sCode": "51400"' in blob
+
+    def _finished_zero_cancel(self, raw: Optional[Dict[str, Any]]) -> bool:
+        """Снятие с нулевой базой: форма Gate или строка OKX. Пустой размер — не ноль."""
+        if not isinstance(raw, dict) or self._closed_row_filled(raw):
+            return False
+        if gate_base_is_zero(raw):
+            return True
+        state = str(raw.get("state") or "").lower()
+        if state not in ("canceled", "cancelled", "mmp_canceled") or "fill_size" not in raw:
+            return False
+        try:
+            return Decimal(str(raw.get("fill_size"))) == 0
+        except (ArithmeticError, ValueError, TypeError):
+            return False
 
     def _exchange_gone_end(self, executor_id: str, order_id: str) -> bool:
         mark = ((self._partial_parsed(executor_id) or {}).get("partial_ends") or {}).get(str(order_id)) or {}

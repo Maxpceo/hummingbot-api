@@ -539,6 +539,36 @@ def test_exchange_gone_buy_without_finished_does_not_prove_the_remainder(monkeyp
     unproven = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"}])
     assert service._shutdown_remainder(EXECUTOR, unproven) is None
 
+    okx_cancel = _fresh(finished=[
+        {"text": "buy-1", "state": "filled", "fill_size": "10"},
+        {"text": "sell-9", "state": "canceled", "fill_size": "0"},
+    ])
+    assert service._shutdown_remainder(EXECUTOR, okx_cancel) == Decimal("10")
+    okx_fill = _fresh(finished=[
+        {"text": "buy-1", "state": "filled", "fill_size": "10"},
+        {"text": "sell-9", "state": "filled", "fill_size": "4"},
+    ])
+    assert service._shutdown_remainder(EXECUTOR, okx_fill) == Decimal("6")
+
+
+def test_okx_zero_cancel_does_not_freeze_the_remainder(monkeypatch, tmp_path):
+    """Строка OKX canceled и fill_size 0 не морозит остаток. filled входит."""
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", sent=True, ts=10),
+        _row("buy-2", level_id="L2", role="open", sent=True, ts=11),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()))
+    cancelled = _fresh(finished=[
+        {"text": "buy-1", "state": "filled", "fill_size": "10"},
+        {"text": "buy-2", "state": "canceled", "fill_size": "0"},
+    ])
+    assert service._shutdown_remainder(EXECUTOR, cancelled) == Decimal("10")
+    filled = _fresh(finished=[
+        {"text": "buy-1", "state": "filled", "fill_size": "10"},
+        {"text": "buy-2", "state": "filled", "fill_size": "10"},
+    ])
+    assert service._shutdown_remainder(EXECUTOR, filled) == Decimal("20")
+
 
 def test_unread_book_does_not_write_the_gone_end(monkeypatch, tmp_path):
     """Книга этого тика не прочитана — конец не писать и отмену не считать доставленной."""
