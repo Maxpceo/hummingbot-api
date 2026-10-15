@@ -886,3 +886,310 @@ def test_shutdown_close_proven_reads_the_pair_book(monkeypatch, tmp_path):
     service.__dict__["_price_tick"] = service.__dict__.get("_price_tick", 1) + 1
     assert service._tick_fresh(PAIR) is None
     assert service._shutdown_close_proven(EXECUTOR) is False
+
+
+class OkxPerpetualDerivative:
+    """Имя класса включает okx и perpetual: площадка и тип инструмента."""
+
+    def __init__(self, contract_size=Decimal("1000")):
+        self.in_flight_orders = {}
+        self._order_tracker = SimpleNamespace(lost_orders={})
+        self._contract_sizes = {PAIR: contract_size} if contract_size is not None else {}
+        self.client_order_id_prefix = "okx"
+        self.client_order_id_max_length = 32
+
+    def _format_size_to_amount(self, trading_pair, size):
+        return Decimal(str(size)) * self._contract_sizes[trading_pair]
+
+
+NOW = 1_700_000_000.0
+
+
+def _freeze_now(monkeypatch):
+    monkeypatch.setattr("services.executor_service.time.time", lambda: NOW)
+
+
+def _archive_row(text, fill_size, price="0.1", state="filled"):
+    return {
+        "text": text,
+        "order_id": text,
+        "state": state,
+        "fill_size": fill_size,
+        "price": price,
+    }
+
+
+def test_old_buy_is_sold_from_the_archive_in_coins(monkeypatch, tmp_path):
+    """Покупка старше 7 дней берётся из архива. В продажу уходят монеты.
+    Чужой номер окно и сумму не меняет. В слот пары архив не пишется."""
+    _freeze_now(monkeypatch)
+    old = NOW - 10 * 24 * 60 * 60
+    foreign = NOW - 20 * 24 * 60 * 60
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-old", level_id="L1", role="open", sent=True, ts=old),
+        _row("foreign-old", level_id="L9", role="open", sent=True, ts=foreign, executor_id="grid-b"),
+    ])
+    connector = OkxPerpetualDerivative()
+    service, repo, connector = _service_with(
+        monkeypatch, _checkpoint(_level(level_id="L1", open_id="buy-old", filled=True)), connector=connector,
+    )
+    book = _fresh(finished=[])
+    executor, sold = _arm_with_task(monkeypatch, service, connector)
+    holder = {}
+    _run_task_with_neighbour_read(monkeypatch, service, connector, executor, book, holder)
+    calls = []
+
+    async def pages(connector, symbol, pair, inst_type, archive, begin, end):
+        calls.append((symbol, pair, inst_type, archive, begin, end))
+        return {
+            "read": True,
+            "done": True,
+            "orders": [
+                _archive_row("buy-old", "2.535"),
+                _archive_row("foreign-old", "9"),
+            ],
+        }
+
+    monkeypatch.setattr(service, "_okx_closed_pages", pages)
+    minted = []
+
+    def mint(*args, **kwargs):
+        minted.append("flat-1")
+        return "flat-1"
+
+    import hummingbot.connector.utils as connector_utils
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+
+    seen = {}
+
+    async def run():
+        await executor.control_task()
+        seen["slot"] = service._pair_book(PAIR)
+        seen["tick"] = service._tick_fresh(PAIR)
+        await _cancel_neighbour(holder)
+
+    asyncio.run(run())
+    assert len(calls) == 1
+    assert calls[0][0] == PAIR and calls[0][1] == PAIR
+    assert calls[0][2] == "SWAP" and calls[0][3] is True
+    assert calls[0][4] == str(int((old - 300) * 1000))
+    assert calls[0][5] == str(int(NOW * 1000))
+    assert sold and sold[0][1] == Decimal("2535")
+    assert minted == ["flat-1"]
+    assert seen["tick"] is None
+    assert all(row.get("text") != "buy-old" for row in (seen["slot"] or {}).get("finished") or [])
+    assert executor._shutdown_close_proven is False
+
+
+def test_unread_or_empty_archive_does_not_sell(monkeypatch, tmp_path):
+    """Непрочитанный архив и пустой архив — не ноль и не продажа."""
+    _freeze_now(monkeypatch)
+    old = NOW - 10 * 24 * 60 * 60
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-old", level_id="L1", role="open", sent=True, ts=old),
+    ])
+    connector = OkxPerpetualDerivative()
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()), connector=connector)
+    fresh = _fresh(finished=[])
+    service._remember_tick_fresh(PAIR, fresh)
+    executor, sold = _arm(monkeypatch, service, connector, None)
+
+    async def unread(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_okx_closed_pages", unread)
+    book = asyncio.run(service._shutdown_remainder_book(EXECUTOR, connector, PAIR, fresh))
+    assert book is None
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert sold == []
+
+    async def truncated(*args, **kwargs):
+        return {"read": True, "done": False, "orders": [_archive_row("buy-old", "2")]}
+
+    monkeypatch.setattr(service, "_okx_closed_pages", truncated)
+    assert asyncio.run(service._shutdown_remainder_book(EXECUTOR, connector, PAIR, fresh)) is None
+
+    async def empty(*args, **kwargs):
+        return {"read": True, "done": True, "orders": []}
+
+    monkeypatch.setattr(service, "_okx_closed_pages", empty)
+    empty_book = asyncio.run(service._shutdown_remainder_book(EXECUTOR, connector, PAIR, fresh))
+    assert empty_book is not None
+    assert service._shutdown_remainder(EXECUTOR, empty_book) is None
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, empty_book))
+    assert sold == []
+    assert "buy-old" not in [row.get("text") for row in fresh.get("finished") or []]
+
+
+def test_too_old_or_unmarked_buy_does_not_ask_the_archive(monkeypatch, tmp_path):
+    """Старше 90 дней и номер без метки архив не спрашивают. Продажи нет."""
+    _freeze_now(monkeypatch)
+    ancient = NOW - 100 * 24 * 60 * 60
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-ancient", level_id="L1", role="open", sent=True, ts=ancient),
+        _row("buy-old", level_id="L2", role="open", sent=True, ts=NOW - 10 * 24 * 60 * 60),
+    ])
+    connector = OkxPerpetualDerivative()
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()), connector=connector)
+    fresh = _fresh(finished=[])
+    calls = []
+
+    async def pages(*args, **kwargs):
+        calls.append(args)
+        return {"read": True, "done": True, "orders": [_archive_row("buy-ancient", "1")]}
+
+    monkeypatch.setattr(service, "_okx_closed_pages", pages)
+    assert asyncio.run(service._shutdown_remainder_book(EXECUTOR, connector, PAIR, fresh)) is None
+    assert calls == []
+
+    from utils.executor_checkpoint import reset_ledger_process_state
+    ledger = tmp_path / "bots" / "data" / "order-ledger.jsonl"
+    ledger.write_text(
+        json.dumps(_row("buy-blank", level_id="L1", role="open", sent=True, ts=None)) + "\n",
+        encoding="utf-8",
+    )
+    reset_ledger_process_state()
+    assert asyncio.run(service._shutdown_remainder_book(EXECUTOR, connector, PAIR, fresh)) is None
+    assert calls == []
+
+
+def test_live_cancel_wins_over_archive_and_foreign_price_does_not_count(monkeypatch, tmp_path):
+    """Живое снятие не заменяется архивом. Чужой номер и пустой clOrdId в сумму не входят."""
+    _freeze_now(monkeypatch)
+    old = NOW - 10 * 24 * 60 * 60
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-old", level_id="L1", role="open", sent=True, ts=old),
+        _row("buy-zero", level_id="L2", role="open", sent=True, ts=old),
+    ])
+    connector = OkxPerpetualDerivative()
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()), connector=connector)
+    fresh = _fresh(finished=[{
+        "text": "buy-zero", "state": "canceled", "fill_size": "0", "price": "0.1",
+    }])
+
+    async def pages(*args, **kwargs):
+        return {
+            "read": True,
+            "done": True,
+            "orders": [
+                _archive_row("buy-old", "1"),
+                _archive_row("buy-zero", "9", state="filled"),
+                _archive_row("foreign-old", "8"),
+                {"order_id": "", "state": "filled", "fill_size": "50", "price": "0.1"},
+            ],
+        }
+
+    monkeypatch.setattr(service, "_okx_closed_pages", pages)
+    book = asyncio.run(service._shutdown_remainder_book(EXECUTOR, connector, PAIR, fresh))
+    assert book is not None
+    assert service._shutdown_remainder(EXECUTOR, book) == Decimal("1000")
+    assert not any(row.get("fill_size") == "50" for row in book.get("finished") or [])
+    zero = next(row for row in book["finished"] if row.get("text") == "buy-zero")
+    assert zero.get("fill_size") == "0"
+    assert fresh["finished"][0]["fill_size"] == "0"
+
+
+def test_missing_contract_size_and_mixed_units_do_not_sell(monkeypatch, tmp_path):
+    """Нет размера контракта — не продаём. amount/left не умножаем. Смесь форм — не продаём."""
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", sent=True, ts=NOW - 60),
+    ])
+    connector = OkxPerpetualDerivative(contract_size=None)
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()), connector=connector)
+    fresh = _fresh(finished=[{"text": "buy-1", "state": "filled", "fill_size": "2"}])
+    assert asyncio.run(service._shutdown_remainder_book(EXECUTOR, connector, PAIR, fresh)) is None
+
+    sized = OkxPerpetualDerivative()
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()), connector=sized)
+    coins = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"}])
+    book = asyncio.run(service._shutdown_remainder_book(EXECUTOR, sized, PAIR, coins))
+    assert book is not None
+    assert service._shutdown_remainder(EXECUTOR, book) == Decimal("10")
+    executor, sold = _arm(monkeypatch, service, sized, None)
+
+    def mint(*args, **kwargs):
+        return "flat-1"
+
+    import hummingbot.connector.utils as connector_utils
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+    monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, sized, PAIR, book))
+    assert sold and sold[0][1] == Decimal("10")
+
+    from utils.executor_checkpoint import reset_ledger_process_state
+    ledger = tmp_path / "bots" / "data" / "order-ledger.jsonl"
+    ledger.write_text("".join(json.dumps(line) + "\n" for line in [
+        _row("buy-coin", level_id="L1", role="open", sent=True, ts=NOW - 60),
+        _row("buy-raw", level_id="L2", role="open", sent=True, ts=NOW - 60),
+    ]), encoding="utf-8")
+    reset_ledger_process_state()
+    mixed = _fresh(finished=[
+        {"text": "buy-coin", "finish_as": "filled", "amount": "10", "left": "0"},
+        {"text": "buy-raw", "state": "filled", "fill_size": "2"},
+    ])
+    assert asyncio.run(service._shutdown_remainder_book(EXECUTOR, sized, PAIR, mixed)) is None
+
+
+def test_archive_copy_proves_zero_and_the_pair_book_alone_does_not(monkeypatch, tmp_path):
+    """Флаг нуля считается по копии с архивом и в монетах. Голая книга пары старую покупку не закрывает."""
+    _freeze_now(monkeypatch)
+    old = NOW - 12 * 24 * 60 * 60
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-old", level_id="L1", role="open", sent=True, ts=old),
+        _row("flat-1", level_id="", role="market_close", sent=True, ts=NOW - 60),
+    ])
+    connector = OkxPerpetualDerivative()
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()), connector=connector)
+    fresh = _fresh(finished=[{"text": "flat-1", "state": "filled", "fill_size": "1"}])
+    service._remember_tick_fresh(PAIR, fresh)
+    service.__dict__["_price_tick"] = service.__dict__.get("_price_tick", 1) + 1
+    assert service._tick_fresh(PAIR) is None
+
+    async def half(*args, **kwargs):
+        return {"read": True, "done": True, "orders": [_archive_row("buy-old", "2")]}
+
+    monkeypatch.setattr(service, "_okx_closed_pages", half)
+    book = asyncio.run(service._shutdown_remainder_book(EXECUTOR, connector, PAIR, fresh))
+    assert service._shutdown_remainder(EXECUTOR, book) == Decimal("1000")
+    assert service._shutdown_close_proven(EXECUTOR, book) is False
+    assert service._shutdown_close_proven(EXECUTOR) is False
+
+    async def covered(*args, **kwargs):
+        return {"read": True, "done": True, "orders": [_archive_row("buy-old", "1")]}
+
+    monkeypatch.setattr(service, "_okx_closed_pages", covered)
+    covered_book = asyncio.run(service._shutdown_remainder_book(EXECUTOR, connector, PAIR, fresh))
+    assert service._shutdown_remainder(EXECUTOR, covered_book) == Decimal("0")
+    assert service._shutdown_close_proven(EXECUTOR, covered_book) is True
+    assert service._shutdown_close_proven(EXECUTOR) is False
+    assert all(row.get("text") != "buy-old" for row in fresh.get("finished") or [])
+
+
+def test_shutdown_flag_uses_the_archive_copy_on_the_tick(monkeypatch, tmp_path):
+    """На тике флаг истинен по копии с архивом, не по голодному `_tick_fresh`."""
+    _freeze_now(monkeypatch)
+    old = NOW - 12 * 24 * 60 * 60
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-old", level_id="L1", role="open", sent=True, ts=old),
+        _row("flat-1", level_id="", role="market_close", sent=True, ts=NOW - 60),
+    ])
+    connector = OkxPerpetualDerivative()
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level()), connector=connector)
+    book = _fresh(finished=[{"text": "flat-1", "state": "filled", "fill_size": "1"}])
+    executor, sold = _arm_with_task(monkeypatch, service, connector)
+    holder = {}
+    _run_task_with_neighbour_read(monkeypatch, service, connector, executor, book, holder)
+
+    async def covered(*args, **kwargs):
+        return {"read": True, "done": True, "orders": [_archive_row("buy-old", "1")]}
+
+    monkeypatch.setattr(service, "_okx_closed_pages", covered)
+
+    async def run():
+        await executor.control_task()
+        await _cancel_neighbour(holder)
+
+    asyncio.run(run())
+    assert sold == []
+    assert executor._shutdown_close_proven is True

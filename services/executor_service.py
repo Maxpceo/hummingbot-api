@@ -5819,13 +5819,172 @@ class ExecutorService:
             return Decimal("0")
         return bought - sold
 
-    def _shutdown_close_proven(self, executor_id: str) -> bool:
-        """Продажа остатка доказана finished. Непрочитанное — не доказательство."""
-        pair = ""
-        executor = (getattr(self, "_active_executors", None) or {}).get(executor_id)
-        if executor is not None:
-            pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
-        fresh = self._pair_book(pair)
+    def _shutdown_mark_seconds(self, ts: Any) -> Optional[float]:
+        """Метка журнала в секундах. Миллисекунды, как у архива, делим."""
+        try:
+            mark = float(ts)
+        except (TypeError, ValueError):
+            return None
+        if mark > 1_000_000_000_000:
+            mark = mark / 1000
+        return mark
+
+    def _shutdown_row_text(self, raw: Any) -> str:
+        if not isinstance(raw, dict):
+            return ""
+        return str(raw.get("text") or raw.get("order_id") or "")
+
+    def _shutdown_text_present(self, rows: Any, name: str) -> bool:
+        return any(self._shutdown_row_text(raw) == name for raw in rows or [])
+
+    def _shutdown_our_marks(self, executor_id: str) -> Optional[Dict[str, Optional[float]]]:
+        """Номера этой сетки и самая старая метка. Чужой executor_id не входит."""
+        rows = self._partial_rows()
+        if rows is None:
+            return None
+        marks: Dict[str, Optional[float]] = {}
+        for row in rows:
+            if str(row.get("executor_id") or "") != str(executor_id):
+                continue
+            name = str(row.get("order_id") or "")
+            if not name:
+                continue
+            mark = self._shutdown_mark_seconds(row.get("ts"))
+            if name not in marks:
+                marks[name] = mark
+                continue
+            current = marks[name]
+            if mark is not None and (current is None or mark < current):
+                marks[name] = mark
+        return marks
+
+    def _shutdown_archive_need(self, executor_id: str, fresh: Dict[str, Any]) -> Dict[str, Any]:
+        """skip — живой список уже держит номера. block — архив не спрашиваем и не продаём.
+
+        fetch — окно от самой старой недоказанной метки этой сетки, старше 7 дней и не старше 90.
+        """
+        marks = self._shutdown_our_marks(executor_id)
+        if marks is None or not self._lists_ready(fresh):
+            return {"need": "block"}
+        now_sec = time.time()
+        history_sec = OKX_HISTORY_MS / 1000
+        archive_sec = OKX_ARCHIVE_MS / 1000
+        oldest: Optional[float] = None
+        for name, mark in marks.items():
+            if self._shutdown_text_present(fresh.get("opens"), name):
+                continue
+            if self._finished_row(name, fresh) is not None:
+                continue
+            if mark is None or now_sec - mark > archive_sec:
+                return {"need": "block"}
+            if now_sec - mark > history_sec:
+                if oldest is None or mark < oldest:
+                    oldest = mark
+        if oldest is None:
+            return {"need": "skip"}
+        return {
+            "need": "fetch",
+            "begin": str(int((oldest - 300) * 1000)),
+            "end": str(int(now_sec * 1000)),
+        }
+
+    def _shutdown_coin_book(
+        self, executor_id: str, connector: Any, pair: str, book: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Сырой accFillSz этой сетки в монетах. Смесь форм и отказ перевода — не продавать."""
+        marks = self._shutdown_our_marks(executor_id)
+        if marks is None:
+            return None
+        ours = set(marks)
+        saw_coins = False
+        saw_contracts = False
+        for raw in book.get("finished") or []:
+            if self._shutdown_row_text(raw) not in ours:
+                continue
+            if "amount" in raw and "left" in raw:
+                saw_coins = True
+            elif "fill_size" in raw:
+                saw_contracts = True
+        if saw_coins and saw_contracts:
+            return None
+        if not saw_contracts:
+            return book
+        converted: List[Dict[str, Any]] = []
+        for raw in book.get("finished") or []:
+            if not isinstance(raw, dict):
+                return None
+            text = self._shutdown_row_text(raw)
+            if text not in ours or "amount" in raw or "fill_size" not in raw:
+                converted.append(raw)
+                continue
+            size = partial_decimal(raw.get("fill_size"))
+            if size is None or size < 0:
+                return None
+            if size == 0:
+                converted.append(raw)
+                continue
+            base = self._contract_base(connector, pair, size)
+            if base is None:
+                return None
+            copied = dict(raw)
+            copied["fill_size"] = str(base)
+            converted.append(copied)
+        out = dict(book)
+        out["finished"] = converted
+        return out
+
+    async def _shutdown_remainder_book(
+        self, executor_id: str, connector: Any, pair: str, fresh: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Копия книги для остатка. В слот пары не пишется. Непрочитанный архив — не ноль."""
+        if connector is None or not isinstance(fresh, dict) or not self._lists_ready(fresh):
+            return None
+        copied: List[Dict[str, Any]] = []
+        for raw in fresh.get("finished") or []:
+            if not isinstance(raw, dict):
+                return None
+            copied.append(dict(raw))
+        book = dict(fresh)
+        book["finished"] = copied
+        need = self._shutdown_archive_need(executor_id, fresh)
+        if need.get("need") == "block":
+            return None
+        if need.get("need") == "fetch":
+            venue = open_list_venue(type(connector).__name__ if connector is not None else "")
+            if venue != "okx":
+                return None
+            symbol = await self._gate_symbol(connector, pair)
+            if not symbol:
+                return None
+            inst_type = "SWAP" if "perpetual" in type(connector).__name__.lower() else "SPOT"
+            archived = await self._okx_closed_pages(
+                connector, symbol, pair, inst_type, True, need["begin"], need["end"],
+            )
+            if not isinstance(archived, dict) or not archived.get("read") or not archived.get("done"):
+                return None
+            known = {self._shutdown_row_text(row) for row in copied}
+            for raw in archived.get("orders") or []:
+                if not isinstance(raw, dict):
+                    return None
+                text = self._shutdown_row_text(raw)
+                if not text or text in known:
+                    continue
+                copied.append(dict(raw))
+                known.add(text)
+        return self._shutdown_coin_book(executor_id, connector, pair, book)
+
+    def _shutdown_close_proven(self, executor_id: str, fresh: Optional[Dict[str, Any]] = None) -> bool:
+        """Продажа остатка доказана finished. Непрочитанное — не доказательство.
+
+        Копия с архивом, если её передали. Без неё — книга пары: старая
+        недоказанная покупка этим вызовом не становится нулём.
+        """
+        if fresh is None:
+            pair = ""
+            executor = (getattr(self, "_active_executors", None) or {}).get(executor_id)
+            if executor is not None:
+                pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+            fresh = self._pair_book(pair)
         if self._partial_rows() is None or not self._lists_ready(fresh):
             return False
         remainder = self._shutdown_remainder(executor_id, fresh)
@@ -8292,10 +8451,20 @@ class ExecutorService:
                     # уходила никогда (план stop-sell-pair-book).
                     fresh_now = service._pair_book(pair or "")
                     if service._lists_ready(fresh_now):
-                        await service._send_shutdown_close(
-                            executor_id, executor, connector, pair or "", fresh_now,
+                        # Копия: архив старых номеров и монеты вместо контрактов.
+                        # В слот пары не пишется — цена из архива никого не занимает.
+                        book = await service._shutdown_remainder_book(
+                            executor_id, connector, pair or "", fresh_now,
                         )
-                        executor._shutdown_close_proven = service._shutdown_close_proven(executor_id)
+                        if book is not None and service._lists_ready(book):
+                            await service._send_shutdown_close(
+                                executor_id, executor, connector, pair or "", book,
+                            )
+                            executor._shutdown_close_proven = service._shutdown_close_proven(
+                                executor_id, book,
+                            )
+                        else:
+                            executor._shutdown_close_proven = False
                 fresh = service._tick_fresh(pair or "")
                 if not service._lists_ready(fresh):
                     if service._partial_forbids(executor_id):
