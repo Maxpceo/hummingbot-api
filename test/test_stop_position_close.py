@@ -649,6 +649,32 @@ def test_same_pair_waiting_for_a_new_book_does_not_write_the_old_one(monkeypatch
     assert service._exchange_gone_end(EXECUTOR, "buy-2") is False
 
 
+def test_live_okx_closed_page_shape_is_readable():
+    """Форма страницы демо-счёта 15 октября, без настоящих номеров.
+
+    Чтение без заявок: 68 строк, все state=filled, 16 с пустой ценой,
+    время внутри окна, страница короче 100. Такая страница прочитана.
+    """
+    from utils.executor_checkpoint import parse_okx_closed_page
+
+    begin, end = 1_000, 5_000
+    rows = [
+        {"clOrdId": f"filled-{i}", "ordId": str(i), "px": "0.09", "side": "buy",
+         "state": "filled", "cTime": "2000", "accFillSz": "1"}
+        for i in range(52)
+    ]
+    rows.extend(
+        {"clOrdId": f"market-{i}", "ordId": str(100 + i), "px": "", "side": "sell",
+         "state": "filled", "cTime": "2100", "accFillSz": "1"}
+        for i in range(16)
+    )
+    parsed = parse_okx_closed_page({"code": "0", "data": rows}, begin, end)
+    assert parsed.get("read") is True
+    assert parsed.get("done") is True
+    assert len(parsed.get("orders") or []) == 52
+    assert all(row.get("state") == "filled" for row in parsed.get("orders") or [])
+
+
 def test_closed_page_skips_a_row_outside_the_window_and_keeps_an_unknown_state_unread():
     from utils.executor_checkpoint import parse_okx_closed_page
 
