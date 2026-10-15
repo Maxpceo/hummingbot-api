@@ -619,17 +619,33 @@ def test_other_pair_tick_keeps_a_ready_book_and_an_open_number_blocks(monkeypatc
 
 
 def test_same_pair_waiting_for_a_new_book_does_not_write_the_old_one(monkeypatch, tmp_path):
-    """Эта пара уже увеличила номер и ещё не положила книгу. Старый слот конец не пишет."""
+    """Эта пара уже увеличила номер и ещё не положила книгу. Отмена чтения
+    старый слот концу не отдаёт."""
     _journal(tmp_path, monkeypatch, [
         _row("buy-2", level_id="L1", role="open", sent=True, ts=10),
     ])
     service, repo, connector = _service_with(monkeypatch, _checkpoint(_level(level_id="L1", open_id="buy-2")))
     service._remember_tick_fresh(PAIR, _fresh())
-    service.__dict__.setdefault("_fresh_waiting", set()).add(PAIR)
-    service.__dict__["_price_tick"] = 4
     executor, _sold = _arm(monkeypatch, service, connector, None)
     _raise_gone(connector)
-    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "buy-2", PAIR, EXECUTOR)) is False
+
+    async def hung(*args, **kwargs):
+        await asyncio.sleep(30)
+        return _fresh()
+
+    monkeypatch.setattr(service, "_fresh_raw_lists", hung)
+
+    async def run():
+        task = asyncio.create_task(service._store_tick_fresh(connector, PAIR))
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert await service._stop_deliver_cancel(executor, connector, "buy-2", PAIR, EXECUTOR) is False
+
+    asyncio.run(run())
     assert service._exchange_gone_end(EXECUTOR, "buy-2") is False
 
 
