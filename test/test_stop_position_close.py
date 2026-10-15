@@ -316,8 +316,13 @@ def test_missing_shutdown_sell_is_sent_again_as_the_same_number(monkeypatch, tmp
 
     import hummingbot.connector.utils as connector_utils
     import utils.executor_checkpoint as checkpoint_mod
+
+    async def no_phrase(order_id):
+        return False
+
     monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
     monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
+    monkeypatch.setattr(service, "_shutdown_close_refusal", no_phrase)
     assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("9")
     asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
     assert minted == []
@@ -430,8 +435,13 @@ def test_restart_resends_the_unfinished_shutdown_number(monkeypatch, tmp_path):
 
     import hummingbot.connector.utils as connector_utils
     import utils.executor_checkpoint as checkpoint_mod
+
+    async def no_phrase(order_id):
+        return False
+
     monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
     monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
+    monkeypatch.setattr(service, "_shutdown_close_refusal", no_phrase)
     assert getattr(executor, "_shutdown_close_id", None) in (None, "")
     assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("6")
     asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
@@ -1286,17 +1296,46 @@ def test_other_or_unread_refusal_does_not_finish_the_close(monkeypatch, tmp_path
 
 
 def test_unread_refusal_does_not_finish_the_close(monkeypatch, tmp_path):
-    """Непрочитанная таблица конец не пишет и флаг не поднимает."""
+    """Непрочитанная таблица: продажу не слать, новый номер не чеканить, конец не писать."""
     service, executor, connector, sold, fresh = _nothing_sell(monkeypatch, tmp_path)
+    minted = []
 
     async def unread(order_id):
         return None
 
+    def mint(*args, **kwargs):
+        minted.append("new")
+        return "new"
+
+    import hummingbot.connector.utils as connector_utils
     import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
     monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
     monkeypatch.setattr(service, "_shutdown_close_refusal", unread)
     asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert sold == []
+    assert minted == []
     assert service._nothing_to_close_end(EXECUTOR, "flat-1") is False
+    assert service._shutdown_close_proven(EXECUTOR, fresh) is False
+
+
+def test_foreign_nothing_to_close_phrase_does_not_finish_our_number(monkeypatch, tmp_path):
+    """Чужая фраза на чужом номере наш market_close не заканчивает."""
+    service, executor, connector, sold, fresh = _nothing_sell(monkeypatch, tmp_path)
+    asked = []
+
+    async def refusal(order_id):
+        asked.append(order_id)
+        return order_id == "foreign-1"
+
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
+    monkeypatch.setattr(service, "_shutdown_close_refusal", refusal)
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert asked == ["flat-1"]
+    assert sold and sold[0][1] == Decimal("9")
+    assert service._nothing_to_close_end(EXECUTOR, "flat-1") is False
+    assert service._nothing_to_close_end(EXECUTOR, "foreign-1") is False
     assert service._shutdown_close_proven(EXECUTOR, fresh) is False
 
 

@@ -6118,6 +6118,8 @@ class ExecutorService:
                 return
             order_id = pending[0]
             refusal = await self._shutdown_close_refusal(order_id)
+            if refusal is None:
+                return
             if refusal is True:
                 await self._remember_nothing_to_close(executor_id, order_id, fresh, connector)
                 return
