@@ -587,3 +587,80 @@ def test_unread_book_does_not_write_the_gone_end(monkeypatch, tmp_path):
     connector._place_cancel = place_cancel
     assert asyncio.run(service._stop_deliver_cancel(executor, connector, "buy-2", PAIR, EXECUTOR)) is False
     assert service._exchange_gone_end(EXECUTOR, "buy-2") is False
+
+
+def _raise_gone(connector):
+    async def place_cancel(order_id, row):
+        raise _gone_error()
+
+    connector._place_cancel = place_cancel
+
+
+def test_other_pair_tick_keeps_a_ready_book_and_an_open_number_blocks(monkeypatch, tmp_path):
+    """Чужая пара сдвинула номер шага. Готовая книга без номера пишет конец.
+    Номер в открытых этой книги конец не пишет."""
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-2", level_id="L1", role="open", sent=True, ts=10),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level(level_id="L1", open_id="buy-2")))
+    service._remember_tick_fresh(PAIR, _fresh())
+    service.__dict__["_price_tick"] = 9
+    executor, _sold = _arm(monkeypatch, service, connector, None)
+    _raise_gone(connector)
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "buy-2", PAIR, EXECUTOR)) is True
+    assert service._exchange_gone_end(EXECUTOR, "buy-2") is True
+
+    service._hold_rows[0]["checkpoint"] = _checkpoint(_level(level_id="L1", open_id="buy-4"))
+    service._remember_tick_fresh(PAIR, _fresh())
+    service._tick_reads[PAIR]["fresh"]["opens"] = [{"text": "buy-4"}]
+    service.__dict__["_price_tick"] = 11
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "buy-4", PAIR, EXECUTOR)) is False
+    assert service._exchange_gone_end(EXECUTOR, "buy-4") is False
+
+
+def test_same_pair_waiting_for_a_new_book_does_not_write_the_old_one(monkeypatch, tmp_path):
+    """Эта пара уже увеличила номер и ещё не положила книгу. Старый слот конец не пишет."""
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-2", level_id="L1", role="open", sent=True, ts=10),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level(level_id="L1", open_id="buy-2")))
+    service._remember_tick_fresh(PAIR, _fresh())
+    service.__dict__.setdefault("_fresh_waiting", set()).add(PAIR)
+    service.__dict__["_price_tick"] = 4
+    executor, _sold = _arm(monkeypatch, service, connector, None)
+    _raise_gone(connector)
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "buy-2", PAIR, EXECUTOR)) is False
+    assert service._exchange_gone_end(EXECUTOR, "buy-2") is False
+
+
+def test_closed_page_skips_a_row_outside_the_window_and_keeps_an_unknown_state_unread():
+    from utils.executor_checkpoint import parse_okx_closed_page
+
+    begin, end = 1_000, 2_000
+    page = {
+        "code": "0",
+        "data": [
+            {"clOrdId": "in", "ordId": "1", "px": "1", "side": "buy", "state": "filled", "cTime": "1500", "accFillSz": "2"},
+            {"clOrdId": "out", "ordId": "2", "px": "1", "side": "buy", "state": "canceled", "cTime": "50", "accFillSz": "0"},
+        ],
+    }
+    parsed = parse_okx_closed_page(page, begin, end)
+    assert parsed.get("read") is True
+    assert [row.get("text") for row in parsed.get("orders") or []] == ["in"]
+    unknown = {
+        "code": "0",
+        "data": [
+            {"clOrdId": "odd", "ordId": "3", "px": "1", "side": "buy", "state": "live", "cTime": "1500", "accFillSz": "0"},
+        ],
+    }
+    assert parse_okx_closed_page(unknown, begin, end).get("read") is False
+    empty_px = {
+        "code": "0",
+        "data": [
+            {"clOrdId": "mkt", "ordId": "4", "px": "", "side": "sell", "state": "filled", "cTime": "1500", "accFillSz": "1"},
+            {"clOrdId": "in2", "ordId": "5", "px": "1", "side": "buy", "state": "filled", "cTime": "1600", "accFillSz": "1"},
+        ],
+    }
+    kept = parse_okx_closed_page(empty_px, begin, end)
+    assert kept.get("read") is True
+    assert [row.get("text") for row in kept.get("orders") or []] == ["in2"]

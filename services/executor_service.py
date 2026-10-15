@@ -1324,6 +1324,10 @@ class ExecutorService:
                 after = parsed.get("cursor")
                 if not after:
                     return None
+            self._log_silent_exit(
+                "okx-closed-page-limit", pair or symbol,
+                f"symbol={symbol} pages=1000 done=false",
+            )
             return None
         except Exception as exc:
             self._log_silent_exit("okx-closed-exception", pair or symbol, f"symbol={symbol} error={exc!r}")
@@ -2601,6 +2605,14 @@ class ExecutorService:
             return None
         return slot.get("fresh")
 
+    def _book_for_exchange_gone(self, pair: str) -> Optional[Dict[str, Any]]:
+        """Книга в слоте пары. Новая книга этой пары ещё не положена — None, не старый снимок."""
+        if not pair or pair in (self.__dict__.get("_fresh_waiting") or set()):
+            return None
+        slot = (self.__dict__.get("_tick_reads") or {}).get(pair)
+        fresh = slot.get("fresh") if isinstance(slot, dict) else None
+        return fresh if isinstance(fresh, dict) else None
+
     def _remember_tick_fresh(self, pair: str, fresh: Dict[str, Any]) -> None:
         tick = self.__dict__.get("_price_tick")
         if tick is None:
@@ -2610,9 +2622,14 @@ class ExecutorService:
 
     async def _store_tick_fresh(self, connector, pair: str):
         self.__dict__["_price_tick"] = self.__dict__.get("_price_tick", 0) + 1
-        fresh = await self._fresh_raw_lists(connector, pair, None)
-        self._remember_tick_fresh(pair, fresh)
-        return fresh
+        waiting = self.__dict__.setdefault("_fresh_waiting", set())
+        waiting.add(pair)
+        try:
+            fresh = await self._fresh_raw_lists(connector, pair, None)
+            self._remember_tick_fresh(pair, fresh)
+            return fresh
+        finally:
+            waiting.discard(pair)
 
     def _lists_ready(self, fresh: Optional[Dict[str, Any]]) -> bool:
         if not fresh:
@@ -6484,7 +6501,7 @@ class ExecutorService:
         text = str(order_id or "")
         if not executor_id or not text:
             return False
-        fresh = self._tick_fresh(pair or "")
+        fresh = self._book_for_exchange_gone(pair or "")
         if not self._lists_ready(fresh) or partial_text_in((fresh or {}).get("opens"), text):
             return False
         if self._exchange_gone_end(executor_id, text):

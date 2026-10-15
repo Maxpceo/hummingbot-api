@@ -3581,7 +3581,7 @@ def parse_okx_closed_page(body: Any, begin_ms: int, end_ms: int) -> Dict[str, An
         except (TypeError, ValueError):
             return _unread_page()
         if created < int(begin_ms) or created > int(end_ms):
-            return _unread_page()
+            continue
         client_id = row.get("clOrdId")
         fill_raw = str(row.get("accFillSz") or "0")
         try:
