@@ -2606,12 +2606,13 @@ class ExecutorService:
         return slot.get("fresh")
 
     def _book_for_exchange_gone(self, pair: str) -> Optional[Dict[str, Any]]:
-        """Книга в слоте пары. Новая книга этой пары ещё не положена — None, не старый снимок."""
-        if (
-            not pair
-            or pair in (self.__dict__.get("_fresh_blocked") or set())
-            or (self.__dict__.get("_fresh_waiting_count") or {}).get(pair, 0) > 0
-        ):
+        """Книга в слоте пары. Отмена или ошибка чтения старый слот концу не отдаёт.
+
+        Идущее чтение той же пары готовой книге в слоте не помеха (факт плана
+        okx-closed-list-ready): с сетками одной пары чтения идут без перерыва,
+        и отказ из-за идущего чтения не даёт концу 51400 записаться никогда.
+        """
+        if not pair or pair in (self.__dict__.get("_fresh_blocked") or set()):
             return None
         slot = (self.__dict__.get("_tick_reads") or {}).get(pair)
         fresh = slot.get("fresh") if isinstance(slot, dict) else None
@@ -2626,8 +2627,6 @@ class ExecutorService:
 
     async def _store_tick_fresh(self, connector, pair: str):
         self.__dict__["_price_tick"] = self.__dict__.get("_price_tick", 0) + 1
-        counts = self.__dict__.setdefault("_fresh_waiting_count", {})
-        counts[pair] = counts.get(pair, 0) + 1
         stored = False
         try:
             fresh = await self._fresh_raw_lists(connector, pair, None)
@@ -2638,11 +2637,6 @@ class ExecutorService:
         finally:
             if not stored:
                 self.__dict__.setdefault("_fresh_blocked", set()).add(pair)
-            left = counts.get(pair, 1) - 1
-            if left > 0:
-                counts[pair] = left
-            else:
-                counts.pop(pair, None)
 
     def _lists_ready(self, fresh: Optional[Dict[str, Any]]) -> bool:
         if not fresh:

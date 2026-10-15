@@ -649,6 +649,42 @@ def test_same_pair_waiting_for_a_new_book_does_not_write_the_old_one(monkeypatch
     assert service._exchange_gone_end(EXECUTOR, "buy-2") is False
 
 
+def test_ready_book_is_taken_while_the_same_pair_is_still_reading(monkeypatch, tmp_path):
+    """Книга пары уже прочитана и готова, чтение соседней сетки той же пары ещё
+    идёт. Ответ 51400 пишет конец: готовая книга не считается непрочитанной.
+    Живой прогон 15 октября: четыре сетки DOGE одной пары читают книгу каждый
+    тик, окно «книга ещё не в слоте» не закрывалось ни разу — 2328 ответов
+    51400 не записали ни одного конца."""
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-2", level_id="L1", role="open", sent=True, ts=10),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(_level(level_id="L1", open_id="buy-2")))
+    service._remember_tick_fresh(PAIR, _fresh())
+    executor, _sold = _arm(monkeypatch, service, connector, None)
+    _raise_gone(connector)
+
+    async def slow(*args, **kwargs):
+        await asyncio.sleep(30)
+        return _fresh()
+
+    monkeypatch.setattr(service, "_fresh_raw_lists", slow)
+
+    async def run():
+        task = asyncio.create_task(service._store_tick_fresh(connector, PAIR))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert task.done() is False, "чтение соседней сетки ещё идёт"
+        assert await service._stop_deliver_cancel(executor, connector, "buy-2", PAIR, EXECUTOR) is True
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+    assert service._exchange_gone_end(EXECUTOR, "buy-2") is True
+
+
 def test_live_okx_closed_page_shape_is_readable():
     """Форма страницы демо-счёта 15 октября, без настоящих номеров.
 
