@@ -5973,11 +5973,81 @@ class ExecutorService:
                 known.add(text)
         return self._shutdown_coin_book(executor_id, connector, pair, book)
 
+    _NOTHING_TO_CLOSE = (
+        "you don't have any positions in this direction for this contract to reduce or close"
+    )
+
+    def _nothing_to_close_text(self, text: Any) -> bool:
+        """Только фраза «в эту сторону закрывать нечего». Часы и прочий отказ — нет."""
+        blob = str(text or "")
+        if "50102" in blob or "50113" in blob:
+            return False
+        return self._NOTHING_TO_CLOSE in blob
+
+    def _nothing_to_close_end(self, executor_id: str, order_id: str) -> bool:
+        """Конец продажи гашения: не 51400 и не исполнение. Без price и без level_id."""
+        mark = ((self._partial_parsed(executor_id) or {}).get("partial_ends") or {}).get(str(order_id)) or {}
+        return (
+            isinstance(mark, dict)
+            and mark.get("kind") == "nothing-to-close"
+            and "price" not in mark
+            and "level_id" not in mark
+        )
+
+    async def _shutdown_close_refusal(self, order_id: str) -> Optional[bool]:
+        """Фраза отказа этого номера. False — таблица прочитана, фразы нет. None — не прочитана."""
+        text = str(order_id or "")
+        if not text or not self.db_manager:
+            return None
+        try:
+            async with self.db_manager.get_session_context() as session:
+                from database.repositories.order_repository import OrderRepository
+                row = await OrderRepository(session).get_order_by_client_id(text)
+        except Exception:
+            return None
+        if row is None:
+            return False
+        return self._nothing_to_close_text(getattr(row, "error_message", None))
+
+    async def _remember_nothing_to_close(
+        self, executor_id: str, order_id: str, fresh: Optional[Dict[str, Any]], connector: Any = None,
+    ) -> bool:
+        """Конец до того, как продажу перестанем слать. Живой номер на книге конец не получает."""
+        text = str(order_id or "")
+        if not executor_id or not text or not self._lists_ready(fresh):
+            return False
+        if self._shutdown_text_present((fresh or {}).get("opens"), text):
+            return False
+        if connector is not None and self._id_still_live(fresh, connector, text):
+            return False
+        if self._nothing_to_close_end(executor_id, text):
+            return True
+
+        def mutate(body: Dict[str, Any]) -> None:
+            ends = dict(body.get("partial_ends") or {})
+            current = ends.get(text) or {}
+            if isinstance(current, dict) and current.get("kind") == "nothing-to-close":
+                return
+            ends[text] = {"kind": "nothing-to-close", "order_ids": [text]}
+            body["partial_ends"] = ends
+
+        def visible(parsed: Optional[Dict[str, Any]]) -> bool:
+            mark = ((parsed or {}).get("partial_ends") or {}).get(text) or {}
+            return (
+                isinstance(mark, dict)
+                and mark.get("kind") == "nothing-to-close"
+                and "price" not in mark
+                and "level_id" not in mark
+            )
+
+        return await self._partial_cas(executor_id, mutate, visible)
+
     def _shutdown_close_proven(self, executor_id: str, fresh: Optional[Dict[str, Any]] = None) -> bool:
-        """Продажа остатка доказана finished. Непрочитанное — не доказательство.
+        """Продажа остатка доказана finished или концом «закрывать нечего».
 
         Копия с архивом, если её передали. Без неё — книга пары: старая
-        недоказанная покупка этим вызовом не становится нулём.
+        недоказанная покупка этим вызовом не становится нулём. Непрочитанное
+        — не доказательство. Живой номер на открытой книге флаг не поднимает.
         """
         if fresh is None:
             pair = ""
@@ -5987,8 +6057,17 @@ class ExecutorService:
             fresh = self._pair_book(pair)
         if self._partial_rows() is None or not self._lists_ready(fresh):
             return False
-        remainder = self._shutdown_remainder(executor_id, fresh)
-        return remainder == 0
+        if self._shutdown_remainder(executor_id, fresh) == 0:
+            return True
+        close_ids = self._shutdown_close_ids(executor_id)
+        if not close_ids:
+            return False
+        for text in close_ids:
+            if self._shutdown_text_present((fresh or {}).get("opens"), text):
+                return False
+            if not self._nothing_to_close_end(executor_id, text):
+                return False
+        return True
 
     async def _seat_market_close(self, executor_id: str, order_id: str) -> bool:
         """Номер гашения в чекпоинт до продажи. Метку не снимает."""
@@ -6034,7 +6113,16 @@ class ExecutorService:
             for text in unfinished:
                 if self._id_still_live(fresh, connector, text):
                     return
-            order_id = unfinished[0]
+            pending = [text for text in unfinished if not self._nothing_to_close_end(executor_id, text)]
+            if not pending:
+                return
+            order_id = pending[0]
+            refusal = await self._shutdown_close_refusal(order_id)
+            if refusal is True:
+                await self._remember_nothing_to_close(executor_id, order_id, fresh, connector)
+                return
+        elif any(self._nothing_to_close_end(executor_id, text) for text in known):
+            return
         else:
             from hummingbot.connector.utils import get_new_client_order_id
             order_id = get_new_client_order_id(

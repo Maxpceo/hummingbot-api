@@ -1193,3 +1193,159 @@ def test_shutdown_flag_uses_the_archive_copy_on_the_tick(monkeypatch, tmp_path):
     asyncio.run(run())
     assert sold == []
     assert executor._shutdown_close_proven is True
+
+
+NOTHING = "you don't have any positions in this direction for this contract to reduce or close"
+
+
+def _nothing_sell(monkeypatch, tmp_path, holds=True):
+    level = _level(level_id="L1", open_id="buy-1", filled=True)
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", sent=True, ts=10),
+        _row("flat-1", level_id="", role="market_close", sent=True, ts=20),
+    ])
+    body = json.loads(_checkpoint(level))
+    if holds:
+        body["holds"] = [{"order_id": "flat-1", "role": "market_close"}]
+    service, repo, connector = _service_with(monkeypatch, json.dumps(body))
+    fresh = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "9", "left": "0"}])
+    service._remember_tick_fresh(PAIR, fresh)
+    executor, sold = _arm(monkeypatch, service, connector, None)
+    return service, executor, connector, sold, fresh
+
+
+def test_nothing_to_close_writes_the_end_and_does_not_resend(monkeypatch, tmp_path):
+    """Фраза «закрывать нечего» пишет конец. Тот же номер не уходит, новый не чеканится."""
+    service, executor, connector, sold, fresh = _nothing_sell(monkeypatch, tmp_path)
+    minted = []
+
+    async def refusal(order_id):
+        assert order_id == "flat-1"
+        return True
+
+    def mint(*args, **kwargs):
+        minted.append("new")
+        return "new"
+
+    import hummingbot.connector.utils as connector_utils
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(service, "_shutdown_close_refusal", refusal)
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+    monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert sold == []
+    assert minted == []
+    assert service._nothing_to_close_end(EXECUTOR, "flat-1") is True
+    parsed = service._partial_parsed(EXECUTOR)
+    mark = parsed["partial_ends"]["flat-1"]
+    assert "price" not in mark and "level_id" not in mark
+    assert any(item.get("order_id") == "flat-1" for item in parsed.get("holds") or [])
+    assert service._shutdown_close_proven(EXECUTOR, fresh) is True
+    assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("9")
+
+
+def test_nothing_to_close_end_must_be_visible_before_the_flag(monkeypatch, tmp_path):
+    """Запись конца не прошла — флаг ложь. Конец виден — флаг истинен, продажа не уходит."""
+    service, executor, connector, sold, fresh = _nothing_sell(monkeypatch, tmp_path)
+
+    async def refusal(order_id):
+        return True
+
+    async def no_write(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(service, "_shutdown_close_refusal", refusal)
+    monkeypatch.setattr(service, "_partial_cas", no_write)
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert sold == []
+    assert service._shutdown_close_proven(EXECUTOR, fresh) is False
+
+    body = json.loads(service._hold_rows[0]["checkpoint"])
+    body["partial_ends"] = {"flat-1": {"kind": "nothing-to-close", "order_ids": ["flat-1"]}}
+    service._hold_rows[0]["checkpoint"] = json.dumps(body)
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert sold == []
+    assert service._shutdown_close_proven(EXECUTOR, fresh) is True
+
+
+def test_other_or_unread_refusal_does_not_finish_the_close(monkeypatch, tmp_path):
+    """Другой текст, пустая таблица и непрочитанная таблица конец не пишут."""
+    assert service_text_rejects_the_clock()
+    service, executor, connector, sold, fresh = _nothing_sell(monkeypatch, tmp_path)
+
+    async def other(order_id):
+        return False
+
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
+    monkeypatch.setattr(service, "_shutdown_close_refusal", other)
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert sold and sold[0][1] == Decimal("9")
+    assert service._nothing_to_close_end(EXECUTOR, "flat-1") is False
+    assert service._shutdown_close_proven(EXECUTOR, fresh) is False
+
+
+def test_unread_refusal_does_not_finish_the_close(monkeypatch, tmp_path):
+    """Непрочитанная таблица конец не пишет и флаг не поднимает."""
+    service, executor, connector, sold, fresh = _nothing_sell(monkeypatch, tmp_path)
+
+    async def unread(order_id):
+        return None
+
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
+    monkeypatch.setattr(service, "_shutdown_close_refusal", unread)
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert service._nothing_to_close_end(EXECUTOR, "flat-1") is False
+    assert service._shutdown_close_proven(EXECUTOR, fresh) is False
+
+
+def service_text_rejects_the_clock():
+    from services.executor_service import ExecutorService
+    probe = ExecutorService.__new__(ExecutorService)
+    assert probe._nothing_to_close_text(NOTHING) is True
+    assert probe._nothing_to_close_text("Error submitting order x: " + NOTHING) is True
+    assert probe._nothing_to_close_text(NOTHING + " 50102") is False
+    assert probe._nothing_to_close_text("Check API key and network connection") is False
+    assert probe._nothing_to_close_text("") is False
+    return True
+
+
+def test_live_open_does_not_get_the_nothing_to_close_end(monkeypatch, tmp_path):
+    """Номер ещё в открытых: конца нет, флаг ложь."""
+    service, executor, connector, sold, fresh = _nothing_sell(monkeypatch, tmp_path)
+    fresh["opens"] = [{"text": "flat-1"}]
+
+    async def refusal(order_id):
+        return True
+
+    monkeypatch.setattr(service, "_shutdown_close_refusal", refusal)
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert sold == []
+    assert service._nothing_to_close_end(EXECUTOR, "flat-1") is False
+    assert service._shutdown_close_proven(EXECUTOR, fresh) is False
+
+
+def test_visible_nothing_to_close_end_does_not_mint_a_second_sell(monkeypatch, tmp_path):
+    """Конец виден, остаток не ноль: второй номер не чеканится, фраза размер не даёт."""
+    service, executor, connector, sold, fresh = _nothing_sell(monkeypatch, tmp_path)
+    body = json.loads(service._hold_rows[0]["checkpoint"])
+    body["partial_ends"] = {"flat-1": {"kind": "nothing-to-close", "order_ids": ["flat-1"]}}
+    service._hold_rows[0]["checkpoint"] = json.dumps(body)
+    minted = []
+
+    def mint(*args, **kwargs):
+        minted.append("new")
+        return "new"
+
+    async def boom(order_id):
+        raise AssertionError("таблицу заново не ждём")
+
+    import hummingbot.connector.utils as connector_utils
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+    monkeypatch.setattr(service, "_shutdown_close_refusal", boom)
+    asyncio.run(service._send_shutdown_close(EXECUTOR, executor, connector, PAIR, fresh))
+    assert sold == []
+    assert minted == []
+    assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("9")
+    assert service._shutdown_close_proven(EXECUTOR, fresh) is True
