@@ -742,3 +742,147 @@ def test_closed_page_skips_a_row_outside_the_window_and_keeps_an_unknown_state_u
     kept = parse_okx_closed_page(empty_px, begin, end)
     assert kept.get("read") is True
     assert [row.get("text") for row in kept.get("orders") or []] == ["in2"]
+
+
+def _arm_with_task(monkeypatch, service, connector):
+    """Каркас как у _arm, но у executor есть control_task — обёртка гашения вешается на него."""
+    sold = []
+    connector.sell = lambda *args, **kwargs: sold.append(args)
+    executor = _stub_executor(connector, [])
+
+    async def original_task(*args, **kwargs):
+        executor._original_task_called = True
+
+    executor.control_task = original_task
+    executor._strategy = SimpleNamespace(connectors={"gate_io": connector})
+    executor.config.trading_pair = PAIR
+    service._active_executors[EXECUTOR] = executor
+    service._install_partial_guards(EXECUTOR, executor)
+
+    async def fake_cas(executor_id, mutate, visible, target_id=None):
+        body = json.loads(service._hold_rows[0]["checkpoint"])
+        mutate(body)
+        service._hold_rows[0]["checkpoint"] = json.dumps(body)
+        return True
+
+    monkeypatch.setattr(service, "_partial_cas", fake_cas)
+    return executor, sold
+
+
+def _run_task_with_neighbour_read(monkeypatch, service, connector, executor, book, holder):
+    """Обход гашения, в котором соседняя сетка той же пары уже читает книгу.
+
+    Первое чтение (своё) кладёт готовую книгу в слот; соседнее начинается в окне
+    `_refresh_stop_mark`, увеличивает общий номер шага и висит — `_tick_fresh`
+    голоден, книга пары в слоте готова.
+    """
+    reads = {"n": 0}
+
+    async def read(*args, **kwargs):
+        reads["n"] += 1
+        if reads["n"] > 1:
+            await asyncio.sleep(30)
+        return dict(book)
+
+    async def freeze_and_start_neighbour(executor_id):
+        holder["task"] = asyncio.create_task(service._store_tick_fresh(connector, PAIR))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return True
+
+    async def no_cancels(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_fresh_raw_lists", read)
+    monkeypatch.setattr(service, "_refresh_stop_mark", freeze_and_start_neighbour)
+    monkeypatch.setattr(service, "_stop_deliver_cancels", no_cancels)
+    monkeypatch.setattr(service, "_stop_mark_now", lambda executor_id: True)
+
+    def mint(*args, **kwargs):
+        return "flat-1"
+
+    import hummingbot.connector.utils as connector_utils
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(connector_utils, "get_new_client_order_id", mint)
+    monkeypatch.setattr(checkpoint_mod, "install_connector_close_channel", lambda market: None)
+
+
+async def _cancel_neighbour(holder):
+    task = holder.get("task")
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+def test_shutdown_sell_is_sent_when_the_step_counter_moves_past_the_book(monkeypatch, tmp_path):
+    """Продажа остатка уходит, хотя общий номер шага уже сдвинула соседняя сетка:
+    чтение той же пары в полёте, `_tick_fresh` голоден, книга пары в слоте готова."""
+    level = _level(level_id="L1", open_id="buy-1", filled=True)
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", sent=True, ts=10),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    book = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"}])
+    executor, sold = _arm_with_task(monkeypatch, service, connector)
+    holder = {}
+    _run_task_with_neighbour_read(monkeypatch, service, connector, executor, book, holder)
+
+    async def run():
+        await executor.control_task()
+        assert service._tick_fresh(PAIR) is None, "прежний источник книги голоден"
+        await _cancel_neighbour(holder)
+
+    asyncio.run(run())
+    assert sold and sold[0][1] == Decimal("10"), "продажа доказанного остатка должна уйти"
+    assert getattr(executor, "_shutdown_close_id", None) == "flat-1"
+
+
+def test_shutdown_sell_is_not_sent_on_an_unready_book(monkeypatch, tmp_path):
+    """Книга пары не готова — продажа не уходит, хотя соседняя сетка и не мешает."""
+    level = _level(level_id="L1", open_id="buy-1", filled=True)
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", sent=True, ts=10),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    book = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"}])
+    book["opens_read"] = False
+    executor, sold = _arm_with_task(monkeypatch, service, connector)
+    holder = {}
+    _run_task_with_neighbour_read(monkeypatch, service, connector, executor, book, holder)
+
+    async def run():
+        await executor.control_task()
+        await _cancel_neighbour(holder)
+
+    asyncio.run(run())
+    assert sold == [], "непрочитанная книга — не доказательство остатка"
+
+
+def test_shutdown_close_proven_reads_the_pair_book(monkeypatch, tmp_path):
+    """Флаг доказательства остатка считается по книге пары, не по голодному `_tick_fresh`:
+    остаток доказан нулём — тормоз control_shutdown отпускается, не доказан — держит."""
+    level = _level(level_id="L1", open_id="buy-1", filled=True)
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", sent=True, ts=10),
+        _row("flat-1", level_id="", role="market_close", sent=True, ts=20),
+    ])
+    service, repo, connector = _service_with(monkeypatch, _checkpoint(level))
+    proven = _fresh(finished=[
+        {"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"},
+        {"text": "flat-1", "finish_as": "filled", "amount": "10", "left": "0"},
+    ])
+    service._remember_tick_fresh(PAIR, proven)
+    executor, _sold = _arm(monkeypatch, service, connector, None)
+    service.__dict__["_price_tick"] = service.__dict__.get("_price_tick", 1) + 1
+    assert service._tick_fresh(PAIR) is None, "прежний источник книги голоден"
+    assert service._shutdown_close_proven(EXECUTOR) is True
+
+    unproven = _fresh(finished=[{"text": "buy-1", "finish_as": "filled", "amount": "10", "left": "0"}])
+    service._remember_tick_fresh(PAIR, unproven)
+    service.__dict__["_price_tick"] = service.__dict__.get("_price_tick", 1) + 1
+    assert service._tick_fresh(PAIR) is None
+    assert service._shutdown_close_proven(EXECUTOR) is False

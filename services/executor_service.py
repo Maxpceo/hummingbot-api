@@ -2605,12 +2605,13 @@ class ExecutorService:
             return None
         return slot.get("fresh")
 
-    def _book_for_exchange_gone(self, pair: str) -> Optional[Dict[str, Any]]:
-        """Книга в слоте пары. Отмена или ошибка чтения старый слот концу не отдаёт.
+    def _pair_book(self, pair: str) -> Optional[Dict[str, Any]]:
+        """Книга в слоте пары: концу 51400 и продаже остатка. Не через общий номер шага.
 
-        Идущее чтение той же пары готовой книге в слоте не помеха (факт плана
-        okx-closed-list-ready): с сетками одной пары чтения идут без перерыва,
-        и отказ из-за идущего чтения не даёт концу 51400 записаться никогда.
+        Отмена или ошибка чтения старый слот не отдаёт. Идущее чтение той же
+        пары готовой книге в слоте не помеха (факт плана okx-closed-list-ready):
+        с сетками одной пары чтения идут без перерыва, и отказ из-за идущего
+        чтения не даёт записаться никогда. Готовность книги проверяет зовущий.
         """
         if not pair or pair in (self.__dict__.get("_fresh_blocked") or set()):
             return None
@@ -5824,7 +5825,7 @@ class ExecutorService:
         executor = (getattr(self, "_active_executors", None) or {}).get(executor_id)
         if executor is not None:
             pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
-        fresh = self._tick_fresh(pair)
+        fresh = self._pair_book(pair)
         if self._partial_rows() is None or not self._lists_ready(fresh):
             return False
         remainder = self._shutdown_remainder(executor_id, fresh)
@@ -6508,7 +6509,7 @@ class ExecutorService:
         text = str(order_id or "")
         if not executor_id or not text:
             return False
-        fresh = self._book_for_exchange_gone(pair or "")
+        fresh = self._pair_book(pair or "")
         if not self._lists_ready(fresh) or partial_text_in((fresh or {}).get("opens"), text):
             return False
         if self._exchange_gone_end(executor_id, text):
@@ -8286,7 +8287,10 @@ class ExecutorService:
                     # Доставка отмен не за готовностью списков и не за судьбой
                     # номеров (план stop-freeze п.3).
                     await service._stop_deliver_cancels(executor_id, executor, connector, pair or "")
-                    fresh_now = service._tick_fresh(pair or "")
+                    # Продажа остатка берёт книгу пары, не общий номер шага:
+                    # с сетками одной пары `_tick_fresh` голодает и продажа не
+                    # уходила никогда (план stop-sell-pair-book).
+                    fresh_now = service._pair_book(pair or "")
                     if service._lists_ready(fresh_now):
                         await service._send_shutdown_close(
                             executor_id, executor, connector, pair or "", fresh_now,
