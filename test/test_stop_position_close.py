@@ -2093,3 +2093,119 @@ def test_retained_archive_window_ignores_a_newer_journal_mark():
     service = ExecutorService.__new__(ExecutorService)
     window = service._retained_archive_window(1_000.0)
     assert int(window["end"]) - int(window["begin"]) == OKX_ARCHIVE_MS
+
+
+def test_retained_archive_log_names_unread_empty_and_raw_size(monkeypatch, tmp_path, caplog):
+    """Непрочитанный архив, пустой ответ и сырой размер. Журнал завершение не отпускает."""
+    import logging
+    service, executor, connector, fresh = _archive_ready(monkeypatch, tmp_path, None)
+    caplog.set_level(logging.WARNING, logger="services.executor_service")
+    service._log_retained_archive(EXECUTOR, PAIR)
+    assert "order=ret-1 result=unread" in caplog.text
+    assert service._executor_proofs_released(EXECUTOR) is False
+    assert EXECUTOR in service._active_executors
+
+    caplog.clear()
+    service._note_retained_archive(EXECUTOR, "read", [{"clOrdId": "other", "accFillSz": "9"}])
+    service._log_retained_archive(EXECUTOR, PAIR)
+    assert "order=ret-1 result=empty" in caplog.text
+    assert "other" not in caplog.text
+    assert service._executor_proofs_released(EXECUTOR) is False
+
+    service._note_retained_archive(EXECUTOR, "read", [{
+        "clOrdId": "ret-1", "state": "canceled", "accFillSz": "0",
+    }])
+    assert service._retained_archive_detail(EXECUTOR, "ret-1") == (
+        "order=ret-1 result=row state=canceled accFillSz=0"
+    )
+    service._note_retained_archive(EXECUTOR, "read", [{
+        "clOrdId": "ret-1", "state": "filled", "accFillSz": "1",
+    }])
+    assert service._retained_archive_detail(EXECUTOR, "ret-1") == (
+        "order=ret-1 result=row state=filled accFillSz=1"
+    )
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", fresh) is False
+    service._note_retained_archive(EXECUTOR, "read", [{
+        "clOrdId": "ret-1", "state": "canceled",
+    }])
+    assert service._retained_archive_detail(EXECUTOR, "ret-1") == (
+        "order=ret-1 result=row state=canceled accFillSz=missing"
+    )
+    assert "accFillSz=0" not in service._retained_archive_detail(EXECUTOR, "ret-1")
+    service._note_retained_archive(EXECUTOR, "read", [
+        {"clOrdId": "ret-1", "state": "canceled", "accFillSz": "0"},
+        {"clOrdId": "ret-1", "state": "filled", "accFillSz": "1"},
+        {"clOrdId": "foreign", "state": "filled", "accFillSz": "9"},
+    ])
+    both = service._retained_archive_detail(EXECUTOR, "ret-1")
+    assert both == (
+        "order=ret-1 result=row state=canceled accFillSz=0 state=filled accFillSz=1"
+    )
+    assert "foreign" not in both
+
+
+def test_retained_archive_log_repeats_only_on_a_new_result(monkeypatch, tmp_path, caplog):
+    """Тот же исход молчит пять минут. Другой исход пишется сразу."""
+    import logging
+    service, executor, connector, fresh = _archive_ready(monkeypatch, tmp_path, None)
+    caplog.set_level(logging.WARNING, logger="services.executor_service")
+    service._log_retained_archive(EXECUTOR, PAIR)
+    service._log_retained_archive(EXECUTOR, PAIR)
+    assert caplog.text.count("result=unread") == 1
+    caplog.clear()
+    service._note_retained_archive(EXECUTOR, "read", [])
+    service._log_retained_archive(EXECUTOR, PAIR)
+    assert "result=empty" in caplog.text
+    assert service._executor_proofs_released(EXECUTOR) is False
+
+
+def test_refresh_logs_bad_body_and_does_not_release(monkeypatch, tmp_path, caplog):
+    """Плохое тело архива — unread. Завершение и запись номера на месте."""
+    import logging
+    service, executor, connector, fresh = _archive_ready(monkeypatch, tmp_path, None)
+    okx = OkxPerpetualDerivative()
+
+    async def api_get(**kwargs):
+        return {"code": "1", "data": []}
+
+    async def symbol(*args, **kwargs):
+        return "DOGE-USDT"
+
+    okx._api_get = api_get
+    monkeypatch.setattr(service, "_gate_symbol", symbol)
+    caplog.set_level(logging.WARNING, logger="services.executor_service")
+    asyncio.run(service._refresh_retained_archive(EXECUTOR, executor, okx, PAIR))
+    assert "order=ret-1 result=unread:bad-body" in caplog.text
+    assert service._executor_proofs_released(EXECUTOR) is False
+    assert EXECUTOR in service._active_executors
+    retained = service._partial_parsed(EXECUTOR).get("retained_orders") or []
+    assert any(item.get("order_id") == "ret-1" for item in retained)
+    assert (service.__dict__.get("_retained_archive_rows") or {}).get(EXECUTOR) is None
+
+
+def test_refresh_logs_raw_size_and_skips_a_foreign_row(monkeypatch, tmp_path, caplog):
+    """Короткая страница пишет сырой размер этого номера и не пишет чужой."""
+    import logging
+    import time
+    service, executor, connector, fresh = _archive_ready(monkeypatch, tmp_path, None)
+    okx = OkxPerpetualDerivative()
+    now_ms = str(int(time.time() * 1000))
+
+    async def api_get(**kwargs):
+        return {"code": "0", "data": [{
+            "clOrdId": "ret-1", "state": "canceled", "cTime": now_ms, "ordId": "1",
+        }, {
+            "clOrdId": "other", "state": "filled", "accFillSz": "9", "cTime": now_ms, "ordId": "2",
+        }]}
+
+    async def symbol(*args, **kwargs):
+        return "DOGE-USDT"
+
+    okx._api_get = api_get
+    monkeypatch.setattr(service, "_gate_symbol", symbol)
+    caplog.set_level(logging.WARNING, logger="services.executor_service")
+    asyncio.run(service._refresh_retained_archive(EXECUTOR, executor, okx, PAIR))
+    assert "order=ret-1 result=row state=canceled accFillSz=missing" in caplog.text
+    assert "accFillSz=0" not in caplog.text
+    assert "other" not in caplog.text
+    assert service._executor_proofs_released(EXECUTOR) is False

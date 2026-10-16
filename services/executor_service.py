@@ -6219,6 +6219,55 @@ class ExecutorService:
             "end": str(end_ms),
         }
 
+    def _note_retained_archive(
+        self, executor_id: str, status: str, rows: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Кэш строк не меняет форму: список или пусто. Исход чтения — отдельно."""
+        bag = self.__dict__.setdefault("_retained_archive_rows", {})
+        note = self.__dict__.setdefault("_retained_archive_status", {})
+        if status == "read":
+            bag[executor_id] = list(rows or [])
+        else:
+            bag[executor_id] = None
+        note[executor_id] = status
+
+    def _retained_archive_detail(self, executor_id: str, order_id: str) -> str:
+        """unread, empty или сырой accFillSz. Подставленный ноль сюда не попадает."""
+        text = str(order_id or "")
+        status = (self.__dict__.get("_retained_archive_status") or {}).get(executor_id)
+        if status != "read":
+            reason = str(status or "unread")
+            if not reason.startswith("unread"):
+                reason = f"unread:{reason}"
+            return f"order={text} result={reason}"
+        cached = (self.__dict__.get("_retained_archive_rows") or {}).get(executor_id)
+        if not isinstance(cached, list):
+            return f"order={text} result=unread"
+        parts: List[str] = []
+        for row in cached:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("clOrdId") or row.get("text") or row.get("order_id") or "")
+            if name != text:
+                continue
+            state = str(row.get("state") or "")
+            size = "missing" if "accFillSz" not in row else str(row.get("accFillSz"))
+            parts.append(f"state={state} accFillSz={size}")
+        if not parts:
+            return f"order={text} result=empty"
+        return f"order={text} result=row " + " ".join(parts)
+
+    def _log_retained_archive(self, executor_id: str, pair: str) -> None:
+        """Одна строка на номер с концом 51400. Журнал завершение не отпускает."""
+        for text in self._retained_ids(executor_id):
+            if not self._exchange_gone_end(executor_id, text):
+                continue
+            detail = self._retained_archive_detail(executor_id, text)
+            self._log_silent_exit(
+                "retained-archive", pair, detail, executor_id,
+                interval=300.0, label="silent stop exit:", key=f"{text}:{detail}",
+            )
+
     async def _refresh_retained_archive(
         self, executor_id: str, executor: Any, connector: Any, pair: str,
     ) -> None:
@@ -6228,16 +6277,24 @@ class ExecutorService:
             text for text in self._retained_ids(executor_id)
             if self._exchange_gone_end(executor_id, text)
         ]
-        if not need or connector is None:
+        if not need:
             bag[executor_id] = None
+            return
+
+        def finish(status: str, rows: Optional[List[Dict[str, Any]]] = None) -> None:
+            self._note_retained_archive(executor_id, status, rows)
+            self._log_retained_archive(executor_id, pair)
+
+        if connector is None:
+            finish("unread:no-connector")
             return
         venue = open_list_venue(type(connector).__name__ if connector is not None else "")
         if venue != "okx":
-            bag[executor_id] = None
+            finish("unread:not-okx")
             return
         symbol = await self._gate_symbol(connector, pair)
         if not symbol:
-            bag[executor_id] = None
+            finish("unread:no-symbol")
             return
         inst_type = "SWAP" if "perpetual" in type(connector).__name__.lower() else "SPOT"
         window = self._retained_archive_window()
@@ -6251,7 +6308,7 @@ class ExecutorService:
                     inst_type=inst_type, archive=True,
                 )
                 if request is None:
-                    bag[executor_id] = None
+                    finish("unread:no-request")
                     return
                 body = await connector._api_get(
                     path_url=request["path"],
@@ -6260,33 +6317,33 @@ class ExecutorService:
                     limit_id=self._open_limit_id(connector, "okx"),
                 )
                 if not isinstance(body, dict) or str(body.get("code")) != "0" or not isinstance(body.get("data"), list):
-                    bag[executor_id] = None
+                    finish("unread:bad-body")
                     return
                 data = body["data"]
                 for raw in data:
                     if not isinstance(raw, dict):
-                        bag[executor_id] = None
+                        finish("unread:bad-body")
                         return
                     try:
                         created = int(str(raw.get("cTime")))
                     except (TypeError, ValueError):
-                        bag[executor_id] = None
+                        finish("unread:bad-body")
                         return
                     if created < int(window["begin"]) or created > int(window["end"]):
                         continue
                     rows.append(raw)
                 if len(data) < OPEN_PAGE_LIMIT:
-                    bag[executor_id] = rows
+                    finish("read", rows)
                     return
                 cursor = data[-1].get("ordId") if isinstance(data[-1], dict) else None
                 if not cursor:
-                    bag[executor_id] = None
+                    finish("unread:no-cursor")
                     return
                 after = str(cursor)
         except Exception:
-            bag[executor_id] = None
+            finish("unread:exception")
             return
-        bag[executor_id] = None
+        finish("unread:page-cap")
 
     async def _shutdown_remainder_book(
         self, executor_id: str, connector: Any, pair: str, fresh: Optional[Dict[str, Any]],
