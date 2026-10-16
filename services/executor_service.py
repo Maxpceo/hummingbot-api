@@ -2250,6 +2250,172 @@ class ExecutorService:
         gates.pop(executor_id, None)
         return True
 
+    def _own_stop_ids(self, executor_id: str) -> Optional[set]:
+        """Свои номера шага остановки: журнал этого исполнителя и колонка.
+
+        close_bans чужого журнала сюда не входят. Непрочитанное — не пустой набор.
+        """
+        if buy_blocked() or ledger_executor_ids() is None or order_miss_unreadable():
+            return None
+        column_ids = self._column_ids_for_executor(executor_id)
+        if column_ids is None:
+            return None
+        try:
+            from utils.executor_checkpoint import read_ledger_filtered
+            rows = read_ledger_filtered()
+        except Exception:
+            return None
+        ids = {
+            str(row.get("order_id"))
+            for row in rows or []
+            if row.get("executor_id") == executor_id and row.get("order_id")
+        }
+        ids.update(column_ids)
+        return ids
+
+    def _dead_end_visible(self, executor_id: str, order_id: str) -> bool:
+        """Конец номера без price и без level_id. Метка с ценой цену не отпускает."""
+        text = str(order_id or "")
+        mark = ((self._partial_parsed(executor_id) or {}).get("partial_ends") or {}).get(text)
+        return self._flat_dead_mark(mark, text)
+
+    @staticmethod
+    def _flat_dead_mark(mark: Any, order_id: str) -> bool:
+        text = str(order_id or "")
+        return (
+            bool(text)
+            and isinstance(mark, dict)
+            and mark.get("kind") == "flat"
+            and "price" not in mark
+            and "level_id" not in mark
+            and list(mark.get("order_ids") or []) == [text]
+        )
+
+    def _own_number_still_dead(self, executor: Any, order_id: str) -> bool:
+        """После записи конец годится, только если книга заново показывает смерть.
+
+        Непрочитанная книга, открытый список, трекер, lost и неизвестная
+        отправка — не смерть. Вид метки сам по себе тоже не смерть.
+        """
+        text = str(order_id or "")
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        fresh = self._pair_book(pair) if pair else None
+        if not text or not self._lists_ready(fresh):
+            return False
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        inflight = getattr(connector, "in_flight_orders", None)
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None)
+        if not isinstance(inflight, dict) or not isinstance(lost, dict):
+            return False
+        if order_send_unknown(text) or text in inflight or text in lost:
+            return False
+        if self._shutdown_text_present((fresh or {}).get("opens"), text):
+            return False
+        return self._finished_row(text, fresh) is not None
+
+    async def _drop_flat_ends(self, executor_id: str, order_ids: List[str]) -> bool:
+        """Снять только что записанный flat-конец. Чужой и nothing-to-close не трогать."""
+        pending = [str(item) for item in order_ids if item]
+        if not pending:
+            return True
+
+        def mutate(body: Dict[str, Any]) -> None:
+            ends = dict(body.get("partial_ends") or {})
+            for text in pending:
+                if self._flat_dead_mark(ends.get(text), text):
+                    ends.pop(text, None)
+            body["partial_ends"] = ends
+
+        def visible(stored: Optional[Dict[str, Any]]) -> bool:
+            ends = (stored or {}).get("partial_ends") or {}
+            return all(text not in ends for text in pending)
+
+        if not await self._partial_cas(executor_id, mutate, visible):
+            return False
+        parsed = self._partial_parsed(executor_id) or {}
+        ends = parsed.get("partial_ends") or {}
+        return all(text not in ends for text in pending)
+
+    async def _retract_unconfirmed_dead_ends(self, executor_id: str, executor: Any) -> bool:
+        """Номер ожил после записи — снять конец, чтобы отмена снова его видела."""
+        bag = self.__dict__.setdefault("_unconfirmed_dead_ends", {}).setdefault(executor_id, set())
+        if not bag:
+            return True
+        live = [text for text in sorted(bag) if not self._own_number_still_dead(executor, text)]
+        if not live:
+            return True
+        if not await self._drop_flat_ends(executor_id, live):
+            return False
+        bag.difference_update(live)
+        return True
+
+    async def _remember_own_dead_ends(self, executor_id: str, executor: Any) -> bool:
+        """Своему номеру со строкой finished — конец до stop(). Чужой ban не пишем.
+
+        Пустой открытый список и таблица orders концом не являются. После записи
+        книга читается заново: номер ожил — конец снимается, stop() не зовётся.
+        """
+        if not await self._retract_unconfirmed_dead_ends(executor_id, executor):
+            return False
+        ids = self._own_stop_ids(executor_id)
+        if ids is None:
+            return False
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        fresh = self._pair_book(pair) if pair else None
+        if not self._lists_ready(fresh):
+            return False
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        inflight = getattr(connector, "in_flight_orders", None)
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None)
+        if not isinstance(inflight, dict) or not isinstance(lost, dict):
+            return False
+        pending: List[str] = []
+        parsed = self._partial_parsed(executor_id) or {}
+        already = set((parsed.get("partial_ends") or {}))
+        for text in sorted(ids):
+            if text in already:
+                continue
+            if order_send_unknown(text) or text in inflight or text in lost:
+                return False
+            if self._shutdown_text_present((fresh or {}).get("opens"), text):
+                return False
+            if self._finished_row(text, fresh) is None:
+                continue
+            pending.append(text)
+        if not pending:
+            return True
+
+        def mutate(body: Dict[str, Any]) -> None:
+            ends = dict(body.get("partial_ends") or {})
+            for text in pending:
+                if text in ends:
+                    continue
+                self._shutdown_end_mark(ends, text)
+            body["partial_ends"] = ends
+
+        def visible(stored: Optional[Dict[str, Any]]) -> bool:
+            ends = (stored or {}).get("partial_ends") or {}
+            for text in pending:
+                mark = ends.get(text) or {}
+                if not self._flat_dead_mark(mark, text):
+                    return False
+            return True
+
+        if not await self._partial_cas(executor_id, mutate, visible):
+            return False
+        if not all(self._dead_end_visible(executor_id, text) for text in pending):
+            return False
+        bag = self.__dict__.setdefault("_unconfirmed_dead_ends", {}).setdefault(executor_id, set())
+        bag.update(pending)
+        if not await self._retract_unconfirmed_dead_ends(executor_id, executor):
+            return False
+        return all(
+            self._own_number_still_dead(executor, text) and self._dead_end_visible(executor_id, text)
+            for text in pending
+        )
+
     def _maybe_enter_shutdown(self, executor_id: str, executor: Any) -> bool:
         """Метка и доказанная продажа гашения: один раз войти в завершение."""
         if getattr(executor, "_stop_entered", False):
@@ -3404,6 +3570,15 @@ class ExecutorService:
         original_stop = getattr(executor, "control_shutdown_process", None)
 
         async def stop_held(*args, **kwargs):
+            proven = service._stop_mark_now(executor_id) and service._shutdown_close_proven(executor_id)
+            if proven and not await service._retract_unconfirmed_dead_ends(executor_id, executor):
+                service._log_silent_exit(
+                    "proven-finish", "", "live end not cleared", executor_id,
+                    interval=300.0, label="silent stop exit:", key=executor_id,
+                )
+                return None
+            if proven and getattr(executor, "_proven_finish_stopped", False):
+                return None
             released = service._stop_held_may_finish(executor_id, executor)
             if not released:
                 gate = (service.__dict__.get("_stop_gate") or {}).get(executor_id) or "unknown"
@@ -3411,6 +3586,29 @@ class ExecutorService:
                     "stop-held", "", f"gate={gate}", executor_id,
                     interval=300.0, label="silent stop exit:", key=executor_id,
                 )
+                return None
+            # Доказанное «закрывать нечего» не отдаём штатному шагу: он зовёт
+            # control_close, тормоз его держит, счётчик повторов ставит FAILED.
+            if proven:
+                if not await service._remember_own_dead_ends(executor_id, executor):
+                    service._log_silent_exit(
+                        "proven-finish", "", "end not visible", executor_id,
+                        interval=300.0, label="silent stop exit:", key=executor_id,
+                    )
+                    return None
+                if not service._stop_held_may_finish(executor_id, executor):
+                    return None
+                if not service._shutdown_close_proven(executor_id):
+                    return None
+                stopper = getattr(executor, "stop", None)
+                if not callable(stopper):
+                    return None
+                # Тормоз пускает stop() только если атрибут истинен. Метод уже
+                # доказал гашение; тик без книги остатка мог записать ложь.
+                executor._shutdown_close_proven = True
+                stopper()
+                executor._proven_finish_stopped = True
+                service.__dict__.get("_unconfirmed_dead_ends", {}).pop(executor_id, None)
                 return None
             if original_stop is None:
                 return None
@@ -8555,6 +8753,13 @@ class ExecutorService:
                 return
 
             def wrapped(*args, **kwargs):
+                # Счётчик повторов при доказанном гашении ставит FAILED. Это не конец.
+                if (
+                    name == "evaluate_max_retries"
+                    and service._stop_mark_now(executor_id)
+                    and service._shutdown_close_proven(executor_id)
+                ):
+                    return None
                 if service._stop_mark_now(executor_id):
                     return original(*args, **kwargs)
                 parsed = service._partial_parsed(executor_id)

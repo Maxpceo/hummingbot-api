@@ -1508,3 +1508,319 @@ def test_stop_held_wrapper_does_not_call_the_inner_finish(monkeypatch, tmp_path)
     service._install_open_shell(EXECUTOR, executor)
     asyncio.run(executor.control_shutdown_process())
     assert called == []
+
+
+class _CloseType:
+    def __init__(self, name):
+        self.name = name
+
+
+def _cas_into_rows(service):
+    async def fake_cas(executor_id, mutate, visible, target_id=None):
+        body = json.loads(service._hold_rows[0]["checkpoint"])
+        mutate(body)
+        if not visible(body):
+            return False
+        service._hold_rows[0]["checkpoint"] = json.dumps(body)
+        return True
+
+    return fake_cas
+
+
+def _proven_scene(
+    monkeypatch, tmp_path, *,
+    buy_end=False, with_close=True, finished=None, opens=None,
+    extra_journal=None, bans=None, mark=True, brake=False,
+):
+    """Метка и продажа «закрывать нечего». buy-1 — свой номер, flat-1 — гашение."""
+    lines = [_row("buy-1", level_id="L1", role="open", sent=True, ts=10)]
+    if with_close:
+        lines.append(_row("flat-1", level_id="", role="market_close", sent=True, ts=20))
+    if extra_journal:
+        lines.extend(extra_journal)
+    _journal(tmp_path, monkeypatch, lines)
+    body = json.loads(_checkpoint(_level(level_id="L1", open_id="buy-1")))
+    ends = {}
+    if with_close:
+        ends["flat-1"] = {"kind": "nothing-to-close", "order_ids": ["flat-1"]}
+    if buy_end:
+        ends["buy-1"] = {"kind": "flat", "order_ids": ["buy-1"]}
+    body["partial_ends"] = ends
+    if bans:
+        body["close_bans"] = list(bans)
+    service, repo, connector = _service_with(monkeypatch, json.dumps(body))
+    fresh = _fresh(finished=finished or [])
+    fresh["opens"] = list(opens or [])
+    service._remember_tick_fresh(PAIR, fresh)
+    service.__dict__["_sweep_seen"] = True
+    service.__dict__["_sweep_failed"] = False
+    calls = []
+    executor = _stub_executor(connector, calls)
+    executor.config.trading_pair = PAIR
+    executor.connectors = {"gate_io": connector}
+    executor.close_type = _CloseType("EARLY_STOP")
+    executor._current_retries = 11
+    sold = []
+    cancelled = []
+    connector.sell = lambda *args, **kwargs: sold.append(args)
+    executor.cancel_open_orders = lambda *args, **kwargs: cancelled.append("cancel")
+    executor._strategy = SimpleNamespace(
+        cancel=lambda *args, **kwargs: cancelled.append(kwargs.get("order_id")),
+    )
+
+    def stop(*args, **kwargs):
+        if brake:
+            assert executor._shutdown_close_proven is True
+        calls.append("stop")
+
+    async def shutdown(*args, **kwargs):
+        calls.append("shutdown")
+
+    def retries(*args, **kwargs):
+        calls.append("retries")
+        executor.close_type = _CloseType("FAILED")
+
+    executor.stop = stop
+    executor.control_shutdown_process = shutdown
+    executor.evaluate_max_retries = retries
+    executor.adjust_and_place_open_order = lambda level: None
+    service._active_executors[EXECUTOR] = executor
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(checkpoint_mod, "order_miss_unreadable", lambda: False)
+    monkeypatch.setattr("services.executor_service.order_miss_unreadable", lambda: False)
+    monkeypatch.setattr(service, "_partial_cas", _cas_into_rows(service))
+    executor._shutdown_close_proven = False
+    if mark:
+        service.__dict__.setdefault("_stop_mark_ram", {})[EXECUTOR] = True
+    if brake:
+        from utils.executor_checkpoint import install_close_without_level
+        assert install_close_without_level(
+            executor, EXECUTOR,
+            frozen=lambda eid=EXECUTOR: service._stop_mark_now(eid),
+        )
+    service._install_open_shell(EXECUTOR, executor)
+    return service, executor, connector, calls, sold, cancelled
+
+
+def test_proven_finish_stops_once_and_does_not_fail(monkeypatch, tmp_path):
+    """Доказанное гашение: stop() один раз сквозь тормоз, тип EARLY_STOP."""
+    service, executor, connector, calls, sold, cancelled = _proven_scene(
+        monkeypatch, tmp_path, buy_end=True, brake=True,
+    )
+    assert executor._shutdown_close_proven is False
+    asyncio.run(executor.control_shutdown_process())
+    asyncio.run(executor.control_shutdown_process())
+    executor.evaluate_max_retries()
+    assert calls == ["stop"]
+    assert executor.close_type.name == "EARLY_STOP"
+    assert sold == []
+    assert cancelled == []
+
+
+def test_proven_finish_waits_without_an_end_or_a_finished_row(monkeypatch, tmp_path):
+    """Свой номер без конца и без finished: stop() нет и FAILED нет."""
+    service, executor, connector, calls, sold, cancelled = _proven_scene(monkeypatch, tmp_path)
+    asyncio.run(executor.control_shutdown_process())
+    executor.evaluate_max_retries()
+    assert calls == []
+    assert executor.close_type.name == "EARLY_STOP"
+
+    opened = _fresh()
+    opened["opens"] = [{"text": "buy-1"}]
+    service._remember_tick_fresh(PAIR, opened)
+    asyncio.run(executor.control_shutdown_process())
+    executor.evaluate_max_retries()
+    assert calls == []
+
+    service._remember_tick_fresh(PAIR, _fresh(finished=[{
+        "text": "buy-1", "finish_as": "filled", "amount": "1", "left": "0",
+    }]))
+    connector.in_flight_orders = {"buy-1": object()}
+    asyncio.run(executor.control_shutdown_process())
+    executor.evaluate_max_retries()
+    assert "stop" not in calls
+    assert executor.close_type.name == "EARLY_STOP"
+    connector.in_flight_orders = {}
+    connector._order_tracker.lost_orders = {"buy-1": object()}
+    asyncio.run(executor.control_shutdown_process())
+    assert "stop" not in calls
+    connector._order_tracker.lost_orders = {}
+    import services.executor_service as service_mod
+    monkeypatch.setattr(service_mod, "order_send_unknown", lambda order_id: order_id == "buy-1")
+    asyncio.run(executor.control_shutdown_process())
+    assert calls == []
+    assert executor.close_type.name == "EARLY_STOP"
+
+
+def test_unread_book_does_not_stop_the_proven_finish(monkeypatch, tmp_path):
+    """Непрочитанная книга: этот срез stop() не зовёт и FAILED сам не ставит."""
+    service, executor, connector, calls, sold, cancelled = _proven_scene(
+        monkeypatch, tmp_path, buy_end=True,
+    )
+    fresh = _fresh()
+    fresh["finished_read"] = False
+    service._remember_tick_fresh(PAIR, fresh)
+    asyncio.run(executor.control_shutdown_process())
+    assert calls == []
+    assert executor.close_type.name == "EARLY_STOP"
+
+
+def test_live_again_after_the_write_drops_the_end_and_does_not_stop(monkeypatch, tmp_path):
+    """Пока запись шла, номер вернулся в открытые: конец снят, stop() нет."""
+    service, executor, connector, calls, sold, cancelled = _proven_scene(
+        monkeypatch, tmp_path,
+        finished=[{"text": "buy-1", "finish_as": "filled", "amount": "1", "left": "0"}],
+    )
+
+    async def cas_then_open(executor_id, mutate, visible, target_id=None):
+        body = json.loads(service._hold_rows[0]["checkpoint"])
+        before = set((body.get("partial_ends") or {}))
+        mutate(body)
+        if not visible(body):
+            return False
+        service._hold_rows[0]["checkpoint"] = json.dumps(body)
+        added = set((body.get("partial_ends") or {})) - before
+        if "buy-1" in added:
+            fresh = dict(service._pair_book(PAIR))
+            fresh["opens"] = [{"text": "buy-1"}]
+            service._remember_tick_fresh(PAIR, fresh)
+        return True
+
+    monkeypatch.setattr(service, "_partial_cas", cas_then_open)
+    asyncio.run(executor.control_shutdown_process())
+    ends = service._partial_parsed(EXECUTOR).get("partial_ends") or {}
+    assert "buy-1" not in ends
+    assert calls == []
+    unfinished = service._stop_unfinished_ids(EXECUTOR, service._pair_book(PAIR))
+    assert "buy-1" in unfinished
+
+
+def test_failed_end_rollback_retries_and_does_not_stop(monkeypatch, tmp_path):
+    """Снять ожившую метку не вышло — stop() нет. Следующий тик снимает её."""
+    service, executor, connector, calls, sold, cancelled = _proven_scene(
+        monkeypatch, tmp_path,
+        finished=[{"text": "buy-1", "finish_as": "filled", "amount": "1", "left": "0"}],
+    )
+    drops = {"n": 0}
+
+    async def cas_then_open(executor_id, mutate, visible, target_id=None):
+        body = json.loads(service._hold_rows[0]["checkpoint"])
+        before = set((body.get("partial_ends") or {}))
+        mutate(body)
+        if not visible(body):
+            return False
+        added = set((body.get("partial_ends") or {})) - before
+        removed = before - set((body.get("partial_ends") or {}))
+        if removed:
+            drops["n"] += 1
+            if drops["n"] == 1:
+                return False
+        service._hold_rows[0]["checkpoint"] = json.dumps(body)
+        if "buy-1" in added:
+            fresh = dict(service._pair_book(PAIR))
+            fresh["opens"] = [{"text": "buy-1"}]
+            service._remember_tick_fresh(PAIR, fresh)
+        return True
+
+    monkeypatch.setattr(service, "_partial_cas", cas_then_open)
+    asyncio.run(executor.control_shutdown_process())
+    assert "buy-1" in (service._partial_parsed(EXECUTOR).get("partial_ends") or {})
+    assert calls == []
+    asyncio.run(executor.control_shutdown_process())
+    assert "buy-1" not in (service._partial_parsed(EXECUTOR).get("partial_ends") or {})
+    assert calls == []
+
+
+def test_finished_own_number_gets_an_end_before_stop(monkeypatch, tmp_path):
+    """Строка finished без конца: конец без price и level_id, затем stop()."""
+    service, executor, connector, calls, sold, cancelled = _proven_scene(
+        monkeypatch, tmp_path,
+        finished=[{"text": "buy-1", "finish_as": "filled", "amount": "1", "left": "0"}],
+    )
+
+    def stop(*args, **kwargs):
+        mark = service._partial_parsed(EXECUTOR)["partial_ends"]["buy-1"]
+        assert mark.get("kind") and "price" not in mark and "level_id" not in mark
+        calls.append("stop")
+
+    executor.stop = stop
+    asyncio.run(executor.control_shutdown_process())
+    assert calls == ["stop"]
+    assert sold == []
+
+
+def test_failed_end_write_does_not_stop(monkeypatch, tmp_path):
+    """Запись конца не прошла — stop() нет."""
+    service, executor, connector, calls, sold, cancelled = _proven_scene(
+        monkeypatch, tmp_path,
+        finished=[{"text": "buy-1", "finish_as": "filled", "amount": "1", "left": "0"}],
+    )
+
+    async def no_write(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(service, "_partial_cas", no_write)
+    asyncio.run(executor.control_shutdown_process())
+    assert calls == []
+    assert "buy-1" not in (service._partial_parsed(EXECUTOR).get("partial_ends") or {})
+    assert executor.close_type.name == "EARLY_STOP"
+
+
+def test_empty_opens_and_orders_table_do_not_write_an_end(monkeypatch, tmp_path):
+    """Пустой открытый список и FILLED в таблице orders конец не пишут."""
+    service, executor, connector, calls, sold, cancelled = _proven_scene(monkeypatch, tmp_path)
+    asked = []
+
+    class _Orders:
+        def __init__(self, session):
+            pass
+
+        async def get_order_by_client_id(self, text):
+            asked.append(text)
+            return SimpleNamespace(status="FILLED")
+
+    monkeypatch.setattr(
+        "database.repositories.order_repository.OrderRepository", _Orders,
+    )
+    assert asyncio.run(service._remember_own_dead_ends(EXECUTOR, executor)) is True
+    assert asked == []
+    assert "buy-1" not in (service._partial_parsed(EXECUTOR).get("partial_ends") or {})
+    asyncio.run(executor.control_shutdown_process())
+    assert "stop" not in calls
+
+
+def test_foreign_ban_does_not_get_an_end_or_block_stop(monkeypatch, tmp_path):
+    """Номер в close_bans чужого журнала: конца нет, отмены нет, свой стоп не держится."""
+    foreign = _row("foreign-1", level_id="L9", role="open", sent=True, ts=30)
+    foreign["executor_id"] = "grid-b"
+    service, executor, connector, calls, sold, cancelled = _proven_scene(
+        monkeypatch, tmp_path, buy_end=True, extra_journal=[foreign], bans=["foreign-1"],
+    )
+    asyncio.run(executor.control_shutdown_process())
+    ends = service._partial_parsed(EXECUTOR).get("partial_ends") or {}
+    assert "foreign-1" not in ends
+    assert calls == ["stop"]
+    assert cancelled == []
+    assert sold == []
+
+
+def test_unmarked_stop_does_not_use_the_new_finish(monkeypatch, tmp_path):
+    """Нет метки: новый stop() не зовётся, штатный шаг остаётся."""
+    service, executor, connector, calls, sold, cancelled = _proven_scene(
+        monkeypatch, tmp_path, buy_end=True, with_close=False, mark=False,
+    )
+    asyncio.run(executor.control_shutdown_process())
+    assert "stop" not in calls
+    assert "shutdown" in calls
+
+
+def test_unproven_stop_keeps_the_old_retry_wrap(monkeypatch, tmp_path):
+    """Гашение не доказано: новый stop() не зовётся, счётчик остаётся прежним."""
+    service, executor, connector, calls, sold, cancelled = _proven_scene(
+        monkeypatch, tmp_path, buy_end=True, with_close=False, mark=True,
+    )
+    asyncio.run(executor.control_shutdown_process())
+    executor.evaluate_max_retries()
+    assert "stop" not in calls
+    assert "shutdown" in calls
+    assert executor.close_type.name == "FAILED"
