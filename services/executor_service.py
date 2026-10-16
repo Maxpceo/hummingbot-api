@@ -2187,6 +2187,7 @@ class ExecutorService:
         # гашение. Концы без level_id (отдельные номера) тоже отпускают номер.
         released = set(self.__dict__.get("_released_order_ids", set()))
         released.update(partial_released_ids(self._partial_parsed(executor_id)))
+        released.difference_update(self._retained_51400_unproven(executor_id))
         held_ids = [order_id for order_id in sorted(ids) if order_id not in released]
         if held_ids:
             gates[executor_id] = "unreleased-ids ids=" + ",".join(held_ids)
@@ -2242,6 +2243,9 @@ class ExecutorService:
                 gates[executor_id] = "still-open"
                 return False
             if text in released or partial_end_visible(parsed, text):
+                if text in self._retained_51400_unproven(executor_id, fresh):
+                    gates[executor_id] = "retained-unproven"
+                    return False
                 continue
             if self._finished_row(text, fresh) is not None:
                 continue
@@ -6949,6 +6953,9 @@ class ExecutorService:
         for hold in (parsed or {}).get("holds") or []:
             if isinstance(hold, dict) and hold.get("order_id") and hold.get("role") != "market_close":
                 numbers.add(str(hold.get("order_id")))
+        for saved in (parsed or {}).get("retained_orders") or []:
+            if isinstance(saved, dict) and saved.get("order_id"):
+                numbers.add(str(saved.get("order_id")))
         out = []
         for text in sorted(numbers):
             if partial_end_visible(parsed, text):
@@ -6991,9 +6998,11 @@ class ExecutorService:
                 result = await result
             return result is True
         except Exception as exc:
-            if self._exchange_says_gone(exc) and await self._remember_exchange_gone(executor_id, text, pair):
-                return True
-            logger.exception("stop cancel delivery failed for %s", text)
+            if self._exchange_says_gone(exc) and not self._cancel_end_blocked(executor, text, pair):
+                if await self._remember_exchange_gone(executor_id, text, pair):
+                    return True
+            if not self._exchange_says_gone(exc):
+                logger.exception("stop cancel delivery failed for %s", text)
             return False
         finally:
             _cancel_delivery_id.reset(token)
@@ -7021,6 +7030,127 @@ class ExecutorService:
             return Decimal(str(raw.get("fill_size"))) == 0
         except (ArithmeticError, ValueError, TypeError):
             return False
+
+    def _retained_ids(self, executor_id: str) -> set:
+        found = set()
+        for saved in (self._partial_parsed(executor_id) or {}).get("retained_orders") or []:
+            if isinstance(saved, dict) and saved.get("order_id"):
+                found.add(str(saved.get("order_id")))
+        return found
+
+    def _retained_level_id(self, executor_id: str, order_id: str) -> str:
+        text = str(order_id or "")
+        for saved in (self._partial_parsed(executor_id) or {}).get("retained_orders") or []:
+            if isinstance(saved, dict) and str(saved.get("order_id") or "") == text:
+                return str(saved.get("level_id") or "")
+        return ""
+
+    def _level_close_ids(self, executor_id: str, level_id: str) -> set:
+        """Закрытие этого уровня: слот close_order и partial_closes. Чужой уровень не входит."""
+        found = set()
+        if not level_id:
+            return found
+        for level in (self._partial_parsed(executor_id) or {}).get("levels") or []:
+            if not isinstance(level, dict) or str(level.get("id") or "") != level_id:
+                continue
+            close = level.get("close_order") or {}
+            if isinstance(close, dict) and close.get("order_id"):
+                found.add(str(close.get("order_id")))
+            for item in level.get("partial_closes") or []:
+                if isinstance(item, dict) and item.get("order_id"):
+                    found.add(str(item.get("order_id")))
+        return found
+
+    def _retained_sale_covers(
+        self, executor_id: str, order_id: str, fresh: Optional[Dict[str, Any]], buy_row: Dict[str, Any],
+    ) -> bool:
+        """Продажа этого номера: close того же level_id. Чужой close и один close на двоих — нет."""
+        text = str(order_id or "")
+        level_id = self._retained_level_id(executor_id, text)
+        close_ids = self._level_close_ids(executor_id, level_id)
+        if not level_id or not close_ids:
+            return False
+        for other in self._retained_ids(executor_id):
+            if other == text:
+                continue
+            if self._level_close_ids(executor_id, self._retained_level_id(executor_id, other)) & close_ids:
+                return False
+        rows = self._partial_rows()
+        if not rows:
+            return False
+        bought = self._shutdown_sold_base(buy_row)
+        if bought is None or bought <= 0:
+            return False
+        sold = Decimal("0")
+        for item in rows:
+            name = str(item.get("order_id") or "")
+            if name not in close_ids:
+                continue
+            if str(item.get("executor_id") or "") != str(executor_id):
+                continue
+            if str(item.get("level_id") or "") != level_id:
+                continue
+            if str(item.get("role") or "") not in ("close", "market_close"):
+                continue
+            finished = self._finished_row(name, fresh)
+            if finished is None or not self._closed_row_filled(finished):
+                continue
+            sold += self._shutdown_sold_base(finished)
+            close_ids.discard(name)
+        return sold >= bought
+
+    def _retained_finish_proven(self, executor_id: str, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Finished-снятие с нулём или исполнение, покрытое продажей этого номера."""
+        row = self._finished_row(str(order_id or ""), fresh)
+        if row is None:
+            return False
+        if self._finished_zero_cancel(row):
+            return True
+        if not self._closed_row_filled(row):
+            return False
+        return self._retained_sale_covers(executor_id, order_id, fresh, row)
+
+    def _retained_51400_unproven(self, executor_id: str, fresh: Optional[Dict[str, Any]] = None) -> set:
+        """Конец 51400 в retained_orders не отпускает завершение, пока нет finished-доказательства.
+
+        Пустой журнал и `_shutdown_close_proven` сюда не входят: они эту покупку не видят.
+        """
+        if fresh is None:
+            pair = ""
+            executor = (getattr(self, "_active_executors", None) or {}).get(executor_id)
+            pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+            if not pair:
+                for row in getattr(self, "_hold_rows", None) or []:
+                    if row.get("executor_id") == executor_id:
+                        pair = row.get("trading_pair") or ""
+                        break
+            fresh = self._pair_book(pair) if pair else None
+        blocked = set()
+        for text in self._retained_ids(executor_id):
+            if not self._exchange_gone_end(executor_id, text):
+                continue
+            if self._retained_finish_proven(executor_id, text, fresh):
+                continue
+            blocked.add(text)
+        return blocked
+
+    def _cancel_end_blocked(self, executor: Any, order_id: str, pair: str) -> bool:
+        """До конца 51400. `_remember_exchange_gone` этих проверок не делает."""
+        text = str(order_id or "")
+        fresh = self._pair_book(pair or "")
+        if not text or not self._lists_ready(fresh):
+            return True
+        if self._shutdown_text_present((fresh or {}).get("opens"), text):
+            return True
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        inflight = getattr(connector, "in_flight_orders", None)
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None)
+        if not isinstance(inflight, dict) or not isinstance(lost, dict):
+            return True
+        if text in inflight or text in lost or order_send_unknown(text):
+            return True
+        return False
 
     def _exchange_gone_end(self, executor_id: str, order_id: str) -> bool:
         mark = ((self._partial_parsed(executor_id) or {}).get("partial_ends") or {}).get(str(order_id)) or {}

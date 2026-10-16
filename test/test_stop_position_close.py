@@ -1824,3 +1824,162 @@ def test_unproven_stop_keeps_the_old_retry_wrap(monkeypatch, tmp_path):
     assert "stop" not in calls
     assert "shutdown" in calls
     assert executor.close_type.name == "FAILED"
+
+
+def _retained_scene(monkeypatch, tmp_path, order_id="ret-1"):
+    """Номер только в retained_orders. Журнала этой покупки нет."""
+    _journal(tmp_path, monkeypatch, [])
+    body = json.loads(_checkpoint(_level(level_id="L1")))
+    body["retained_orders"] = [{
+        "order_id": order_id, "filled": True, "role": "open_order", "price": "100",
+    }]
+    service, repo, connector = _service_with(monkeypatch, json.dumps(body))
+    fresh = _fresh()
+    service._remember_tick_fresh(PAIR, fresh)
+    service.__dict__["_sweep_seen"] = True
+    service.__dict__["_sweep_failed"] = False
+    executor = _stub_executor(connector, [])
+    executor.config.trading_pair = PAIR
+    executor.connectors = {"gate_io": connector}
+    service._active_executors[EXECUTOR] = executor
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(checkpoint_mod, "order_miss_unreadable", lambda: False)
+    monkeypatch.setattr("services.executor_service.order_miss_unreadable", lambda: False)
+    monkeypatch.setattr(service, "_partial_cas", _cas_into_rows(service))
+    return service, executor, connector, fresh
+
+
+def test_retained_number_is_delivered_and_a_foreign_price_is_not(monkeypatch, tmp_path):
+    """Свой номер только в retained_orders входит в отмену. Чужой по цене — нет."""
+    service, executor, connector, fresh = _retained_scene(monkeypatch, tmp_path)
+    pending = service._stop_unfinished_ids(EXECUTOR, fresh)
+    assert "ret-1" in pending
+    assert "foreign-same-price" not in pending
+
+
+def test_retained_51400_does_not_release_finish(monkeypatch, tmp_path):
+    """51400 гасит повтор отмены, но пустой журнал не закрывает сетку."""
+    service, executor, connector, fresh = _retained_scene(monkeypatch, tmp_path)
+    calls = []
+
+    async def place_cancel(order_id, row):
+        calls.append(str(order_id))
+        raise _gone_error()
+
+    connector._place_cancel = place_cancel
+    executor.stop = lambda *args, **kwargs: calls.append("stop")
+    executor.adjust_and_place_open_order = lambda level: None
+    service.__dict__.setdefault("_stop_mark_ram", {})[EXECUTOR] = True
+    service._install_open_shell(EXECUTOR, executor)
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "ret-1", PAIR, EXECUTOR)) is True
+    assert service._exchange_gone_end(EXECUTOR, "ret-1") is True
+    mark = service._partial_parsed(EXECUTOR)["partial_ends"]["ret-1"]
+    assert "price" not in mark
+    assert "ret-1" not in service._stop_unfinished_ids(EXECUTOR, fresh)
+    assert service._executor_proofs_released(EXECUTOR) is False
+    assert service._stop_held_may_finish(EXECUTOR, executor) is False
+    asyncio.run(executor.control_shutdown_process())
+    if service._executor_proofs_released(EXECUTOR):
+        executor.stop()
+        service._active_executors.pop(EXECUTOR, None)
+    assert "stop" not in calls
+    assert EXECUTOR in service._active_executors
+    retained = service._partial_parsed(EXECUTOR).get("retained_orders") or []
+    assert any(item.get("order_id") == "ret-1" for item in retained)
+
+
+def test_retained_cancel_does_not_write_gone_while_live(monkeypatch, tmp_path):
+    """Живой или непрочитанный номер из retained_orders конца не получает."""
+    service, executor, connector, fresh = _retained_scene(monkeypatch, tmp_path)
+
+    async def place_cancel(order_id, row):
+        raise _gone_error()
+
+    connector._place_cancel = place_cancel
+    fresh_unread = _fresh()
+    fresh_unread["opens_read"] = False
+    service._remember_tick_fresh(PAIR, fresh_unread)
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "ret-1", PAIR, EXECUTOR)) is False
+    assert service._exchange_gone_end(EXECUTOR, "ret-1") is False
+    assert "ret-1" in service._stop_unfinished_ids(EXECUTOR, _fresh())
+
+    service._remember_tick_fresh(PAIR, _fresh())
+    opened = _fresh()
+    opened["opens"] = [{"text": "ret-1"}]
+    service._remember_tick_fresh(PAIR, opened)
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "ret-1", PAIR, EXECUTOR)) is False
+    assert service._exchange_gone_end(EXECUTOR, "ret-1") is False
+
+    service._remember_tick_fresh(PAIR, _fresh())
+    connector.in_flight_orders = {"ret-1": object()}
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "ret-1", PAIR, EXECUTOR)) is False
+    connector.in_flight_orders = {}
+    connector._order_tracker.lost_orders = {"ret-1": object()}
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "ret-1", PAIR, EXECUTOR)) is False
+    connector._order_tracker.lost_orders = {}
+    connector.in_flight_orders = None
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "ret-1", PAIR, EXECUTOR)) is False
+    connector.in_flight_orders = {}
+    import services.executor_service as service_mod
+    monkeypatch.setattr(service_mod, "order_send_unknown", lambda order_id: order_id == "ret-1")
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "ret-1", PAIR, EXECUTOR)) is False
+    assert service._exchange_gone_end(EXECUTOR, "ret-1") is False
+    assert "ret-1" in service._stop_unfinished_ids(EXECUTOR, _fresh())
+
+
+def test_market_failure_wrapper_does_not_end_or_sell(monkeypatch, tmp_path):
+    """Обёртка MarketOrderFailureEvent не конец и не новая продажа."""
+    service, executor, connector, fresh = _retained_scene(monkeypatch, tmp_path)
+    sold = []
+    connector.sell = lambda *args, **kwargs: sold.append(args)
+
+    async def place_cancel(order_id, row):
+        raise OSError("Order failed: MarketOrderFailureEvent")
+
+    connector._place_cancel = place_cancel
+    assert service._nothing_to_close_text("Order failed: MarketOrderFailureEvent") is False
+    assert asyncio.run(service._stop_deliver_cancel(executor, connector, "ret-1", PAIR, EXECUTOR)) is False
+    assert service._exchange_gone_end(EXECUTOR, "ret-1") is False
+    assert sold == []
+
+
+def test_other_close_does_not_prove_a_retained_buy(monkeypatch, tmp_path):
+    """Чужой close того же исполнителя не продажа номера из retained_orders."""
+    _journal(tmp_path, monkeypatch, [
+        _row("other-close", level_id="L9", role="close", sent=True, ts=30),
+        _row("level-close", level_id="L1", role="close", sent=True, ts=31),
+    ])
+    body = json.loads(_checkpoint(_level(level_id="L1", close_id="level-close")))
+    body["retained_orders"] = [
+        {"order_id": "ret-1", "filled": True, "role": "open_order", "level_id": "L1", "price": "100"},
+        {"order_id": "ret-2", "filled": True, "role": "open_order", "level_id": "L1", "price": "100"},
+    ]
+    body["partial_ends"] = {
+        "ret-1": {"kind": "gone", "order_ids": ["ret-1"], "exchange": "51400"},
+        "ret-2": {"kind": "gone", "order_ids": ["ret-2"], "exchange": "51400"},
+    }
+    service, repo, connector = _service_with(monkeypatch, json.dumps(body))
+    fresh = _fresh(finished=[{
+        "text": "ret-1", "finish_as": "filled", "amount": "1", "left": "0",
+    }, {
+        "text": "ret-2", "finish_as": "filled", "amount": "1", "left": "0",
+    }, {
+        "text": "other-close", "finish_as": "filled", "amount": "9", "left": "0",
+    }, {
+        "text": "level-close", "finish_as": "filled", "amount": "9", "left": "0",
+    }])
+    service._remember_tick_fresh(PAIR, fresh)
+    service.__dict__["_sweep_seen"] = True
+    service.__dict__["_sweep_failed"] = False
+    executor = _stub_executor(connector, [])
+    executor.config.trading_pair = PAIR
+    executor.connectors = {"gate_io": connector}
+    service._active_executors[EXECUTOR] = executor
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(checkpoint_mod, "order_miss_unreadable", lambda: False)
+    monkeypatch.setattr("services.executor_service.order_miss_unreadable", lambda: False)
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", fresh) is False
+    assert service._retained_finish_proven(EXECUTOR, "ret-2", fresh) is False
+    assert "ret-1" in service._retained_51400_unproven(EXECUTOR, fresh)
+    assert service._executor_proofs_released(EXECUTOR) is False
+    assert service._stop_held_may_finish(EXECUTOR, executor) is False
