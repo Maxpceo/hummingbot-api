@@ -2194,6 +2194,81 @@ class ExecutorService:
         gates.pop(executor_id, None)
         return True
 
+    def _stop_held_may_finish(self, executor_id: str, executor: Any) -> bool:
+        """Внутреннее завершение только если каждый номер мёртв доказанно.
+
+        Нет в открытых — не смерть. Непрочитанная книга, трекер, lost и
+        неизвестная отправка пропуск не дают.
+        """
+        gates = self.__dict__.setdefault("_stop_gate", {})
+        if buy_blocked() or ledger_executor_ids() is None or order_miss_unreadable():
+            gates[executor_id] = "unread"
+            return False
+        if not self.__dict__.get("_sweep_seen") or self.__dict__.get("_sweep_failed"):
+            gates[executor_id] = "sweep"
+            return False
+        column_ids = self._column_ids_for_executor(executor_id)
+        if column_ids is None:
+            gates[executor_id] = "column-unread"
+            return False
+        try:
+            from utils.executor_checkpoint import read_ledger_filtered
+            rows = read_ledger_filtered()
+        except Exception:
+            gates[executor_id] = "ledger-reread"
+            return False
+        ids = {
+            str(row.get("order_id"))
+            for row in rows or []
+            if row.get("executor_id") == executor_id and row.get("order_id")
+        }
+        ids.update(column_ids)
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        fresh = self._pair_book(pair) if pair else None
+        if not self._lists_ready(fresh):
+            gates[executor_id] = "book-unread"
+            return False
+        inflight = getattr(connector, "in_flight_orders", None) or {}
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
+        parsed = self._partial_parsed(executor_id)
+        released = partial_released_ids(parsed)
+        for text in sorted(ids):
+            if order_send_unknown(text) or text in inflight or text in lost:
+                gates[executor_id] = "still-live"
+                return False
+            if self._shutdown_text_present((fresh or {}).get("opens"), text):
+                gates[executor_id] = "still-open"
+                return False
+            if text in released or partial_end_visible(parsed, text):
+                continue
+            if self._finished_row(text, fresh) is not None:
+                continue
+            gates[executor_id] = "unreleased-ids"
+            return False
+        gates.pop(executor_id, None)
+        return True
+
+    def _maybe_enter_shutdown(self, executor_id: str, executor: Any) -> bool:
+        """Метка и доказанная продажа гашения: один раз войти в завершение."""
+        if getattr(executor, "_stop_entered", False):
+            return False
+        if not self._stop_mark_now(executor_id):
+            return False
+        if not getattr(executor, "_shutdown_close_proven", False):
+            return False
+        status = getattr(executor, "status", None)
+        if getattr(status, "name", None) != "RUNNING":
+            return False
+        early = getattr(executor, "early_stop", None)
+        if not callable(early):
+            return False
+        keep = bool((self.__dict__.get("_stop_keep_position") or {}).get(str(executor_id)))
+        early(keep_position=keep)
+        executor._stop_entered = True
+        return True
+
     async def _cancel_owned_rows(self, connector, row: Dict[str, Any]) -> None:
         venue = open_list_venue(type(connector).__name__ if connector is not None else "")
         request = exchange_open_request(venue or "", row.get("trading_pair") or "")
@@ -3329,7 +3404,7 @@ class ExecutorService:
         original_stop = getattr(executor, "control_shutdown_process", None)
 
         async def stop_held(*args, **kwargs):
-            released = service._executor_proofs_released(executor_id)
+            released = service._stop_held_may_finish(executor_id, executor)
             if not released:
                 gate = (service.__dict__.get("_stop_gate") or {}).get(executor_id) or "unknown"
                 service._log_silent_exit(
@@ -8555,6 +8630,8 @@ class ExecutorService:
                             )
                         else:
                             executor._shutdown_close_proven = False
+                        if executor._shutdown_close_proven:
+                            service._maybe_enter_shutdown(executor_id, executor)
                 fresh = service._tick_fresh(pair or "")
                 if not service._lists_ready(fresh):
                     if service._partial_forbids(executor_id):

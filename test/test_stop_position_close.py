@@ -1388,3 +1388,123 @@ def test_visible_nothing_to_close_end_does_not_mint_a_second_sell(monkeypatch, t
     assert minted == []
     assert service._shutdown_remainder(EXECUTOR, fresh) == Decimal("9")
     assert service._shutdown_close_proven(EXECUTOR, fresh) is True
+
+
+class _Status:
+    def __init__(self, name):
+        self.name = name
+
+
+def _finish_ready(monkeypatch, tmp_path, finished=None, opens=None, ends=None):
+    _journal(tmp_path, monkeypatch, [
+        _row("buy-1", level_id="L1", role="open", sent=True, ts=10),
+    ])
+    body = json.loads(_checkpoint(_level(level_id="L1", open_id="buy-1")))
+    if ends:
+        body["partial_ends"] = ends
+    service, repo, connector = _service_with(monkeypatch, json.dumps(body))
+    fresh = _fresh(finished=finished or [])
+    fresh["opens"] = list(opens or [])
+    service._remember_tick_fresh(PAIR, fresh)
+    service.__dict__["_sweep_seen"] = True
+    service.__dict__["_sweep_failed"] = False
+    executor = _stub_executor(connector, [])
+    executor.config.trading_pair = PAIR
+    executor.connectors = {"gate_io": connector}
+    service._active_executors[EXECUTOR] = executor
+    import utils.executor_checkpoint as checkpoint_mod
+    monkeypatch.setattr(checkpoint_mod, "order_miss_unreadable", lambda: False)
+    monkeypatch.setattr("services.executor_service.order_miss_unreadable", lambda: False)
+    return service, executor, connector, fresh
+
+
+def test_proven_stop_enters_shutdown_once(monkeypatch, tmp_path):
+    """Метка и доказанная продажа: один вход в завершение, без новой продажи."""
+    service, executor, connector, fresh = _finish_ready(monkeypatch, tmp_path)
+    service.__dict__.setdefault("_stop_mark_ram", {})[EXECUTOR] = True
+    executor._shutdown_close_proven = True
+    executor.status = _Status("RUNNING")
+    calls = []
+
+    def early_stop(keep_position=False):
+        calls.append(keep_position)
+        executor.status = _Status("SHUTTING_DOWN")
+
+    executor.early_stop = early_stop
+    assert service._maybe_enter_shutdown(EXECUTOR, executor) is True
+    assert service._maybe_enter_shutdown(EXECUTOR, executor) is False
+    assert calls == [False]
+    assert executor.status.name == "SHUTTING_DOWN"
+
+
+def test_unproven_stop_does_not_enter_shutdown(monkeypatch, tmp_path):
+    """Нет метки или флаг ложь — в завершение не входим."""
+    service, executor, connector, fresh = _finish_ready(monkeypatch, tmp_path)
+    executor.status = _Status("RUNNING")
+    executor.early_stop = lambda **kwargs: calls.append("x")
+    calls = []
+    executor.early_stop = lambda **kwargs: calls.append("x")
+    assert service._maybe_enter_shutdown(EXECUTOR, executor) is False
+    service.__dict__.setdefault("_stop_mark_ram", {})[EXECUTOR] = True
+    executor._shutdown_close_proven = False
+    assert service._maybe_enter_shutdown(EXECUTOR, executor) is False
+    assert calls == []
+
+
+def test_stop_held_does_not_finish_without_death_proof(monkeypatch, tmp_path):
+    """Нет конца и нет finished — не завершать, даже если номера нет в открытых."""
+    service, executor, connector, fresh = _finish_ready(monkeypatch, tmp_path)
+    assert service._stop_held_may_finish(EXECUTOR, executor) is False
+    fresh_unread = _fresh()
+    fresh_unread["opens_read"] = False
+    service._remember_tick_fresh(PAIR, fresh_unread)
+    body = json.loads(service._hold_rows[0]["checkpoint"])
+    body["partial_ends"] = {"buy-1": {"kind": "flat", "order_ids": ["buy-1"]}}
+    service._hold_rows[0]["checkpoint"] = json.dumps(body)
+    assert service._stop_held_may_finish(EXECUTOR, executor) is False
+    opened = _fresh()
+    opened["opens"] = [{"text": "buy-1"}]
+    service._remember_tick_fresh(PAIR, opened)
+    assert service._stop_held_may_finish(EXECUTOR, executor) is False
+    service._remember_tick_fresh(PAIR, _fresh())
+    connector.in_flight_orders = {"buy-1": object()}
+    assert service._stop_held_may_finish(EXECUTOR, executor) is False
+    connector.in_flight_orders = {}
+    connector._order_tracker.lost_orders = {"buy-1": object()}
+    assert service._stop_held_may_finish(EXECUTOR, executor) is False
+    connector._order_tracker.lost_orders = {}
+    import services.executor_service as service_mod
+    monkeypatch.setattr(service_mod, "order_send_unknown", lambda order_id: order_id == "buy-1")
+    assert service._stop_held_may_finish(EXECUTOR, executor) is False
+
+
+def test_stop_held_finishes_only_when_every_number_is_dead(monkeypatch, tmp_path):
+    """Конец или finished у каждого номера, и никто не жив: завершение можно отдать."""
+    service, executor, connector, fresh = _finish_ready(
+        monkeypatch, tmp_path,
+        ends={"buy-1": {"kind": "flat", "order_ids": ["buy-1"]}},
+    )
+    assert "buy-1" not in [row.get("text") for row in fresh.get("opens") or []]
+    assert service._stop_held_may_finish(EXECUTOR, executor) is True
+    body = json.loads(service._hold_rows[0]["checkpoint"])
+    body["partial_ends"] = {}
+    service._hold_rows[0]["checkpoint"] = json.dumps(body)
+    service._remember_tick_fresh(PAIR, _fresh(finished=[{
+        "text": "buy-1", "finish_as": "filled", "amount": "1", "left": "0",
+    }]))
+    assert service._stop_held_may_finish(EXECUTOR, executor) is True
+
+
+def test_stop_held_wrapper_does_not_call_the_inner_finish(monkeypatch, tmp_path):
+    """Обёртка не отдаёт внутреннее завершение, пока номера нет в finished и нет конца."""
+    service, executor, connector, fresh = _finish_ready(monkeypatch, tmp_path)
+    called = []
+
+    async def original(*args, **kwargs):
+        called.append("inner")
+
+    executor.control_shutdown_process = original
+    executor.adjust_and_place_open_order = lambda level: None
+    service._install_open_shell(EXECUTOR, executor)
+    asyncio.run(executor.control_shutdown_process())
+    assert called == []
