@@ -1983,3 +1983,113 @@ def test_other_close_does_not_prove_a_retained_buy(monkeypatch, tmp_path):
     assert "ret-1" in service._retained_51400_unproven(EXECUTOR, fresh)
     assert service._executor_proofs_released(EXECUTOR) is False
     assert service._stop_held_may_finish(EXECUTOR, executor) is False
+
+
+def _archive_ready(monkeypatch, tmp_path, rows):
+    service, executor, connector, fresh = _retained_scene(monkeypatch, tmp_path)
+    body = json.loads(service._hold_rows[0]["checkpoint"])
+    body["partial_ends"] = {
+        "ret-1": {"kind": "gone", "order_ids": ["ret-1"], "exchange": "51400"},
+    }
+    service._hold_rows[0]["checkpoint"] = json.dumps(body)
+    service.__dict__.setdefault("_retained_archive_rows", {})[EXECUTOR] = rows
+    return service, executor, connector, fresh
+
+
+def test_archive_explicit_zero_releases_retained_finish(monkeypatch, tmp_path):
+    """Явный accFillSz 0 и прочитанная книга отпускают завершение. Запись номера на месте."""
+    raw = [{
+        "clOrdId": "ret-1", "state": "canceled", "accFillSz": "0", "cTime": "1", "px": "1",
+    }]
+    service, executor, connector, fresh = _archive_ready(monkeypatch, tmp_path, raw)
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", fresh) is True
+    assert service._executor_proofs_released(EXECUTOR) is True
+    assert service._stop_held_may_finish(EXECUTOR, executor) is True
+    retained = service._partial_parsed(EXECUTOR).get("retained_orders") or []
+    assert any(item.get("order_id") == "ret-1" for item in retained)
+    assert connector.created == []
+
+
+def test_archive_unread_or_foreign_does_not_release(monkeypatch, tmp_path):
+    """Непрочитанный архив, пустой архив и чужой номер завершение не отпускают."""
+    service, executor, connector, fresh = _archive_ready(monkeypatch, tmp_path, None)
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", fresh) is False
+    service.__dict__["_retained_archive_rows"][EXECUTOR] = []
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", fresh) is False
+    service.__dict__["_retained_archive_rows"][EXECUTOR] = [{
+        "clOrdId": "other", "state": "canceled", "accFillSz": "0",
+    }]
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", fresh) is False
+    assert EXECUTOR in service._active_executors
+
+
+def test_open_book_blocks_archive_proof(monkeypatch, tmp_path):
+    """Номер в открытых или непрочитанная книга: архив не отпускает, исполнитель в памяти."""
+    raw = [{"clOrdId": "ret-1", "state": "canceled", "accFillSz": "0"}]
+    service, executor, connector, fresh = _archive_ready(monkeypatch, tmp_path, raw)
+    opened = _fresh()
+    opened["opens"] = [{"text": "ret-1"}]
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", opened) is False
+    unread = _fresh()
+    unread["opens_read"] = False
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", unread) is False
+    connector.in_flight_orders = {"ret-1": object()}
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", fresh) is False
+    connector.in_flight_orders = {}
+    connector._order_tracker.lost_orders = {"ret-1": object()}
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", fresh) is False
+    connector._order_tracker.lost_orders = {}
+    import services.executor_service as service_mod
+    monkeypatch.setattr(service_mod, "order_send_unknown", lambda order_id: order_id == "ret-1")
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", fresh) is False
+    assert EXECUTOR in service._active_executors
+    retained = service._partial_parsed(EXECUTOR).get("retained_orders") or []
+    assert any(item.get("order_id") == "ret-1" and item.get("price") == "100" for item in retained)
+    assert connector.created == []
+
+
+def test_parser_zero_without_acc_fill_does_not_release(monkeypatch, tmp_path):
+    """Пустой accFillSz после parse_okx_closed_page — не снятие. Явный ноль — отдельная строка."""
+    from utils.executor_checkpoint import parse_okx_closed_page
+    body = {"code": "0", "data": [{
+        "clOrdId": "ret-1", "state": "canceled", "accFillSz": "", "cTime": "1000", "px": "1",
+        "ordId": "1", "side": "buy",
+    }]}
+    parsed = parse_okx_closed_page(body, 0, 2000)
+    assert parsed.get("orders")
+    assert parsed["orders"][0].get("fill_size") == "0"
+    assert "accFillSz" not in parsed["orders"][0]
+    booked = _fresh(finished=list(parsed["orders"]))
+    service, executor, connector, fresh = _archive_ready(monkeypatch, tmp_path, parsed["orders"])
+    service._remember_tick_fresh(PAIR, booked)
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", booked) is False
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", None) is False
+    assert service._executor_proofs_released(EXECUTOR) is False
+    retained = service._partial_parsed(EXECUTOR).get("retained_orders") or []
+    assert any(item.get("order_id") == "ret-1" for item in retained)
+    explicit = [{"clOrdId": "ret-1", "state": "canceled", "accFillSz": "0"}]
+    assert service._archive_explicit_zero(explicit, "ret-1") is True
+
+
+def test_archive_fill_without_level_sale_does_not_release(monkeypatch, tmp_path):
+    """Живое исполнение и архивный ноль без продажи уровня завершение не отпускают."""
+    raw = [{"clOrdId": "ret-1", "state": "canceled", "accFillSz": "0"}]
+    service, executor, connector, fresh = _archive_ready(monkeypatch, tmp_path, raw)
+    filled = _fresh(finished=[{
+        "text": "ret-1", "finish_as": "filled", "amount": "1", "left": "0",
+    }])
+    service._remember_tick_fresh(PAIR, filled)
+    assert service._retained_finish_proven(EXECUTOR, "ret-1", filled) is False
+    assert service._executor_proofs_released(EXECUTOR) is False
+    assert EXECUTOR in service._active_executors
+    retained = service._partial_parsed(EXECUTOR).get("retained_orders") or []
+    assert any(item.get("order_id") == "ret-1" for item in retained)
+
+
+def test_retained_archive_window_ignores_a_newer_journal_mark():
+    """Окно не шире 90 дней и не берёт чужую более новую метку."""
+    from utils.executor_checkpoint import OKX_ARCHIVE_MS
+    from services.executor_service import ExecutorService
+    service = ExecutorService.__new__(ExecutorService)
+    window = service._retained_archive_window(1_000.0)
+    assert int(window["end"]) - int(window["begin"]) == OKX_ARCHIVE_MS

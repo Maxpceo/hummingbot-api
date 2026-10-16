@@ -6210,6 +6210,84 @@ class ExecutorService:
         out["finished"] = converted
         return out
 
+    def _retained_archive_window(self, now: Optional[float] = None) -> Dict[str, str]:
+        """Не шире 90 дней. Чужую более новую метку журнала в begin не берём."""
+        moment = time.time() if now is None else float(now)
+        end_ms = int(moment * 1000)
+        return {
+            "begin": str(end_ms - OKX_ARCHIVE_MS),
+            "end": str(end_ms),
+        }
+
+    async def _refresh_retained_archive(
+        self, executor_id: str, executor: Any, connector: Any, pair: str,
+    ) -> None:
+        """Сырой accFillSz архива для номера из retained_orders. В слот пары не пишется."""
+        bag = self.__dict__.setdefault("_retained_archive_rows", {})
+        need = [
+            text for text in self._retained_ids(executor_id)
+            if self._exchange_gone_end(executor_id, text)
+        ]
+        if not need or connector is None:
+            bag[executor_id] = None
+            return
+        venue = open_list_venue(type(connector).__name__ if connector is not None else "")
+        if venue != "okx":
+            bag[executor_id] = None
+            return
+        symbol = await self._gate_symbol(connector, pair)
+        if not symbol:
+            bag[executor_id] = None
+            return
+        inst_type = "SWAP" if "perpetual" in type(connector).__name__.lower() else "SPOT"
+        window = self._retained_archive_window()
+        from utils.executor_checkpoint import OPEN_PAGE_LIMIT
+        rows: List[Dict[str, Any]] = []
+        after = None
+        try:
+            for _ in range(1000):
+                request = okx_closed_request(
+                    symbol, after=after, begin=window["begin"], end=window["end"],
+                    inst_type=inst_type, archive=True,
+                )
+                if request is None:
+                    bag[executor_id] = None
+                    return
+                body = await connector._api_get(
+                    path_url=request["path"],
+                    params=request["params"],
+                    is_auth_required=True,
+                    limit_id=self._open_limit_id(connector, "okx"),
+                )
+                if not isinstance(body, dict) or str(body.get("code")) != "0" or not isinstance(body.get("data"), list):
+                    bag[executor_id] = None
+                    return
+                data = body["data"]
+                for raw in data:
+                    if not isinstance(raw, dict):
+                        bag[executor_id] = None
+                        return
+                    try:
+                        created = int(str(raw.get("cTime")))
+                    except (TypeError, ValueError):
+                        bag[executor_id] = None
+                        return
+                    if created < int(window["begin"]) or created > int(window["end"]):
+                        continue
+                    rows.append(raw)
+                if len(data) < OPEN_PAGE_LIMIT:
+                    bag[executor_id] = rows
+                    return
+                cursor = data[-1].get("ordId") if isinstance(data[-1], dict) else None
+                if not cursor:
+                    bag[executor_id] = None
+                    return
+                after = str(cursor)
+        except Exception:
+            bag[executor_id] = None
+            return
+        bag[executor_id] = None
+
     async def _shutdown_remainder_book(
         self, executor_id: str, connector: Any, pair: str, fresh: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
@@ -7099,16 +7177,59 @@ class ExecutorService:
             close_ids.discard(name)
         return sold >= bought
 
-    def _retained_finish_proven(self, executor_id: str, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
-        """Finished-снятие с нулём или исполнение, покрытое продажей этого номера."""
-        row = self._finished_row(str(order_id or ""), fresh)
-        if row is None:
-            return False
-        if self._finished_zero_cancel(row):
+    def _retained_book_blocks(self, executor: Any, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Непрочитанная книга — не «нет в открытых». Живой номер архив не отпускает."""
+        text = str(order_id or "")
+        if not text or not self._lists_ready(fresh):
             return True
-        if not self._closed_row_filled(row):
+        if self._shutdown_text_present((fresh or {}).get("opens"), text):
+            return True
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        inflight = getattr(connector, "in_flight_orders", None)
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None)
+        if not isinstance(inflight, dict) or not isinstance(lost, dict):
+            return True
+        if text in inflight or text in lost or order_send_unknown(text):
+            return True
+        return False
+
+    def _archive_explicit_zero(self, raw_rows: Any, order_id: str) -> bool:
+        """Нулевая база — только явный accFillSz. Подставленный fill_size «0» не считается."""
+        text = str(order_id or "")
+        if not text or not isinstance(raw_rows, list):
             return False
-        return self._retained_sale_covers(executor_id, order_id, fresh, row)
+        found = False
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                return False
+            name = str(row.get("clOrdId") or row.get("text") or row.get("order_id") or "")
+            if name != text:
+                continue
+            found = True
+            if str(row.get("state") or "") not in ("canceled", "mmp_canceled"):
+                return False
+            if "accFillSz" not in row or str(row.get("accFillSz")) != "0":
+                return False
+        return found
+
+    def _retained_finish_proven(self, executor_id: str, order_id: str, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Явный ноль архива или продажа уровня. Подставленный fill_size «0» не снятие."""
+        text = str(order_id or "")
+        if fresh is None:
+            pair = getattr(
+                getattr((getattr(self, "_active_executors", None) or {}).get(executor_id), "config", None),
+                "trading_pair", None,
+            ) or ""
+            fresh = self._pair_book(pair) if pair else None
+        executor = (getattr(self, "_active_executors", None) or {}).get(executor_id)
+        if self._retained_book_blocks(executor, text, fresh):
+            return False
+        row = self._finished_row(text, fresh)
+        if row is not None and self._closed_row_filled(row):
+            return self._retained_sale_covers(executor_id, text, fresh, row)
+        cached = (self.__dict__.get("_retained_archive_rows") or {}).get(executor_id)
+        return self._archive_explicit_zero(cached, text)
 
     def _retained_51400_unproven(self, executor_id: str, fresh: Optional[Dict[str, Any]] = None) -> set:
         """Конец 51400 в retained_orders не отпускает завершение, пока нет finished-доказательства.
@@ -8946,6 +9067,9 @@ class ExecutorService:
                     # Доставка отмен не за готовностью списков и не за судьбой
                     # номеров (план stop-freeze п.3).
                     await service._stop_deliver_cancels(executor_id, executor, connector, pair or "")
+                    await service._refresh_retained_archive(
+                        executor_id, executor, connector, pair or "",
+                    )
                     # Продажа остатка берёт книгу пары, не общий номер шага:
                     # с сетками одной пары `_tick_fresh` голодает и продажа не
                     # уходила никогда (план stop-sell-pair-book).
