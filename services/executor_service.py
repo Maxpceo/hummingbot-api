@@ -11283,7 +11283,7 @@ class ExecutorService:
                     open_slot = getattr(target, "active_open_order", None)
                     if open_slot is None or not getattr(open_slot, "is_filled", False):
                         continue
-                    if service._rescue_close_blocked(executor_id, level_id, fresh):
+                    if service._rescue_close_blocked(executor_id, level_id, fresh, executor):
                         blocked.add(level_id)
                 if not blocked:
                     return found
@@ -12001,19 +12001,22 @@ class ExecutorService:
             interval=300.0, label="silent buy exit:", key=executor_id,
         )
 
-    def _rescue_proved_close(self, executor_id: str, level_body: Dict[str, Any], fresh: Dict[str, Any]):
+    def _rescue_proved_close(self, executor_id: str, level_body: Dict[str, Any], fresh: Dict[str, Any],
+                             live_open_id: Optional[str] = None):
         """Ранний номер close этого уровня, доказанный страницей исполненным.
 
-        Метка круга — ts строки журнала слота открытия, не метка тела
-        (исполненное тело сажается с нулевой меткой). Поздняя отказная
-        строка раннее исполнение не заслоняет и сама не сажается.
+        Метка круга — ts строки журнала живого слота открытия, не метка тела
+        (исполненное тело сажается с нулевой меткой) и не чекпойнт. Записанный
+        в чекпойнт close доказательство не гасит (подъём снимает слот, круг
+        сажает заново), но чужой записанный номер не затирается. Поздняя
+        отказная строка раннее исполнение не заслоняет и сама не сажается.
         """
         rows = self._partial_rows()
         if rows is None:
             return None
-        if (level_body.get("close_order") or {}).get("order_id"):
+        open_id = str(live_open_id or "")
+        if not open_id:
             return None
-        open_id = str((level_body.get("open_order") or {}).get("order_id") or "")
         open_ts = next((
             row.get("ts") for row in rows
             if str(row.get("order_id") or "") == open_id and row.get("ts") is not None
@@ -12046,9 +12049,14 @@ class ExecutorService:
                 continue
             if best is None or ts < best[2]:
                 best = (text, size, ts, found)
+        if best is not None:
+            seated = str((level_body.get("close_order") or {}).get("order_id") or "")
+            if seated and seated != best[0]:
+                return None
         return best
 
-    def _rescue_close_blocked(self, executor_id: str, level_id: str, fresh: Dict[str, Any]) -> bool:
+    def _rescue_close_blocked(self, executor_id: str, level_id: str, fresh: Dict[str, Any],
+                              executor: Any = None) -> bool:
         """Уровень не получает новую продажу, только пока его исполненный close доказан страницей."""
         parsed = self._partial_parsed(executor_id)
         level_body = next((
@@ -12057,7 +12065,15 @@ class ExecutorService:
         ), None)
         if level_body is None:
             return False
-        return self._rescue_proved_close(executor_id, level_body, fresh) is not None
+        target = next((
+            level for level in list(getattr(executor, "grid_levels", None) or [])
+            if str(getattr(level, "id", "") or "") == str(level_id)
+        ), None)
+        open_slot = getattr(target, "active_open_order", None) if target is not None else None
+        live_open_id = str(getattr(open_slot, "order_id", "") or "") if open_slot is not None else None
+        if not live_open_id or not getattr(open_slot, "is_filled", False):
+            return False
+        return self._rescue_proved_close(executor_id, level_body, fresh, live_open_id) is not None
 
 
     def _rescue_close_price(self, level_body: Dict[str, Any], found: Dict[str, Any]) -> Optional[Decimal]:
@@ -12084,21 +12100,24 @@ class ExecutorService:
         for level_body in (parsed or {}).get("levels") or []:
             if not isinstance(level_body, dict):
                 continue
-            proof = self._rescue_proved_close(executor_id, level_body, fresh)
+            target = next((
+                level for level in list(getattr(executor, "grid_levels", None) or [])
+                if str(getattr(level, "id", "") or "") == str(level_body.get("id") or "")
+            ), None)
+            if target is None:
+                continue
+            open_slot = getattr(target, "active_open_order", None)
+            if open_slot is None or not getattr(open_slot, "is_filled", False):
+                continue
+            live_open_id = str(getattr(open_slot, "order_id", "") or "")
+            proof = self._rescue_proved_close(executor_id, level_body, fresh, live_open_id)
             if proof is None:
                 continue
             text, size, _ts, found = proof
             price = self._rescue_close_price(level_body, found)
             if price is None or price <= 0:
                 continue
-            target = next((
-                level for level in list(getattr(executor, "grid_levels", None) or [])
-                if str(getattr(level, "id", "") or "") == str(level_body.get("id") or "")
-            ), None)
-            if target is not None:
-                open_slot = getattr(target, "active_open_order", None)
-                if open_slot is None or not getattr(open_slot, "is_filled", False):
-                    continue
+            if getattr(target, "active_close_order", None) is None:
                 closed = self._stock_filled_order(
                     client_id=text, trading_pair=pair, trade_name="SELL",
                     position_name="CLOSE", amount=size, price=price, leverage=1,

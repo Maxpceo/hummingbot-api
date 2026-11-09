@@ -177,11 +177,12 @@ def test_filter_blocks_only_own_proved_level(tmp_path, monkeypatch):
     fresh = _fresh(blank=[_blank(EARLY)])
     lines = [_row("buy-1", ts=10), _row(EARLY, ts=11, role="market_close", sent=True)]
     service, _repo, connector = _base(tmp_path, monkeypatch, fresh, [_level()], lines)
-    assert service._rescue_close_blocked(EXECUTOR, "L1", fresh) is True
+    executor = _live_executor(connector)
+    assert service._rescue_close_blocked(EXECUTOR, "L1", fresh, executor) is True
 
     unproved = _fresh(blank=[])
-    assert service._rescue_close_blocked(EXECUTOR, "L1", unproved) is False
-    assert service._rescue_close_blocked(EXECUTOR, "L2", fresh) is False
+    assert service._rescue_close_blocked(EXECUTOR, "L1", unproved, executor) is False
+    assert service._rescue_close_blocked(EXECUTOR, "L2", fresh, executor) is False
 
 
 def test_wrapped_close_get_filters_proved_level(tmp_path, monkeypatch):
@@ -201,3 +202,50 @@ def test_wrapped_close_get_filters_proved_level(tmp_path, monkeypatch):
     unproved = _fresh(blank=[])
     _store_fresh(service, unproved)
     assert level in executor.get_close_orders_to_create()
+
+
+def test_restart_reseats_slot_after_lift_peek(tmp_path, monkeypatch):
+    """Подъём снял живой слот (blank-px без цены), чекпойнт close_order записан:
+    круг сажает слот заново до предложений, чужой записанный номер не затирается."""
+    fresh = _fresh(blank=[_blank(EARLY)])
+    lines = [_row("buy-1", ts=10), _row(EARLY, ts=11, role="market_close", sent=True)]
+    seated = _level(close={"order_id": EARLY, "filled": True, "price": "101",
+                           "order": {"executed_amount_base": "1"}})
+    service, _repo, connector = _base(tmp_path, monkeypatch, fresh, [seated], lines)
+    executor = _live_executor(connector)
+    assert executor.grid_levels[0].active_close_order is None
+    assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, connector, PAIR)) is True
+    assert executor.grid_levels[0].active_close_order.order_id == EARLY
+    assert executor.grid_levels[0].active_close_order.order.completely_filled_event.is_set()
+    assert service._rescue_close_blocked(EXECUTOR, "L1", fresh, executor) is True
+
+    # чужой записанный номер не затирается
+    foreign = _level(close={"order_id": "other", "filled": True})
+    service2, _repo2, connector2 = _base(tmp_path, monkeypatch, fresh, [foreign], lines)
+    executor2 = _live_executor(connector2)
+    assert asyncio.run(service2._rescue_seat_filled_close(EXECUTOR, executor2, connector2, PAIR)) is False
+    assert executor2.grid_levels[0].active_close_order is None
+
+
+def test_live_slot_beats_checkpoint_for_the_round(tmp_path, monkeypatch):
+    """Чекпойнт ещё buy-1, живой слот уже buy-2 — старый sell-early не сажается,
+    уровень из предложений не выкидывается, чекпойнт не пишется."""
+    fresh = _fresh(blank=[_blank(EARLY)])
+    lines = [
+        _row("buy-1", ts=10),
+        _row("buy-2", ts=20),
+        _row(EARLY, ts=11, role="market_close", sent=True),
+    ]
+    service, _repo, connector = _base(tmp_path, monkeypatch, fresh, [_level()], lines)
+    executor = _live_executor(connector, open_id="buy-2")
+    assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, connector, PAIR)) is False
+    assert executor.grid_levels[0].active_close_order is None
+    assert executor.grid_levels[0].active_open_order.order_id == "buy-2"
+    assert service._rescue_close_blocked(EXECUTOR, "L1", fresh, executor) is False
+    parsed = service._partial_parsed(EXECUTOR)
+    assert (parsed["levels"][0].get("close_order") or {}).get("order_id") is None
+
+    # живего уровня нет вовсе — чекпойнт не пишется
+    executor3 = _live_executor(connector)
+    executor3.grid_levels = []
+    assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor3, connector, PAIR)) is False
