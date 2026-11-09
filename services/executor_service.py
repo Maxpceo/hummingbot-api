@@ -9028,7 +9028,6 @@ class ExecutorService:
             return
         # После штатного конца не спрашиваем, жив ли номер, и не открываем
         # исполнителя снова (план stop-finished-not-reopened).
-        executor = self._active_executors.pop(executor_id, None)
         if executor is None:
             return
 
@@ -9038,8 +9037,12 @@ class ExecutorService:
         if executor.close_type == CloseType.POSITION_HOLD:
             await self._aggregate_position_hold(executor_id, executor, metadata)
 
-        # Persist final state to database
-        await self._persist_executor_completed(executor_id, executor)
+        # Persist final state to database. Запись не села — исполнитель остаётся
+        # в памяти с is_closed, следующий тик повторяет запись (stock-close-not-gated):
+        # вынутая до записи строка осталась бы RUNNING и перезапуск поднял бы её снова.
+        if not await self._persist_executor_completed(executor_id, executor):
+            return
+        self._active_executors.pop(executor_id, None)
 
         # The rent refund is only known once the close confirms, which is here. A
         # successful close has already cleared position_address from custom_info, so this
@@ -9392,7 +9395,7 @@ class ExecutorService:
     async def _persist_executor_completed(self, executor_id: str, executor: ExecutorBase):
         """Persist executor completion to database."""
         if not self.db_manager:
-            return
+            return False
 
         try:
             # Read status/close_type directly from executor (most reliable)
@@ -9542,6 +9545,7 @@ class ExecutorService:
                     f"Could not persist completion for executor {executor_id}: no row to "
                     f"update and the repair insert did not take"
                 )
+                return False
             elif repaired:
                 logger.warning(
                     f"Executor {executor_id} completed before its creation row existed; "
@@ -9549,9 +9553,11 @@ class ExecutorService:
                 )
             else:
                 logger.debug(f"Persisted executor {executor_id} completion to database")
+            return True
 
         except Exception as e:
             logger.error(f"Error persisting executor completion: {e}")
+            return False
 
     # ========================================
     # Position Hold Tracking Methods

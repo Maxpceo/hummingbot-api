@@ -1572,9 +1572,14 @@ from utils.executor_checkpoint import (
 
 class _Kept:
     is_closed = False
+    close_type = SimpleNamespace(name="TAKE_PROFIT")
+    status = SimpleNamespace(name="TERMINATED")
 
     def stop(self):
         return None
+
+    def get_custom_info(self):
+        return {}
 
 
 class _Gate:
@@ -1650,6 +1655,14 @@ class _Repo:
             if row["executor_id"] == executor_id:
                 row["status"] = status or row.get("status")
         return None
+
+    async def upsert_executor_completion(self, executor_id, status=None, close_type=None, **kwargs):
+        for row in self.rows:
+            if row["executor_id"] == executor_id:
+                row["status"] = status or row.get("status")
+                row["close_type"] = close_type
+                return row, False
+        return None, False
 
 
 def _owed(order_id="t-HBOTcid", price="105", executor_id="grid-a", pair="INJ-USDT", account="main"):
@@ -1766,6 +1779,7 @@ def _service(monkeypatch, repo, connector, executor_id="grid-a"):
     service.performance_retention_days = 0
     service.PERFORMANCE_PRUNE_INTERVAL_SECONDS = 10 ** 9
     service._kept_ids = set()
+    service._log_capture = SimpleNamespace(get_error_count=lambda executor_id: 0)
     return service
 
 

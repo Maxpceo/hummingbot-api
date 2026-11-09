@@ -107,6 +107,34 @@ def test_early_stop_end_still_writes_with_proven_numbers(tmp_path, monkeypatch):
     assert EXECUTOR not in service._active_executors
 
 
+def test_failed_write_keeps_the_executor_for_the_next_tick(tmp_path, monkeypatch):
+    """Запись конца упала — исполнитель остаётся в памяти и строка RUNNING;"
+    следующий вызов с успешной записью сажает конец и только тогда вынимает."""
+    service, _repo, _connector = _service_with(monkeypatch, _checkpoint())
+    executor = _closed_executor("TAKE_PROFIT")
+    service._active_executors[EXECUTOR] = executor
+    row = _Row(status="RUNNING")
+    repo = _bind_upsert_db(monkeypatch, service, row)
+
+    async def failing(*args, **kwargs):
+        raise RuntimeError("write failed")
+
+    repo.upsert_executor_completion = failing
+    service._executor_proofs_released = lambda executor_id: False
+    _quiet_completion(service)
+    asyncio.run(service._handle_executor_completion(EXECUTOR))
+    assert EXECUTOR in service._active_executors
+    assert row.status == "RUNNING"
+
+    asyncio.run(service._handle_executor_completion(EXECUTOR))
+    assert EXECUTOR in service._active_executors
+
+    del repo.upsert_executor_completion
+    asyncio.run(service._handle_executor_completion(EXECUTOR))
+    assert row.status == "TERMINATED" and row.close_type == "TAKE_PROFIT"
+    assert EXECUTOR not in service._active_executors
+
+
 def test_control_tick_sends_closed_take_profit_to_stock_completion(tmp_path, monkeypatch):
     """Один тик цикла: закрытый TAKE_PROFIT с недоказанным номером идёт в штатную запись,
     наш посадчик ранней остановки из цикла не зовётся."""
