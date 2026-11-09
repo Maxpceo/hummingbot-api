@@ -12017,6 +12017,8 @@ class ExecutorService:
         open_id = str(live_open_id or "")
         if not open_id:
             return None
+        if open_id != str((level_body.get("open_order") or {}).get("order_id") or ""):
+            return None
         open_ts = next((
             row.get("ts") for row in rows
             if str(row.get("order_id") or "") == open_id and row.get("ts") is not None
@@ -12025,6 +12027,8 @@ class ExecutorService:
             return None
         best = None
         for row in rows:
+            if str(row.get("executor_id") or "") != str(executor_id):
+                continue
             if str(row.get("level_id") or "") != str(level_body.get("id") or ""):
                 continue
             if str(row.get("role") or "") not in ("close", "market_close"):

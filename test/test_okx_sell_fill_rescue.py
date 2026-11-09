@@ -249,3 +249,41 @@ def test_live_slot_beats_checkpoint_for_the_round(tmp_path, monkeypatch):
     executor3 = _live_executor(connector)
     executor3.grid_levels = []
     assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor3, connector, PAIR)) is False
+
+
+def test_slot_checkpoint_mismatch_blocks_even_with_later_proof(tmp_path, monkeypatch):
+    """Колонка buy-1, слот buy-2, close с ts позже строки buy-2 и страница filled —
+    ничего не сажается, колонка не пишется, уровень не выкидывается из предложений."""
+    fresh = _fresh(blank=[_blank(EARLY)])
+    lines = [
+        _row("buy-1", ts=10),
+        _row("buy-2", ts=20),
+        _row(EARLY, ts=25, role="market_close", sent=True),
+    ]
+    service, _repo, connector = _base(tmp_path, monkeypatch, fresh, [_level()], lines)
+    executor = _live_executor(connector, open_id="buy-2")
+    assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, connector, PAIR)) is False
+    assert executor.grid_levels[0].active_close_order is None
+    assert executor.grid_levels[0].active_open_order.order_id == "buy-2"
+    assert service._rescue_close_blocked(EXECUTOR, "L1", fresh, executor) is False
+    parsed = service._partial_parsed(EXECUTOR)
+    assert (parsed["levels"][0].get("close_order") or {}).get("order_id") is None
+
+
+def test_foreign_executor_close_is_not_seated(tmp_path, monkeypatch):
+    """Чужой исполнитель с тем же level_id: его доказанная продажа не сажается
+    и не режет предложения нашего уровня."""
+    fresh = _fresh(blank=[_blank(EARLY)])
+    lines = [
+        _row("buy-1", ts=10),
+        {"executor_id": "grid-other", "order_id": "other-buy", "level_id": "L1", "price": "100", "ts": 11},
+        {"executor_id": "grid-other", "order_id": EARLY, "level_id": "L1", "price": "100", "ts": 12,
+         "role": "market_close", "sent": True},
+    ]
+    service, _repo, connector = _base(tmp_path, monkeypatch, fresh, [_level()], lines)
+    executor = _live_executor(connector)
+    assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, connector, PAIR)) is False
+    assert executor.grid_levels[0].active_close_order is None
+    assert service._rescue_close_blocked(EXECUTOR, "L1", fresh, executor) is False
+    parsed = service._partial_parsed(EXECUTOR)
+    assert (parsed["levels"][0].get("close_order") or {}).get("order_id") is None
