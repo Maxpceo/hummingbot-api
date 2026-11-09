@@ -11243,6 +11243,7 @@ class ExecutorService:
                 service.__dict__.setdefault("_filled_down_blocked", {})[executor_id] = filled_down
                 stuck = service._unseated_level_ids(executor_id, executor, connector, fresh)
                 service.__dict__.setdefault("_unseated_levels", {})[executor_id] = stuck
+                await service._rescue_seat_filled_close(executor_id, executor, connector, pair or "")
                 aside = service.__dict__.setdefault("_stepped_aside_ids", set())
                 aside.add(str(executor_id))
                 service._log_silent_exit(
@@ -11260,6 +11261,35 @@ class ExecutorService:
                     (service.__dict__.get("_stock_tick_ids") or {}).pop(executor_id, None)
 
             executor.control_task = wrapped_task
+        original_close_get = getattr(executor, "get_close_orders_to_create", None)
+        if original_close_get is not None and not getattr(executor, "_rescue_close_wrapped", False):
+            def rescue_close_get(*args, **kwargs):
+                found = list(original_close_get(*args, **kwargs) or [])
+                if not found:
+                    return found
+                pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+                fresh = service._tick_fresh(pair)
+                if not service._lists_ready(fresh):
+                    return found
+                blocked = set()
+                for level in found:
+                    level_id = str(getattr(level, "id", "") or "")
+                    target = next((
+                        item for item in list(getattr(executor, "grid_levels", None) or [])
+                        if str(getattr(item, "id", "") or "") == level_id
+                    ), None)
+                    if target is None:
+                        continue
+                    open_slot = getattr(target, "active_open_order", None)
+                    if open_slot is None or not getattr(open_slot, "is_filled", False):
+                        continue
+                    if service._rescue_close_blocked(executor_id, level_id, fresh):
+                        blocked.add(level_id)
+                if not blocked:
+                    return found
+                return [level for level in found if str(getattr(level, "id", "") or "") not in blocked]
+            executor.get_close_orders_to_create = rescue_close_get
+            executor._rescue_close_wrapped = True
         original_shutdown = getattr(executor, "control_shutdown_process", None)
         if original_shutdown is not None and not getattr(executor, "_close_brake", False):
 
@@ -11970,6 +12000,136 @@ class ExecutorService:
             "filled-buy-close", pair or "", f"{reason} order_id=\u2026{str(order_id)[-8:]}", executor_id,
             interval=300.0, label="silent buy exit:", key=executor_id,
         )
+
+    def _rescue_proved_close(self, executor_id: str, level_body: Dict[str, Any], fresh: Dict[str, Any]):
+        """Ранний номер close этого уровня, доказанный страницей исполненным.
+
+        Метка круга — ts строки журнала слота открытия, не метка тела
+        (исполненное тело сажается с нулевой меткой). Поздняя отказная
+        строка раннее исполнение не заслоняет и сама не сажается.
+        """
+        rows = self._partial_rows()
+        if rows is None:
+            return None
+        if (level_body.get("close_order") or {}).get("order_id"):
+            return None
+        open_id = str((level_body.get("open_order") or {}).get("order_id") or "")
+        open_ts = next((
+            row.get("ts") for row in rows
+            if str(row.get("order_id") or "") == open_id and row.get("ts") is not None
+        ), None)
+        if not open_id or open_ts is None:
+            return None
+        best = None
+        for row in rows:
+            if str(row.get("level_id") or "") != str(level_body.get("id") or ""):
+                continue
+            if str(row.get("role") or "") not in ("close", "market_close"):
+                continue
+            ts = row.get("ts")
+            if ts is None or ts < open_ts:
+                continue
+            text = str(row.get("order_id") or "")
+            if not text:
+                continue
+            found = partial_find_text(fresh.get("finished"), text)
+            if not isinstance(found, dict):
+                found = partial_find_text(fresh.get("finished_blank_px"), text)
+            if not isinstance(found, dict):
+                continue
+            if str(found.get("state") or "") != "filled":
+                continue
+            size = partial_decimal(found.get("fill_size"))
+            if size is None or size <= 0:
+                continue
+            if not self._okx_window_open(fresh, ts):
+                continue
+            if best is None or ts < best[2]:
+                best = (text, size, ts, found)
+        return best
+
+    def _rescue_close_blocked(self, executor_id: str, level_id: str, fresh: Dict[str, Any]) -> bool:
+        """Уровень не получает новую продажу, только пока его исполненный close доказан страницей."""
+        parsed = self._partial_parsed(executor_id)
+        level_body = next((
+            item for item in (parsed or {}).get("levels") or []
+            if str(item.get("id") or "") == str(level_id)
+        ), None)
+        if level_body is None:
+            return False
+        return self._rescue_proved_close(executor_id, level_body, fresh) is not None
+
+
+    def _rescue_close_price(self, level_body: Dict[str, Any], found: Dict[str, Any]) -> Optional[Decimal]:
+        """Цена тела продажи: средняя страницы, иначе тейк уровня. Пустой px не берём."""
+        avg = partial_decimal(found.get("avgPx"))
+        if avg is not None and avg > 0:
+            return avg
+        tp = partial_decimal(level_body.get("take_profit_price"))
+        if tp is not None and tp > 0:
+            return tp
+        base = partial_decimal((level_body.get("open_order") or {}).get("price"))
+        profit = partial_decimal(level_body.get("take_profit"))
+        if base is not None and base > 0 and profit is not None:
+            return base * (Decimal("1") + profit)
+        return None
+
+    async def _rescue_seat_filled_close(self, executor_id: str, executor: Any, connector: Any, pair: str) -> bool:
+        """Посадить исполненный close уровня из страницы OKX. Сами не шлём ничего."""
+        fresh = self._tick_fresh(pair or "")
+        if not self._lists_ready(fresh):
+            return False
+        parsed = self._partial_parsed(executor_id)
+        seated = False
+        for level_body in (parsed or {}).get("levels") or []:
+            if not isinstance(level_body, dict):
+                continue
+            proof = self._rescue_proved_close(executor_id, level_body, fresh)
+            if proof is None:
+                continue
+            text, size, _ts, found = proof
+            price = self._rescue_close_price(level_body, found)
+            if price is None or price <= 0:
+                continue
+            target = next((
+                level for level in list(getattr(executor, "grid_levels", None) or [])
+                if str(getattr(level, "id", "") or "") == str(level_body.get("id") or "")
+            ), None)
+            if target is not None:
+                open_slot = getattr(target, "active_open_order", None)
+                if open_slot is None or not getattr(open_slot, "is_filled", False):
+                    continue
+                closed = self._stock_filled_order(
+                    client_id=text, trading_pair=pair, trade_name="SELL",
+                    position_name="CLOSE", amount=size, price=price, leverage=1,
+                )
+                if closed is None:
+                    continue
+                target.active_close_order = TrackedOrder(order_id=text)
+                target.active_close_order.order = closed
+
+            def mutate(column: Dict[str, Any], text=text, size=size, price=price, level_id=str(level_body.get("id") or "")) -> None:
+                for item in column.get("levels") or []:
+                    if str(item.get("id") or "") != level_id:
+                        continue
+                    if (item.get("close_order") or {}).get("order_id"):
+                        return
+                    item["close_order"] = {
+                        "order_id": text,
+                        "filled": True,
+                        "price": str(price),
+                        "order": {"executed_amount_base": str(size)},
+                    }
+
+            def visible(parsed_body: Optional[Dict[str, Any]], text=text, level_id=str(level_body.get("id") or "")) -> bool:
+                for item in (parsed_body or {}).get("levels") or []:
+                    if str(item.get("id") or "") == level_id:
+                        return str((item.get("close_order") or {}).get("order_id") or "") == text
+                return False
+
+            if await self._partial_cas(executor_id, mutate, visible, str(level_body.get("id") or "")):
+                seated = True
+        return seated
 
     async def _partial_note_filled_price(
         self, executor_id: str, level_id: str, quant: str, bought: Decimal,
