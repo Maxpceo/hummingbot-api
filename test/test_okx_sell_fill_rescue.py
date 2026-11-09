@@ -432,3 +432,17 @@ def test_restart_body_from_checkpoint_carries_the_event(tmp_path, monkeypatch):
     level.active_close_order = lifted
     asyncio.run(executor.control_task())
     assert level.state == GridLevelStates.NOT_ACTIVE
+
+
+def test_partial_fill_size_is_not_a_full_close(tmp_path, monkeypatch):
+    """Размер страницы меньше исполненной базы открытия — полное исполнение не
+    сажается, уровень не выкидывается из предложений: остаток продаёт штатная сетка."""
+    fresh = _fresh(blank=[_blank(EARLY, size="0.4")])
+    lines = [_row("buy-1", ts=10), _row(EARLY, ts=11, role="market_close", sent=True)]
+    service, _repo, connector = _base(tmp_path, monkeypatch, fresh, [_level()], lines)
+    executor = _live_executor(connector)
+    assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, connector, PAIR)) is False
+    assert executor.grid_levels[0].active_close_order is None
+    assert service._rescue_close_blocked(EXECUTOR, "L1", fresh, executor) is False
+    parsed = service._partial_parsed(EXECUTOR)
+    assert (parsed["levels"][0].get("close_order") or {}).get("order_id") is None

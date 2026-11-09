@@ -12054,6 +12054,10 @@ class ExecutorService:
             if best is None or ts < best[2]:
                 best = (text, size, ts, found)
         if best is not None:
+            open_base = self._filled_order_base(level_body)
+            if open_base is not None and best[1] < open_base:
+                return None
+        if best is not None:
             seated = str((level_body.get("close_order") or {}).get("order_id") or "")
             if seated and seated != best[0]:
                 return None
