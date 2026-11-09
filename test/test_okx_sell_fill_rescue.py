@@ -489,3 +489,20 @@ def test_live_base_missing_blocks_seating(tmp_path, monkeypatch):
     assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, connector, PAIR)) is False
     assert executor.grid_levels[0].active_close_order is None
     assert service._rescue_close_blocked(EXECUTOR, "L1", fresh, executor) is False
+
+
+def test_late_full_fill_beats_early_small(tmp_path, monkeypatch):
+    """Ранний мелкий (0.4) не гасит поздний полный (1): кандидаты — только номера,
+    чей размер покрывает исполненную базу живого открытия."""
+    fresh = _fresh(blank=[_blank(EARLY, size="0.4"), _blank(LATE, size="1")])
+    lines = [
+        _row("buy-1", ts=10),
+        _row(EARLY, ts=11, role="market_close", sent=True),
+        _row(LATE, ts=12, role="market_close", sent=True),
+    ]
+    service, _repo, connector = _base(tmp_path, monkeypatch, fresh, [_level()], lines)
+    executor = _live_executor(connector)
+    assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, connector, PAIR)) is True
+    assert executor.grid_levels[0].active_close_order.order_id == LATE
+    parsed = service._partial_parsed(EXECUTOR)
+    assert parsed["levels"][0]["close_order"]["order_id"] == LATE

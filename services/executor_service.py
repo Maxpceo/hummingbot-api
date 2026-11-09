@@ -12002,7 +12002,7 @@ class ExecutorService:
         )
 
     def _rescue_proved_close(self, executor_id: str, level_body: Dict[str, Any], fresh: Dict[str, Any],
-                             live_open_id: Optional[str] = None):
+                             live_open_id: Optional[str] = None, live_open_base: Optional[Decimal] = None):
         """Ранний номер close этого уровня, доказанный страницей исполненным.
 
         Метка круга — ts строки журнала живого слота открытия, не метка тела
@@ -12049,14 +12049,12 @@ class ExecutorService:
             size = partial_decimal(found.get("fill_size"))
             if size is None or size <= 0:
                 continue
+            if live_open_base is not None and size < live_open_base:
+                continue
             if not self._okx_window_open(fresh, ts):
                 continue
             if best is None or ts < best[2]:
                 best = (text, size, ts, found)
-        if best is not None:
-            open_base = self._filled_order_base(level_body)
-            if open_base is not None and best[1] < open_base:
-                return None
         if best is not None:
             seated = str((level_body.get("close_order") or {}).get("order_id") or "")
             if seated and seated != best[0]:
@@ -12081,13 +12079,12 @@ class ExecutorService:
         live_open_id = str(getattr(open_slot, "order_id", "") or "") if open_slot is not None else None
         if not live_open_id or not getattr(open_slot, "is_filled", False):
             return False
-        proof = self._rescue_proved_close(executor_id, level_body, fresh, live_open_id)
-        if proof is None:
+        live_open_base = partial_decimal(
+            str(getattr(getattr(open_slot, "order", None), "executed_amount_base", "") or "")
+        )
+        if live_open_base is None or live_open_base <= 0:
             return False
-        open_base = partial_decimal(str(getattr(getattr(open_slot, "order", None), "executed_amount_base", "") or ""))
-        if open_base is None or open_base <= 0 or proof[1] < open_base:
-            return False
-        return True
+        return self._rescue_proved_close(executor_id, level_body, fresh, live_open_id, live_open_base) is not None
 
 
     def _rescue_close_price(self, level_body: Dict[str, Any], found: Dict[str, Any]) -> Optional[Decimal]:
@@ -12124,17 +12121,17 @@ class ExecutorService:
             if open_slot is None or not getattr(open_slot, "is_filled", False):
                 continue
             live_open_id = str(getattr(open_slot, "order_id", "") or "")
-            proof = self._rescue_proved_close(executor_id, level_body, fresh, live_open_id)
+            live_open_base = partial_decimal(
+                str(getattr(getattr(open_slot, "order", None), "executed_amount_base", "") or "")
+            )
+            if live_open_base is None or live_open_base <= 0:
+                continue
+            proof = self._rescue_proved_close(executor_id, level_body, fresh, live_open_id, live_open_base)
             if proof is None:
                 continue
             text, size, _ts, found = proof
             price = self._rescue_close_price(level_body, found)
             if price is None or price <= 0:
-                continue
-            open_base = partial_decimal(str(getattr(getattr(open_slot, "order", None), "executed_amount_base", "") or ""))
-            if open_base is None or open_base <= 0:
-                continue
-            if size < open_base:
                 continue
             closed = self._stock_filled_order(
                 client_id=text, trading_pair=pair, trade_name="SELL",
