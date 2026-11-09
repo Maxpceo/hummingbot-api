@@ -2195,10 +2195,17 @@ async def test_column_only_id_survives_stop_and_cleanup(tmp_path, monkeypatch):
     kept = _Kept()
     kept.is_closed = True
     service._active_executors["grid-a"] = kept
+
+    async def _quiet_iface_cleanup():
+        pass
+
+    service._trading_interfaces["main"].cleanup = _quiet_iface_cleanup
     await _one_tick(service, monkeypatch)
-    assert "grid-a" in service._active_executors
+    # Штатная запись конца забрала исполнителя и с недоказанным номером колонки:
+    # номер держит запрет новой заявки из журнала, а не активной памятью.
+    assert "grid-a" not in service._active_executors
     await service.stop()
-    assert "grid-a" in service._active_executors
+    assert "grid-a" not in service._active_executors
     await service.cleanup_orphaned_executors()
     assert "grid-a" in repo.cleaned
     await service._durable_open("grid-a", _buyer(connector), _open_level(), {})
@@ -2375,7 +2382,8 @@ async def test_failed_read_does_not_pop_on_an_old_release(tmp_path, monkeypatch)
     service._released_order_ids = {"t-HBOTold"}
     service._sweep_seen = True
     await _one_tick(service, monkeypatch)
-    assert "grid-a" in service._active_executors
+    # Сбойное чтение книги не держит штатную запись конца: исполнитель записан и вынут.
+    assert "grid-a" not in service._active_executors
 
 
 def test_plain_append_does_not_unlink_the_marker(tmp_path, monkeypatch):

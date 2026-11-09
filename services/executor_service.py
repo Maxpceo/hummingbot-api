@@ -15,12 +15,15 @@ def _delivery_owns(text: str) -> bool:
     current = _cancel_delivery_id.get()
     return current not in (None, "") and str(text) == str(current)
 _own_fresh_send = contextvars.ContextVar("own_fresh_send", default="")
+# Уровень, который живой шаг уже держит, пока идёт его штатная постановка.
+_placing_level = contextvars.ContextVar("placing_level", default=None)
 import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Type
 
 from fastapi import HTTPException
@@ -112,6 +115,8 @@ from utils.executor_checkpoint import (
     CLOSE_HOLD_KEY,
     CLOSE_BAN_KEY,
     install_close_without_level,
+    append_level_place_line,
+    seat_recorded_level_opens,
     stop_mark_visible,
     STOP_MARK_KEY,
     read_merged_ledger,
@@ -131,6 +136,15 @@ from utils.executor_checkpoint import (
     note_checkpoint_copy,
     parse_checkpoint_cached,
     append_durable_row,
+    record_returned_close,
+    append_published_close,
+    published_close_rows,
+    seat_live_returned_close,
+    seat_role_close_before_next,
+    recent_ids_kept_as_open,
+    step_close_witness,
+    okx_blank_px_fills,
+    recorded_close_holds_retry,
     resolve_close_bans,
     restore_close_memory,
     note_owed,
@@ -546,9 +560,18 @@ class ExecutorService:
                 completed_ids = []
                 for executor_id, executor in list(self._active_executors.items()):
                     if getattr(executor, "is_closed", False):
-                        if not self._executor_proofs_released(executor_id):
+                        if executor_id in (self.__dict__.get("_flat_stopped") or set()):
+                            if await self._flat_checkpoint_number_live(executor_id, executor):
+                                await self._restore_running_after_flat(executor_id)
+                                self._reopen_closed_executor(executor, executor_id)
+                                continue
+                        if await self._flat_stop_needs_owner(executor_id, executor):
+                            await self._restore_running_after_flat(executor_id)
+                            self._reopen_closed_executor(executor, executor_id)
                             continue
                         completed_ids.append(executor_id)
+                    elif executor_id in (self.__dict__.get("_flat_stopped") or set()):
+                        await self._restart_flat_owner_if_needed(executor_id, executor)
                     elif (
                         self._executor_metadata.get(executor_id, {}).get("executor_type") == "lp_executor"
                         and executor_id not in self._lp_rent_recorded
@@ -1082,6 +1105,7 @@ class ExecutorService:
                 frozen=lambda eid=str(executor_id): self._stop_mark_now(eid),
             )
             self._open_fill_down_close_door(executor_id, executor)
+            self._install_close_record(executor_id, executor)
         if start:
             self._start_registered_executor(executor_id, executor)
         return executor_id, executor
@@ -1097,6 +1121,11 @@ class ExecutorService:
         service = self
 
         def get_close(*args, **kwargs):
+
+            if not service._stop_mark_now(executor_id):
+
+                return brake_get(*args, **kwargs)
+
             found = list(brake_get(*args, **kwargs) or [])
             seen = {id(item) for item in found}
             pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
@@ -1114,21 +1143,259 @@ class ExecutorService:
             return found
 
         def adjust(level, *args, **kwargs):
-            if not service._filled_down_open(executor_id, executor, level):
-                return brake_adjust(level, *args, **kwargs)
-            connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
-            connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
-            task = asyncio.get_event_loop().create_task(
-                service._one_sell_after_fill_down(executor_id, executor, connector, level)
-            )
-            service.__dict__.setdefault("_accept_tasks", set()).add(task)
-            task.add_done_callback(service.__dict__["_accept_tasks"].discard)
-            return None
+            # Исполненная покупка не переводится в нашу продажу. Их тейк не глушим.
+            return brake_adjust(level, *args, **kwargs)
 
         executor.get_close_orders_to_create = get_close
         executor.adjust_and_place_close_order = adjust
         executor._fill_down_door = True
 
+    def _install_close_record(self, executor_id: str, executor: Any) -> None:
+
+        """Их продажа не уходит, пока строка с уровнем не сброшена. Свой номер не чеканим."""
+
+        if getattr(executor, "_close_record_wrapped", False):
+
+            return
+
+        original = getattr(executor, "adjust_and_place_close_order", None)
+
+        if original is None:
+
+            return
+
+        service = self
+
+
+
+        def wrapped(level, *args, **kwargs):
+            if service._stop_mark_now(executor_id):
+                return original(level, *args, **kwargs)
+            import hummingbot.connector.exchange_py_base as exchange_base
+            from hummingbot.core.utils.async_utils import safe_ensure_future
+            held = []
+            real_ensure = exchange_base.safe_ensure_future
+
+            def capture(coro, *coro_args, **coro_kwargs):
+                held.append(coro)
+                return None
+
+            exchange_base.safe_ensure_future = capture
+            try:
+                result = original(level, *args, **kwargs)
+            finally:
+                exchange_base.safe_ensure_future = real_ensure
+            order_id = str(getattr(getattr(level, "active_close_order", None), "order_id", "") or "")
+            if not order_id:
+                for coro in held:
+                    coro.close()
+                level.active_close_order = None
+                return result
+            kept = append_published_close(
+                executor_id, order_id, str(getattr(level, "id", "") or ""), getattr(level, "price", None),
+            )
+            if not kept:
+                for coro in held:
+                    coro.close()
+                rows = published_close_rows(executor_id)
+                level_id = str(getattr(level, "id", "") or "")
+                still = rows is None or any(
+                    str(item.get("order_id") or "") == order_id and str(item.get("level_id") or "") == level_id
+                    for item in rows
+                )
+                if not still:
+                    level.active_close_order = None
+                return result
+            for coro in held:
+                safe_ensure_future(coro)
+            return result
+
+
+
+
+        wrapped._close_record_wrapped = True
+
+        executor.adjust_and_place_close_order = wrapped
+
+        executor._close_record_wrapped = True
+
+
+
+    def _restart_seat_due(self, executor_id: str, executor: Any) -> bool:
+        return bool(getattr(executor, "_notebook_resumed", False)) and not self._stop_mark_now(executor_id)
+
+
+    def _finish_restart_seat(self, executor_id: str, executor: Any, fresh: Optional[Dict[str, Any]]) -> bool:
+        """Ложь — журнал не прочитан. Их шаг не звать и флаг подъёма не снимать."""
+        if not self._seat_restart_closes(executor_id, executor, fresh):
+            return False
+        if self._lists_ready(fresh):
+            executor._notebook_resumed = False
+        return True
+
+    def _seat_restart_closes(self, executor_id: str, executor: Any, fresh: Optional[Dict[str, Any]]) -> bool:
+
+        """После восстановления уровней: поздняя строка закрытия в пустой слот. По цене не сажаем."""
+
+        if self._stop_mark_now(executor_id):
+
+            return True
+
+        rows = published_close_rows(executor_id)
+        if rows is None:
+            return False
+
+        by_level: Dict[str, list] = {}
+
+        for row in rows:
+
+            by_level.setdefault(str(row.get("level_id") or ""), []).append(row)
+
+        opens_read = bool((fresh or {}).get("opens_read") and (fresh or {}).get("opens_done"))
+
+        finished_read = bool((fresh or {}).get("finished_read") and (fresh or {}).get("finished_done"))
+
+        half = not opens_read or not finished_read
+
+        shown_lists = []
+
+        if opens_read:
+
+            shown_lists.extend((fresh or {}).get("opens") or [])
+
+        if finished_read:
+
+            shown_lists.extend((fresh or {}).get("finished") or [])
+
+            shown_lists.extend((fresh or {}).get("finished_blank_px") or [])
+
+
+
+        def shown(order_id: str):
+
+            if half:
+
+                return True
+
+            return self._shown_fill_row(fresh, order_id, "SELL") is not None or any(
+
+                self._row_order_id(item) == str(order_id) for item in shown_lists if isinstance(item, dict)
+
+            )
+
+
+
+        def live(order_id: str) -> bool:
+
+            if not opens_read:
+
+                return False
+
+            return any(
+
+                self._row_order_id(item) == str(order_id) for item in ((fresh or {}).get("opens") or []) if isinstance(item, dict)
+
+            )
+
+
+
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+
+        side = getattr(getattr(getattr(executor, "config", None), "side", None), "name", "BUY")
+        close_side = "SELL" if side == "BUY" else "BUY" if side == "SELL" else side
+
+        leverage = getattr(getattr(executor, "config", None), "leverage", None) or 1
+
+        from hummingbot.strategy_v2.models.executors import TrackedOrder
+
+        for level in list(getattr(executor, "grid_levels", None) or []):
+
+            level_id = str(getattr(level, "id", "") or "")
+
+            group = sorted(by_level.get(level_id) or [], key=lambda item: float(item.get("ts") or 0))
+
+            occupied = str(getattr(getattr(level, "active_close_order", None), "order_id", "") or "")
+            if not group:
+                continue
+
+
+            later = group[-1]
+
+            earlier = group[:-1]
+
+            chosen = None
+
+            filled = False
+
+            if half:
+
+                chosen = later
+
+            elif live(str(later.get("order_id") or "")) or self._shown_fill_row(fresh, str(later.get("order_id") or ""), close_side) is not None:
+                chosen = later
+                filled = self._shown_fill_row(fresh, str(later.get("order_id") or ""), close_side) is not None
+
+            else:
+
+                for row in reversed(earlier):
+
+                    order_id = str(row.get("order_id") or "")
+
+                    if self._shown_fill_row(fresh, order_id, close_side) is not None:
+
+                        chosen = row
+
+                        filled = True
+
+                        break
+
+                    if live(order_id):
+
+                        chosen = row
+
+                        filled = False
+
+                        break
+
+            if chosen is None:
+                if not half and occupied and self._shown_fill_row(fresh, occupied, close_side) is None and not live(occupied):
+                    level.active_close_order = None
+                continue
+
+
+            order_id = str(chosen.get("order_id") or "")
+
+            tracked = TrackedOrder(order_id=order_id)
+
+            if filled:
+
+                row = self._shown_fill_row(fresh, order_id, close_side)
+
+                opened = self._stock_filled_order(
+
+                    client_id=order_id,
+
+                    trading_pair=pair,
+
+                    trade_name="SELL" if side == "BUY" else "BUY",
+
+                    position_name="CLOSE",
+
+                    amount=self._row_fill_size(row) if row else None,
+
+                    price=self._row_fill_price(row) if row else None,
+
+                    leverage=int(leverage),
+
+                )
+
+                if opened is not None:
+
+                    tracked.order = opened
+
+            level.active_close_order = tracked
+
+        return True
     def _start_registered_executor(self, executor_id: str, executor: ExecutorBase) -> None:
         token = current_executor_id.set(executor_id)
         try:
@@ -1212,10 +1479,44 @@ class ExecutorService:
         original_place = executor.place_order
 
         def place_wrapped(*args, **kwargs):
+            # Сторож отхода не отвергает штатную постановку и не требует номер
+            # до возврата. Свой номер до вызова не чеканим.
+            level = _placing_level.get()
+            order_type = kwargs.get("order_type")
+            side = kwargs.get("side")
+            if (
+                getattr(order_type, "name", str(order_type or "")) == "MARKET"
+                and getattr(side, "name", str(side or "")) == "BUY"
+            ):
+                try:
+                    from hummingbot.core.data_type.common import PriceType
+                    ask = executor.get_price(
+                        kwargs.get("connector_name"), kwargs.get("trading_pair"), PriceType.BestAsk,
+                    )
+                    price = kwargs.get("price")
+                    if ask is not None and price is not None and price < ask:
+                        kwargs["price"] = ask
+                except Exception:
+                    pass
             result = original_place(*args, **kwargs)
             order_id = result if isinstance(result, str) else None
+            if level is not None:
+                level_id = str(getattr(level, "id", "") or "")
+                if order_id and level_id:
+                    # Строка с id уровня до возврата. Голую строку не пишем:
+                    # иначе старая посадка снимет колпак по цене.
+                    append_level_place_line(
+                        executor_id, order_id, level_id, kwargs.get("price"),
+                    )
+                service._schedule_checkpoint(executor_id)
+                return result
             note_placed(executor, order_id)
             remember_order_now(executor_id, order_id)
+            action = kwargs.get("position_action")
+            is_close = getattr(action, "name", str(action or "")) == "CLOSE"
+            if order_id and is_close:
+                record_returned_close(executor_id, order_id)
+                seat_live_returned_close(executor, order_id)
             service._schedule_checkpoint(executor_id)
             return result
 
@@ -1282,6 +1583,7 @@ class ExecutorService:
             "covers_ts": False,
             "opens": [],
             "finished": [],
+            "finished_blank_px": [],
         }
 
     async def _okx_closed_pages(
@@ -1296,6 +1598,7 @@ class ExecutorService:
         if end is None:
             end = first["params"]["end"]
         orders = []
+        blank_fills = []
         after = None
         try:
             for _ in range(1000):
@@ -1314,11 +1617,13 @@ class ExecutorService:
                 if not parsed.get("read"):
                     return None
                 orders.extend(parsed.get("orders") or [])
+                blank_fills.extend(okx_blank_px_fills(body))
                 if parsed.get("done"):
                     return {
                         "read": True,
                         "done": True,
                         "orders": orders,
+                        "blank_px_fills": blank_fills,
                         "request": request,
                     }
                 after = parsed.get("cursor")
@@ -1411,6 +1716,7 @@ class ExecutorService:
                         "covers_ts": False,
                         "opens": opens,
                         "finished": finished.get("orders") or [],
+                        "finished_blank_px": finished.get("blank_px_fills") or [],
                         "symbol": symbol,
                         "finished_request": finished.get("request"),
                     }
@@ -2194,6 +2500,328 @@ class ExecutorService:
             return False
         gates.pop(executor_id, None)
         return True
+
+    async def _land_closed_early_stop(self, executor_id: str, executor: Any) -> bool:
+        """Сажает уже закрытую раннюю остановку уже существующей записью.
+        Новый статус не пишем. Недоказанное не сажаем и из памяти не вынимаем.
+        """
+        if not await self._closed_early_stop_ready(executor_id, executor):
+            return False
+        await self._persist_executor_completed(executor_id, executor)
+        if not await self._closed_row_landed(executor_id):
+            return False
+        self._active_executors.pop(executor_id, None)
+        self._executor_metadata.pop(executor_id, None)
+        return True
+
+    async def _closed_early_stop_ready(self, executor_id: str, executor: Any) -> bool:
+        """Каждый свой номер доказан, тело прочитано и плоско.
+
+        Номера без finished и без открытых доказывает архив: сырые строки
+        страницы (пустой px строку не выкидывает), состояние «исполнена» и
+        монетный размер больше нуля. Открытые, полёт, потерянные, неизвестная
+        отправка и непрочитанное архив не заменяют. После тела списки
+        читаются заново.
+        """
+        close_name = getattr(getattr(executor, "close_type", None), "name", None)
+        status_name = getattr(getattr(executor, "status", None), "name", None)
+        if not getattr(executor, "is_closed", False):
+            self._log_silent_exit(
+                "closed-stop-proof", getattr(getattr(executor, "config", None), "trading_pair", None) or "",
+                "not-closed", executor_id, interval=60.0, label="silent stop exit:", key=executor_id,
+            )
+            return False
+        if close_name != "EARLY_STOP" or status_name != "TERMINATED":
+            self._log_silent_exit(
+                "closed-stop-proof", getattr(getattr(executor, "config", None), "trading_pair", None) or "",
+                f"memory-state {close_name}/{status_name}", executor_id,
+                interval=60.0, label="silent stop exit:", key=executor_id,
+            )
+            return False
+        ids = self._closed_early_stop_ids(executor_id, executor)
+        if ids is None:
+            self._log_silent_exit(
+                "closed-stop-proof", getattr(getattr(executor, "config", None), "trading_pair", None) or "",
+                "ids-unread", executor_id, interval=60.0, label="silent stop exit:", key=executor_id,
+            )
+            return False
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        if connector is None or not pair or not hasattr(connector, "_api_get"):
+            return False
+
+        def proof_log(reason):
+            self._log_silent_exit(
+                "closed-stop-proof", pair or "", reason, executor_id,
+                interval=60.0, label="silent stop exit:", key=executor_id,
+            )
+
+        def lists_state(fresh):
+            if not self._lists_ready(fresh):
+                proof_log("lists-unread")
+                return None
+            inflight = getattr(getattr(connector, "in_flight_orders", None), "copy", lambda: {})()
+            lost = getattr(getattr(getattr(connector, "_order_tracker", None), "lost_orders", None), "copy", lambda: {})()
+            missing = []
+            for text in sorted(ids):
+                if order_send_unknown(text) or text in inflight or text in lost:
+                    proof_log("number-live " + text[-8:])
+                    return None
+                if self._shutdown_text_present((fresh or {}).get("opens"), text):
+                    proof_log("number-open " + text[-8:])
+                    return None
+                row = self._finished_row(text, fresh)
+                if row is not None:
+                    if not self._closed_row_filled(row):
+                        proof_log("finished-not-filled " + text[-8:])
+                        return None
+                    continue
+                missing.append(text)
+            return missing
+
+        fresh = await self._fresh_raw_lists(connector, pair, None)
+        missing = lists_state(fresh)
+        if missing is None:
+            return False
+        archive_deaths = {}
+        need = []
+        for text in missing:
+            refusal = await self._shutdown_close_refusal(text)
+            if refusal is True:
+                continue
+            need.append(text)
+        if need:
+            archive_deaths = await self._archive_death_bases(connector, pair, need)
+            if archive_deaths is None:
+                proof_log("archive-unproven " + ",".join(text[-8:] for text in need))
+                return False
+        own_size = getattr(executor, "position_size_base", None)
+        try:
+            own_flat = own_size is not None and Decimal(str(own_size)) == 0
+        except Exception:
+            own_flat = False
+        if not own_flat:
+            proof_log("own-size-not-zero")
+            return False
+        fresh = await self._fresh_raw_lists(connector, pair, None)
+        missing_after = lists_state(fresh)
+        if missing_after is None:
+            return False
+        for text in missing_after:
+            if await self._shutdown_close_refusal(text) is True:
+                continue
+            if text not in archive_deaths:
+                proof_log("archive-death-dropped " + text[-8:])
+                return False
+        return True
+
+    async def _archive_death_bases(self, connector, pair: str, numbers) -> Optional[Dict[str, Decimal]]:
+        """Сырые страницы (свежая 7-дневная и 90-дневный архив) по каждому номеру:
+
+        исполнен и монетный размер больше нуля. Пустой px строку не выкидываем.
+        Нечитаемое, незнайденное, отмена и нулевой размер — None, не ноль.
+        """
+        from utils.executor_checkpoint import OPEN_PAGE_LIMIT
+        symbol = await self._gate_symbol(connector, pair)
+        if not symbol:
+            return None
+        inst_type = "SWAP" if "perpetual" in type(connector).__name__.lower() else "SPOT"
+        window = self._retained_archive_window()
+        rows: List[Dict[str, Any]] = []
+        for use_archive, begin, end in (
+            (False, None, None),
+            (True, window["begin"], window["end"]),
+        ):
+            after = None
+            try:
+                for _ in range(1000):
+                    request = okx_closed_request(
+                        symbol, after=after, begin=begin, end=end,
+                        inst_type=inst_type, archive=use_archive,
+                    )
+                    if request is None:
+                        return None
+                    body = await connector._api_get(
+                        path_url=request["path"],
+                        params=request["params"],
+                        is_auth_required=True,
+                        limit_id=self._open_limit_id(connector, "okx"),
+                    )
+                    if not isinstance(body, dict) or str(body.get("code")) != "0" or not isinstance(body.get("data"), list):
+                        return None
+                    data = body["data"]
+                    for raw in data:
+                        if isinstance(raw, dict):
+                            if use_archive:
+                                try:
+                                    created = int(str(raw.get("cTime")))
+                                except (TypeError, ValueError):
+                                    return None
+                                if created < int(window["begin"]) or created > int(window["end"]):
+                                    continue
+                            rows.append(raw)
+                    if len(data) < OPEN_PAGE_LIMIT:
+                        break
+                    cursor = data[-1].get("ordId") if isinstance(data[-1], dict) else None
+                    if not cursor:
+                        return None
+                    after = str(cursor)
+            except Exception:
+                return None
+        deaths: Dict[str, Decimal] = {}
+        for text in [str(item) for item in numbers]:
+            base = None
+            for raw in rows:
+                name = str(raw.get("clOrdId") or raw.get("text") or raw.get("order_id") or "")
+                if name != text:
+                    continue
+                if str(raw.get("state") or "") != "filled":
+                    continue
+                size = partial_decimal(raw.get("accFillSz"))
+                coin = self._contract_base(connector, pair, size) if size is not None and size > 0 else None
+                if coin is not None and coin > 0:
+                    base = coin
+                    break
+            if base is None:
+                self._log_silent_exit(
+                    "archive-proof", pair or "",
+                    f"no-death {text[-8:]} rows={len(rows)}",
+                    key=pair or "archive",
+                    label="silent stop exit:",
+                )
+                return None
+            deaths[text] = base
+        return deaths
+
+    def _closed_early_stop_ids(self, executor_id: str, executor: Any):
+        """Журнал, колонка и close_holds, включая не ушедшую отправку.
+        Отфильтрованный журнал такую строку прячет. Непрочитанное — не пустой набор.
+        """
+        ids = self._own_stop_ids(executor_id)
+        if ids is None:
+            return None
+        from utils.executor_checkpoint import parse_checkpoint, _read_ledger, saved_order_ids
+        found = set(ids)
+        try:
+            raw_rows = _read_ledger()
+        except Exception:
+            import traceback; traceback.print_exc()
+            return None
+        found.update(
+            str(row.get("order_id"))
+            for row in raw_rows or []
+            if row.get("executor_id") == executor_id and row.get("order_id")
+        )
+        for row in getattr(self, "_hold_rows", None) or []:
+            key = str(row.get("executor_id") or row.get("row_executor_id") or "")
+            if key != str(executor_id):
+                continue
+            text = row.get("checkpoint") or ""
+            parsed = parse_checkpoint(text)
+            if text and parsed is None:
+                return None
+            found.update(saved_order_ids(parsed))
+            found.update(self._ids_of((parsed or {}).get("holds")))
+            found.update(self._ids_of((parsed or {}).get("close_holds")))
+            found.update(self._ids_of((parsed or {}).get("retained_orders")))
+            found.update(self._ban_ids(parsed))
+            found.update(self._partial_end_order_ids(parsed))
+            found.update(self._checkpoint_close_ids(parsed, past=True))
+        found.update(self._ids_of(getattr(executor, "_close_holds", []) or []))
+        found.update(self._executor_close_slot_ids(executor))
+        return found
+
+    @staticmethod
+    def _ban_ids(parsed) -> set:
+        found = set()
+        for ban in (parsed or {}).get("close_bans") or []:
+            if isinstance(ban, dict) and ban.get("order_id"):
+                found.add(str(ban["order_id"]))
+            elif isinstance(ban, str) and ban:
+                found.add(ban)
+        return found
+
+    @staticmethod
+    def _partial_end_order_ids(parsed) -> set:
+        ends = (parsed or {}).get("partial_ends") or {}
+        if not isinstance(ends, dict):
+            return set()
+        found = set()
+        for key, mark in ends.items():
+            text = str(key or "")
+            if text and text != "stop-requested" and not text.startswith("level:"):
+                found.add(text)
+            if isinstance(mark, dict):
+                found.update(str(item) for item in (mark.get("order_ids") or []) if item)
+        return found
+
+    @staticmethod
+    def _executor_close_slot_ids(executor) -> set:
+        found = {str(item) for item in getattr(executor, "_close_ban_ids", set()) or set() if item}
+        close = getattr(executor, "_close_order", None)
+        if getattr(close, "order_id", None):
+            found.add(str(close.order_id))
+        pending = getattr(executor, "_shutdown_close_id", None)
+        if pending:
+            found.add(str(pending))
+        for level in getattr(executor, "grid_levels", []) or []:
+            seated = getattr(level, "active_close_order", None)
+            if getattr(seated, "order_id", None):
+                found.add(str(seated.order_id))
+        return found
+
+    async def _numbers_dead_on_fresh_lists(self, executor: Any, ids) -> bool:
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        if connector is None or not pair:
+            return False
+        try:
+            fresh = await self._fresh_raw_lists(connector, pair, None)
+        except Exception:
+            return False
+        if not self._lists_ready(fresh):
+            return False
+        inflight = getattr(connector, "in_flight_orders", None)
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None)
+        if not isinstance(inflight, dict) or not isinstance(lost, dict):
+            return False
+        return all(
+            self._sent_number_proven_dead(text, fresh, inflight, lost)
+            for text in ids
+        )
+
+    def _sent_number_proven_dead(
+        self, order_id: str, fresh: Optional[Dict[str, Any]], inflight: Dict[str, Any], lost: Dict[str, Any],
+    ) -> bool:
+        text = str(order_id or "")
+        if (
+            not text
+            or order_send_unknown(text)
+            or text in inflight
+            or text in lost
+            or self._shutdown_text_present((fresh or {}).get("opens"), text)
+        ):
+            return False
+        if order_is_unsent(text):
+            return True
+        return self._finished_row(text, fresh) is not None
+
+    async def _closed_row_landed(self, executor_id: str) -> bool:
+        if not self.db_manager:
+            return False
+        try:
+            async with self.db_manager.get_session_context() as session:
+                current = await ExecutorRepository(session).get_executor_by_id(executor_id)
+        except Exception:
+            return False
+        if current is None:
+            return False
+        return (
+            str(getattr(current, "status", None) or "") == "TERMINATED"
+            and str(getattr(current, "close_type", None) or "") == "EARLY_STOP"
+        )
 
     def _stop_held_may_finish(self, executor_id: str, executor: Any) -> bool:
         """Внутреннее завершение только если каждый номер мёртв доказанно.
@@ -3553,19 +4181,21 @@ class ExecutorService:
         return found
 
     def _install_open_shell(self, executor_id: str, executor: ExecutorBase) -> None:
-        """Grid opens do not call the stock place. The task is kept, not discarded."""
+        """Живой шаг зовёт штатную постановку. Свой номер до возврата не чеканим."""
         if not hasattr(executor, "adjust_and_place_open_order"):
             return
         service = self
-        reserves = self.__dict__.setdefault("_quant_reserves", {})
-        tasks = self.__dict__.setdefault("_accept_tasks", set())
+
+        original_adjust = executor.adjust_and_place_open_order
 
         def wrapped(level):
-            task = asyncio.get_event_loop().create_task(
-                service._durable_open(executor_id, executor, level, reserves)
-            )
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
+            # Живой шаг зовёт штатную постановку этого уровня. Уровни, которые
+            # она сама ставит на одну цену, не удерживаем. Свой номер не чеканим.
+            token = _placing_level.set(level)
+            try:
+                return original_adjust(level)
+            finally:
+                _placing_level.reset(token)
 
         executor.adjust_and_place_open_order = wrapped
         install_partial = getattr(self, "_install_partial_guards", None)
@@ -3574,45 +4204,13 @@ class ExecutorService:
         original_stop = getattr(executor, "control_shutdown_process", None)
 
         async def stop_held(*args, **kwargs):
-            proven = service._stop_mark_now(executor_id) and service._shutdown_close_proven(executor_id)
-            if proven and not await service._retract_unconfirmed_dead_ends(executor_id, executor):
-                service._log_silent_exit(
-                    "proven-finish", "", "live end not cleared", executor_id,
-                    interval=300.0, label="silent stop exit:", key=executor_id,
-                )
-                return None
-            if proven and getattr(executor, "_proven_finish_stopped", False):
-                return None
-            released = service._stop_held_may_finish(executor_id, executor)
-            if not released:
-                gate = (service.__dict__.get("_stop_gate") or {}).get(executor_id) or "unknown"
-                service._log_silent_exit(
-                    "stop-held", "", f"gate={gate}", executor_id,
-                    interval=300.0, label="silent stop exit:", key=executor_id,
-                )
-                return None
-            # Доказанное «закрывать нечего» не отдаём штатному шагу: он зовёт
-            # control_close, тормоз его держит, счётчик повторов ставит FAILED.
-            if proven:
-                if not await service._remember_own_dead_ends(executor_id, executor):
-                    service._log_silent_exit(
-                        "proven-finish", "", "end not visible", executor_id,
-                        interval=300.0, label="silent stop exit:", key=executor_id,
-                    )
+            # Метка кнопки не пропускает штатное гашение. Нулевая ликвидность
+            # без метки по-прежнему не входит: ячейку не стираем.
+            if service._stop_mark_now(executor_id):
+                if original_stop is None:
                     return None
-                if not service._stop_held_may_finish(executor_id, executor):
-                    return None
-                if not service._shutdown_close_proven(executor_id):
-                    return None
-                stopper = getattr(executor, "stop", None)
-                if not callable(stopper):
-                    return None
-                # Тормоз пускает stop() только если атрибут истинен. Метод уже
-                # доказал гашение; тик без книги остатка мог записать ложь.
-                executor._shutdown_close_proven = True
-                stopper()
-                executor._proven_finish_stopped = True
-                service.__dict__.get("_unconfirmed_dead_ends", {}).pop(executor_id, None)
+                return await original_stop(*args, **kwargs)
+            if service._live_delivery_reads_zero_liquidity(executor_id, executor):
                 return None
             if original_stop is None:
                 return None
@@ -3620,6 +4218,24 @@ class ExecutorService:
 
         if original_stop is not None:
             executor.control_shutdown_process = stop_held
+        current_stop = getattr(executor, "stop", None)
+        if current_stop is not None and not getattr(current_stop, "_delivery_stop_guard", False):
+
+            if not getattr(executor, "_author_stop", None):
+                executor._author_stop = current_stop
+            def delivery_stop(*args, **kwargs):
+                # Уже стоящий stop() при тормозе не ставит «закончено», пока доставка жива.
+                if service._live_delivery_reads_zero_liquidity(executor_id, executor):
+                    return None
+                if (
+                    service._stop_mark_now(executor_id)
+                    and service._unproven_delivery_ids(executor_id, executor)
+                ):
+                    return None
+                return current_stop(*args, **kwargs)
+
+            delivery_stop._delivery_stop_guard = True
+            executor.stop = delivery_stop
         connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
         if connector_name != "okx_perpetual":
             return
@@ -3803,6 +4419,8 @@ class ExecutorService:
             close = side == close_side
             if self._slot_has_other(executor, level_id, close, order_id):
                 continue
+            if self._shown_fill_row(fresh, order_id, grid_side) is not None:
+                continue
             self._seat_not_filled(executor, level_id, order_id, close)
 
     def _seat_filled_while_down(self, executor_id, executor, connector, fresh) -> set:
@@ -3861,6 +4479,134 @@ class ExecutorService:
                 tracked.order = opened
                 level.active_open_order = tracked
         return blocked
+
+    def _checkpoint_open_ids(self, executor_id: str) -> list:
+        """Свои покупки из записи. Журнал не нужен, чужая цена не входит."""
+        found = []
+        for level in (self._partial_parsed(executor_id) or {}).get("levels") or []:
+            if not isinstance(level, dict):
+                continue
+            slot = level.get("open_order") or {}
+            order_id = str(slot.get("order_id") or "")
+            level_id = str(level.get("id") or "")
+            if order_id and level_id:
+                found.append((order_id, level_id))
+        return found
+
+    def _row_order_id(self, row: Dict[str, Any]) -> str:
+        return str(row.get("text") or row.get("clOrdId") or row.get("order_id") or "")
+
+    def _row_fill_size(self, row: Dict[str, Any]):
+        return partial_decimal(row.get("fill_size") if row.get("fill_size") not in (None, "") else row.get("accFillSz"))
+
+    def _row_fill_price(self, row: Dict[str, Any]):
+        for key in ("price", "fillPx", "avgPx", "px"):
+            if row.get(key) not in (None, ""):
+                return partial_decimal(row.get(key))
+        return None
+
+    def _shown_fill_row(self, fresh: Optional[Dict[str, Any]], order_id: str, side: str) -> Optional[Dict[str, Any]]:
+        """Строка исполнения этого номера. Непрочитанный список исполнением не становится."""
+        if not isinstance(fresh, dict) or not fresh.get("finished_read") or not fresh.get("finished_done"):
+            return None
+        row = None
+        lists = list(fresh.get("finished") or [])
+        lists.extend(fresh.get("finished_blank_px") or [])
+        for item in lists:
+            if isinstance(item, dict) and self._row_order_id(item) == str(order_id):
+                row = item
+                break
+        if not isinstance(row, dict) or str(row.get("state") or "") != "filled":
+            return None
+        shown_side = str(row.get("side") or "").upper()
+        if shown_side and shown_side != side:
+            return None
+        size = self._row_fill_size(row)
+        price = self._row_fill_price(row)
+        if size is None or size <= 0 or price is None or price <= 0:
+            return None
+        return row
+
+    async def _note_shown_buy(self, executor_id: str, level_id: str, order_id: str, row: Dict[str, Any]) -> bool:
+        """Исполнение без своего номера продажи. Метка кнопки запись не запрещает."""
+        size = self._row_fill_size(row)
+        price = self._row_fill_price(row)
+
+        def mutate(body: Dict[str, Any]) -> None:
+            target = None
+            for level in body.get("levels") or []:
+                if isinstance(level, dict) and str(level.get("id") or "") == str(level_id):
+                    target = level
+                    break
+            if target is None:
+                raise RuntimeError("level missing")
+            opened = dict(target.get("open_order") or {})
+            if str(opened.get("order_id") or "") != str(order_id):
+                raise RuntimeError("not our open")
+            opened["filled"] = True
+            opened["price"] = str(price)
+            opened["order"] = {"executed_amount_base": str(size)}
+            target["open_order"] = opened
+
+        def visible(parsed: Optional[Dict[str, Any]]) -> bool:
+            for level in (parsed or {}).get("levels") or []:
+                if str(level.get("id") or "") != str(level_id):
+                    continue
+                opened = level.get("open_order") or {}
+                body = opened.get("order") or {}
+                return (
+                    str(opened.get("order_id") or "") == str(order_id)
+                    and opened.get("filled") is True
+                    and str(body.get("executed_amount_base") or "") == str(size)
+                    and not (level.get("close_order") or {}).get("order_id")
+                )
+            return False
+
+        return await self._partial_cas(executor_id, mutate, visible, level_id)
+
+    async def _note_shown_buys(self, executor_id: str, fresh: Optional[Dict[str, Any]]) -> None:
+        side = "BUY"
+        executor = (getattr(self, "_active_executors", None) or {}).get(executor_id)
+        named = getattr(getattr(getattr(executor, "config", None), "side", None), "name", "")
+        if named in ("BUY", "SELL"):
+            side = named
+        for order_id, level_id in self._checkpoint_open_ids(executor_id):
+            row = self._shown_fill_row(fresh, order_id, side)
+            if row is None:
+                continue
+            await self._note_shown_buy(executor_id, level_id, order_id, row)
+
+    def _seat_shown_buys(self, executor_id: str, executor: Any, fresh: Optional[Dict[str, Any]]) -> None:
+        """До их шага: исполнение на уровне, даже если номер ещё в полёте. Размер позиции не пишем."""
+        side = getattr(getattr(getattr(executor, "config", None), "side", None), "name", "")
+        if side not in ("BUY", "SELL"):
+            return
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        leverage = getattr(getattr(executor, "config", None), "leverage", None) or 1
+        if not pair:
+            return
+        from hummingbot.strategy_v2.models.executors import TrackedOrder
+        for order_id, level_id in self._checkpoint_open_ids(executor_id):
+            row = self._shown_fill_row(fresh, order_id, side)
+            if row is None:
+                continue
+            opened = self._stock_filled_order(
+                client_id=order_id,
+                trading_pair=pair,
+                trade_name=side,
+                position_name="OPEN",
+                amount=self._row_fill_size(row),
+                price=self._row_fill_price(row),
+                leverage=int(leverage),
+            )
+            if opened is None:
+                continue
+            for level in list(getattr(executor, "grid_levels", None) or []):
+                if str(getattr(level, "id", "") or "") != level_id:
+                    continue
+                tracked = TrackedOrder(order_id=str(order_id))
+                tracked.order = opened
+                level.active_open_order = tracked
 
     def _filled_down_open(self, executor_id, executor, level) -> str:
         """Our filled open text in this slot. A foreign id is not this."""
@@ -5083,6 +5829,8 @@ class ExecutorService:
         if not self.db_manager:
             self._resume_holding_prefix = False
             return
+        # Уже закрытую раннюю остановку подъём не открывает
+        # (план stop-finished-not-reopened).
         try:
             async with self.db_manager.get_session_context() as session:
                 rows = await ExecutorRepository(session).get_running_for_resume()
@@ -5394,9 +6142,179 @@ class ExecutorService:
             found.update(str(order_id) for order_id in cached if order_id)
         return found
 
+    def _resume_own_ids(self, executor_id: str, checkpoint: Optional[Dict[str, Any]]) -> set:
+        found = {str(item) for item in saved_order_ids(checkpoint) if item}
+        found.update(str(item) for item in (recent_order_ids(executor_id) or []) if item)
+        for level in (checkpoint or {}).get("levels") or []:
+            if not isinstance(level, dict):
+                continue
+            for key in ("open_order", "close_order"):
+                order_id = (level.get(key) or {}).get("order_id")
+                if order_id:
+                    found.add(str(order_id))
+        close = ((checkpoint or {}).get("close_order") or {}).get("order_id")
+        if close:
+            found.add(str(close))
+        for hold in (checkpoint or {}).get("holds") or []:
+            if isinstance(hold, dict) and hold.get("order_id"):
+                found.add(str(hold.get("order_id")))
+        found.discard(STOP_MARK_KEY)
+        return found
+
+    def _resume_own_side(self, checkpoint: Optional[Dict[str, Any]], order_id: str) -> str:
+        text = str(order_id)
+        for level in (checkpoint or {}).get("levels") or []:
+            if not isinstance(level, dict):
+                continue
+            close = (level.get("close_order") or {}).get("order_id")
+            if str(close or "") == text:
+                return "sell"
+            open_id = (level.get("open_order") or {}).get("order_id")
+            if str(open_id or "") == text:
+                return "buy"
+        close = ((checkpoint or {}).get("close_order") or {}).get("order_id")
+        if str(close or "") == text:
+            return "sell"
+        for hold in (checkpoint or {}).get("holds") or []:
+            if not isinstance(hold, dict) or str(hold.get("order_id") or "") != text:
+                continue
+            if str(hold.get("role") or "") in ("close", "market_close", "close_order"):
+                return "sell"
+        return ""
+
+    def _resume_fill_size(self, row: Dict[str, Any]) -> Optional[Decimal]:
+        for key in ("fill_size", "amount", "accFillSz"):
+            if row.get(key) in (None, ""):
+                continue
+            try:
+                size = Decimal(str(row.get(key)))
+            except Exception:
+                return None
+            if size > 0:
+                return size
+        return None
+
+    def _resume_proof_ids(self, executor_id: str, checkpoint: Optional[Dict[str, Any]]) -> Optional[set]:
+        from utils.executor_checkpoint import _read_ledger
+        try:
+            raw_rows = _read_ledger()
+        except Exception:
+            return None
+        found = {
+            str(row.get("order_id"))
+            for row in raw_rows or []
+            if row.get("executor_id") == executor_id and row.get("order_id")
+        }
+        found.update(self._resume_own_ids(executor_id, checkpoint))
+        found.update(self._ids_of((checkpoint or {}).get("close_holds")))
+        found.update(self._ban_ids(checkpoint))
+        found.update(self._partial_end_order_ids(checkpoint))
+        found.update(self._checkpoint_close_ids(checkpoint, past=True))
+        found.discard(STOP_MARK_KEY)
+        return found
+
+    async def _marked_resume_gate(self, row: Dict[str, Any]) -> Optional[str]:
+        """seat, keep, or None. None means the resume path is unchanged."""
+        checkpoint = parse_checkpoint_cached(row.get("checkpoint"))
+        if not stop_mark_visible(checkpoint):
+            return None
+        executor_id = str(row.get("executor_id") or "")
+        pair = str(row.get("trading_pair") or "")
+        ids = self._resume_proof_ids(executor_id, checkpoint)
+        if not ids:
+            return "keep"
+        account = row.get("account_name")
+        connector_name = row.get("connector_name")
+        try:
+            trading_interface = self._get_trading_interface(account)
+            await self._prepare_market(account, connector_name, pair)
+            connector = trading_interface.get_connector(connector_name)
+        except Exception:
+            return "keep"
+        if connector is None or not hasattr(connector, "_api_get"):
+            return "keep"
+
+        def lists_state(fresh):
+            if not self._lists_ready(fresh):
+                return None
+            inflight = getattr(getattr(connector, "in_flight_orders", None), "copy", lambda: {})()
+            lost = getattr(
+                getattr(getattr(connector, "_order_tracker", None), "lost_orders", None),
+                "copy", lambda: {},
+            )()
+            missing = []
+            for text in sorted(ids):
+                if order_send_unknown(text) or text in inflight or text in lost:
+                    return None
+                if self._shutdown_text_present((fresh or {}).get("opens"), text):
+                    return None
+                finished = self._finished_row(text, fresh)
+                if finished is not None:
+                    if not self._closed_row_filled(finished):
+                        return None
+                    continue
+                missing.append(text)
+            return missing
+
+        fresh = await self._fresh_raw_lists(connector, pair, None)
+        missing = lists_state(fresh)
+        if missing is None:
+            return "keep"
+        archive = {}
+        if missing:
+            archive = await self._archive_death_bases(connector, pair, missing)
+            if not archive:
+                return "keep"
+        fresh = await self._fresh_raw_lists(connector, pair, None)
+        missing_after = lists_state(fresh)
+        if missing_after is None:
+            return "keep"
+        for text in missing_after:
+            if text not in archive:
+                return "keep"
+        net = Decimal("0")
+        for text in sorted(ids):
+            side = self._resume_own_side(checkpoint, text)
+            if side not in ("buy", "sell"):
+                return "keep"
+            finished = self._finished_row(text, fresh)
+            size = self._resume_fill_size(finished) if finished is not None else archive.get(text)
+            if size is None:
+                return "keep"
+            net += size if side == "buy" else -size
+        if net != 0:
+            return None
+        return "seat"
+
+    async def _write_resume_close(self, executor_id: str) -> bool:
+        """Запись конца в базу. stop() и статус в памяти не ставим."""
+        if not self.db_manager:
+            return False
+        from database.repositories.executor_repository import ExecutorRepository
+        try:
+            async with self.db_manager.get_session_context() as session:
+                written = await ExecutorRepository(session).update_executor(
+                    executor_id, status="TERMINATED", close_type="EARLY_STOP",
+                )
+                if written is None:
+                    return False
+        except Exception:
+            logger.exception("resume close was not written for %s", executor_id)
+            return False
+        return True
+
     async def _resume_one(self, row: Dict[str, Any], owned_by: Optional[Dict[str, str]] = None) -> Optional[str]:
         """None on success. A string is why this row was left for cleanup."""
         checkpoint = parse_checkpoint_cached(row.get("checkpoint"))
+        gate = await self._marked_resume_gate(row)
+        if gate == "seat":
+            if not await self._write_resume_close(str(row.get("executor_id") or "")):
+                self.__dict__.setdefault("_kept_ids", set()).add(row["executor_id"])
+                return "marked close was not written"
+            return "seated marked close"
+        if gate == "keep":
+            self.__dict__.setdefault("_kept_ids", set()).add(row["executor_id"])
+            return "marked number unproven"
         # Подъём до start: метка из колонки прогревает RAM (план stop-freeze п.1).
         if stop_mark_visible(checkpoint):
             self.__dict__.setdefault("_stop_mark_ram", {})[str(row["executor_id"])] = True
@@ -5438,7 +6356,7 @@ class ExecutorService:
             ]
             views = [live_order_view(order) for order in live_orders]
             if checkpoint and row["executor_type"] == "grid_executor":
-                checkpoint = merge_recent_ids(checkpoint, recent_order_ids(row["executor_id"]))
+                checkpoint = merge_recent_ids(checkpoint, recent_ids_kept_as_open(row["executor_id"]))
             reason = can_resume(checkpoint, views)
             if reason:
                 self.__dict__.setdefault("_kept_ids", set()).add(row["executor_id"])
@@ -5534,6 +6452,12 @@ class ExecutorService:
                     )
                     kept_bans = set(getattr(executor, "_close_ban_ids", set()) or set())
                 apply_checkpoint(executor, checkpoint, live_orders)
+                executor._notebook_resumed = True
+                seat_role_close_before_next(executor, row["executor_id"])
+                if not seat_recorded_level_opens(executor, row["executor_id"]):
+                    hold_new_opens(executor)
+                    self.__dict__.setdefault("_kept_ids", set()).add(row["executor_id"])
+                    return "level journal was not read"
                 seed_accounted_orders(executor, accounted, connector)
                 self._copy_column_closes_into_holds(executor, checkpoint)
                 executor._close_seat_ready = False
@@ -6039,6 +6963,52 @@ class ExecutorService:
             return False
         return self._finished_row(text, fresh) is None
 
+    def _shutdown_missing_market_closes(self, executor_id: str, fresh: Optional[Dict[str, Any]]) -> List[str]:
+        """Записанные продажи гашения, которых нет в тик-книге. Их исполнение ищет архив."""
+        found: List[str] = []
+        for text in self._shutdown_close_ids(executor_id) or []:
+            if self._exchange_gone_end(executor_id, text):
+                continue
+            if self._shutdown_sell_missing(text, fresh) and text not in found:
+                found.append(text)
+        return found
+
+    def _archive_sold_base(self, executor_id: str, order_id: str) -> Optional[Decimal]:
+        """База продажи гашения из архива, в монетах. Нет доказательства — None, не ноль."""
+        if (self.__dict__.get("_retained_archive_status") or {}).get(executor_id) != "read":
+            return None
+        cached = (self.__dict__.get("_retained_archive_rows") or {}).get(executor_id)
+        if not isinstance(cached, list):
+            return None
+        text = str(order_id or "")
+        for row in cached:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("clOrdId") or row.get("text") or row.get("order_id") or "")
+            if name != text:
+                continue
+            if str(row.get("state") or "") != "filled":
+                return None
+            size = partial_decimal(row.get("coin_fill_size"))
+            if size is None or size <= 0:
+                return None
+            return size
+        return None
+
+    def _shutdown_sell_settled(self, executor_id: str, executor: Any) -> bool:
+        """True только когда каждый записанный market_close доказанно не ушёл
+
+        (order_is_unsent) либо записанных нет. Исполнение, концы и
+        непрочитанное отпуск не дают: штатную постановку не пускаем.
+        """
+        ids = self._shutdown_close_ids(executor_id)
+        if ids is None:
+            return False
+        for text in ids:
+            if not order_is_unsent(text):
+                return False
+        return True
+
     def _shutdown_remainder(self, executor_id: str, fresh: Optional[Dict[str, Any]]) -> Optional[Decimal]:
         """Остаток сетки по своим номерам. Не доказан — None, продажу не слать."""
         rows = self._partial_rows()
@@ -6074,6 +7044,10 @@ class ExecutorService:
                 else:
                     return None
             if sell and role == "market_close" and self._shutdown_sell_missing(name, fresh):
+                archived = self._archive_sold_base(executor_id, name)
+                if archived is None:
+                    return None
+                sold += archived
                 continue
             if sell and not self._proven_dead(name, fresh):
                 return None
@@ -6277,6 +7251,9 @@ class ExecutorService:
             text for text in self._retained_ids(executor_id)
             if self._exchange_gone_end(executor_id, text)
         ]
+        for text in self._shutdown_missing_market_closes(executor_id, self._tick_fresh(pair or "")):
+            if text not in need:
+                need.append(text)
         if not need:
             bag[executor_id] = None
             return
@@ -6331,6 +7308,10 @@ class ExecutorService:
                         return
                     if created < int(window["begin"]) or created > int(window["end"]):
                         continue
+                    size = partial_decimal(raw.get("accFillSz"))
+                    base = self._contract_base(connector, pair, size) if size is not None and size > 0 else None
+                    if base is not None:
+                        raw["coin_fill_size"] = str(base)
                     rows.append(raw)
                 if len(data) < OPEN_PAGE_LIMIT:
                     finish("read", rows)
@@ -6340,8 +7321,8 @@ class ExecutorService:
                     finish("unread:no-cursor")
                     return
                 after = str(cursor)
-        except Exception:
-            finish("unread:exception")
+        except Exception as exc:
+            finish("unread:exception:" + type(exc).__name__)
             return
         finish("unread:page-cap")
 
@@ -6499,10 +7480,537 @@ class ExecutorService:
 
         return await self._partial_cas(executor_id, mutate, visible)
 
+    def _clear_pair_position(self, pair: str) -> None:
+        (self.__dict__.get("_pair_position_body") or {}).pop(pair, None)
+
+    def _position_body_flat(self, body: Any, symbol: str) -> Optional[bool]:
+        """Плоско только по телу этой пары. Пустой кэш и чужая пара — не плоско."""
+        if not isinstance(body, dict) or str(body.get("code")) != "0" or not isinstance(body.get("data"), list):
+            return None
+        wanted = str(symbol or "")
+        if not wanted:
+            return None
+        saw_own = False
+        saw_foreign = False
+        for row in body["data"]:
+            if not isinstance(row, dict):
+                return None
+            inst = str(row.get("instId") or "")
+            if inst and inst != wanted:
+                saw_foreign = True
+                continue
+            if "pos" not in row:
+                return None
+            try:
+                size = Decimal(str(row.get("pos")))
+            except Exception:
+                return None
+            saw_own = True
+            if size != 0:
+                return False
+        if saw_foreign and not saw_own:
+            return None
+        return True
+
+    def _executor_position_flat(self, executor: Any) -> Optional[bool]:
+        """Тело этого тика на исполнителе. Общий слот пары чужой тик стирает."""
+        slot = getattr(executor, "_flat_position_tick", None)
+        if not isinstance(slot, dict) or slot.get("body") is None:
+            return None
+        return self._position_body_flat(slot.get("body"), str(slot.get("symbol") or ""))
+
+    def _stored_position_flat(self, pair: str) -> Optional[bool]:
+        slot = (self.__dict__.get("_pair_position_body") or {}).get(pair)
+        if not isinstance(slot, dict) or slot.get("body") is None:
+            return None
+        return self._position_body_flat(slot.get("body"), str(slot.get("symbol") or ""))
+
+    async def _reread_executor_position(self, executor: Any) -> Optional[bool]:
+        """Свежее тело этой сетки. Пустой ответ — не плоско."""
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        if connector is None or not hasattr(connector, "_api_get"):
+            return self._executor_position_flat(executor)
+        symbol = ""
+        body = None
+        try:
+            if pair:
+                symbol = await self._gate_symbol(connector, pair) or ""
+            if symbol:
+                body = await connector._api_get(
+                    path_url="/api/v5/account/positions",
+                    params={"instId": symbol},
+                    is_auth_required=True,
+                    limit_id=self._open_limit_id(connector, "okx"),
+                )
+        except Exception:
+            body = None
+        executor._flat_position_tick = {
+            "symbol": symbol,
+            "body": body if isinstance(body, dict) else None,
+        }
+        return self._executor_position_flat(executor)
+
+    async def _read_pair_position_body(self, connector: Any, pair: str) -> None:
+        """Тело позиций одной пары. `_update_positions` не зовём и кэш коннектора не читаем."""
+        symbol = ""
+        body = None
+        try:
+            if connector is not None and pair:
+                symbol = await self._gate_symbol(connector, pair) or ""
+            if symbol and connector is not None:
+                body = await connector._api_get(
+                    path_url="/api/v5/account/positions",
+                    params={"instId": symbol},
+                    is_auth_required=True,
+                    limit_id=self._open_limit_id(connector, "okx"),
+                )
+        except Exception:
+            body = None
+        self.__dict__.setdefault("_pair_position_body", {})[pair] = {
+            "symbol": symbol,
+            "body": body if isinstance(body, dict) else None,
+        }
+
+    async def _flat_close_live_blocks(self, executor_id: str, executor: Any) -> bool:
+        """Живой номер или неизвестная отправка — строку раннего стопа не пишем.
+
+        Открытые берём новым чтением, не снимком начала тика.
+        """
+        if order_miss_unreadable():
+            return True
+        if not self._executor_proofs_released(executor_id):
+            return True
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        fresh = None
+        if connector is not None and pair:
+            try:
+                fresh = await self._fresh_raw_lists(connector, pair, None)
+            except Exception:
+                fresh = None
+        if not self._lists_ready(fresh):
+            return True
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        inflight = getattr(connector, "in_flight_orders", None)
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None)
+        if not isinstance(inflight, dict) or not isinstance(lost, dict):
+            return True
+        column_ids = self._column_ids_for_executor(executor_id)
+        if column_ids is None:
+            return True
+        try:
+            from utils.executor_checkpoint import read_ledger_filtered
+            rows = read_ledger_filtered()
+        except Exception:
+            return True
+        ids = {
+            str(row.get("order_id"))
+            for row in rows or []
+            if row.get("executor_id") == executor_id and row.get("order_id")
+        }
+        ids.update(column_ids)
+        ids.update(self._close_hold_ids_for(executor_id, executor))
+        for text in ids:
+            if order_send_unknown(text) or text in inflight or text in lost:
+                return True
+            if self._shutdown_text_present((fresh or {}).get("opens"), text):
+                return True
+        return False
+
+    async def _commit_flat_early_stop(self, executor_id: str, executor: Any) -> bool:
+        """Ранний стоп в базе и перечитка. Цикл гасим только после неё. Флаг не ставим."""
+        if await self._reread_executor_position(executor) is not True:
+            return False
+        if not self._stop_mark_now(executor_id) or await self._flat_close_live_blocks(executor_id, executor):
+            return False
+        if await self._reread_executor_position(executor) is not True:
+            return False
+        if not self.db_manager:
+            return False
+        from database.repositories.executor_repository import ExecutorRepository
+        try:
+            async with self.db_manager.get_session_context() as session:
+                repo = ExecutorRepository(session)
+                current = await repo.get_executor_by_id(executor_id)
+                if current is not None and str(getattr(current, "close_type", None) or "") == "FAILED":
+                    return False
+                if current is not None and str(getattr(current, "status", None) or "") != "RUNNING":
+                    if str(getattr(current, "close_type", None) or "") != "EARLY_STOP":
+                        return False
+                written = await repo.update_executor(
+                    executor_id, status="TERMINATED", close_type="EARLY_STOP",
+                )
+                if written is None:
+                    return False
+                if await self._flat_close_live_blocks(executor_id, executor):
+                    written.status = "RUNNING"
+                    written.close_type = ""
+                    reverted = True
+                else:
+                    reverted = False
+            async with self.db_manager.get_session_context() as session:
+                seen = await ExecutorRepository(session).get_executor_by_id(executor_id)
+        except Exception:
+            return False
+        if seen is None:
+            return False
+        status = str(getattr(seen, "status", None) or "")
+        close_type = str(getattr(seen, "close_type", None) or "")
+        if reverted and status != "RUNNING":
+            await self._restore_running_after_flat(executor_id)
+            return False
+        if reverted:
+            return False
+        if status == "RUNNING" or close_type != "EARLY_STOP" or close_type == "FAILED":
+            return False
+        if await self._reread_executor_position(executor) is not True:
+            await self._restore_running_after_flat(executor_id)
+            return False
+        if await self._flat_checkpoint_number_live(executor_id, executor):
+            await self._restore_running_after_flat(executor_id)
+            return False
+        self.__dict__.setdefault("_flat_stopped", set()).add(executor_id)
+        self._leave_loop_after_flat_row(executor)
+        return True
+
+    async def _restore_running_after_flat(self, executor_id: str) -> bool:
+        """Номер ожил, пока запись шла: вернуть строку в работу и перечитать."""
+        from database.repositories.executor_repository import ExecutorRepository
+        try:
+            async with self.db_manager.get_session_context() as session:
+                written = await ExecutorRepository(session).update_executor(
+                    executor_id, status="RUNNING", close_type="",
+                )
+                if written is None:
+                    return False
+            async with self.db_manager.get_session_context() as session:
+                seen = await ExecutorRepository(session).get_executor_by_id(executor_id)
+        except Exception:
+            return False
+        if seen is None:
+            return False
+        status = str(getattr(seen, "status", None) or "")
+        close_type = str(getattr(seen, "close_type", None) or "")
+        return status == "RUNNING" and close_type != "FAILED"
+
+    async def _early_stop_body_not_flat(self, row: Dict[str, Any]) -> bool:
+        """Неплоское или непрочитанное тело — повод поднять хозяина."""
+        connector = None
+        try:
+            interface = self._get_trading_interface(row.get("account_name") or "")
+            if interface is not None:
+                connector = interface.get_connector(row.get("connector_name") or "")
+        except Exception:
+            return True
+        if connector is None or not hasattr(connector, "_api_get"):
+            return True
+        holder = SimpleNamespace(
+            config=SimpleNamespace(
+                trading_pair=row.get("trading_pair") or "",
+                connector_name=row.get("connector_name") or "",
+            ),
+            connectors={row.get("connector_name") or "": connector},
+        )
+        flat = await self._reread_executor_position(holder)
+        return flat is not True
+
+    async def _restore_early_stop_if_needed(self, executor_id: str) -> bool:
+        """Пока строка ранний стоп, а тело уже не плоско — снова писать работу."""
+        if not self.db_manager:
+            return False
+        from database.repositories.executor_repository import ExecutorRepository
+        try:
+            async with self.db_manager.get_session_context() as session:
+                current = await ExecutorRepository(session).get_executor_by_id(executor_id)
+        except Exception:
+            return False
+        if current is None or str(getattr(current, "close_type", None) or "") != "EARLY_STOP":
+            return False
+        return await self._restore_running_after_flat(executor_id)
+
+    async def _restart_flat_owner_if_needed(self, executor_id: str, executor: Any) -> None:
+        """Спящий цикл уже вышел, номер жив: start() при метке стопа."""
+        if self._executor_loop_running(executor) or not self._stop_mark_now(executor_id):
+            return
+        terminated = getattr(executor, "terminated", None)
+        if terminated is None or not terminated.is_set():
+            return
+        if not await self._flat_stop_needs_owner(executor_id, executor):
+            return
+        await self._restore_running_after_flat(executor_id)
+        from hummingbot.strategy_v2.executors.executor_base import RunnableStatus
+        executor._status = RunnableStatus.NOT_STARTED
+        if "is_closed" in getattr(executor, "__dict__", {}):
+            executor.is_closed = False
+        start = getattr(executor, "start", None)
+        if callable(start):
+            start()
+
+    async def _early_stop_number_seen_live(self, row: Dict[str, Any], ids: set) -> bool:
+        """Непрочитанные открытые и неготовый finished — как живой номер."""
+        if order_miss_unreadable():
+            return True
+        connector = None
+        try:
+            interface = self._get_trading_interface(row.get("account_name") or "")
+            if interface is not None:
+                connector = interface.get_connector(row.get("connector_name") or "")
+        except Exception:
+            connector = None
+        if connector is None:
+            return True
+        inflight = getattr(connector, "in_flight_orders", None)
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None)
+        if not isinstance(inflight, dict) or not isinstance(lost, dict):
+            return True
+        for text in ids:
+            if order_send_unknown(text) or text in inflight or text in lost:
+                return True
+        pair = row.get("trading_pair") or ""
+        if not pair:
+            return True
+        try:
+            fresh = await self._fresh_raw_lists(connector, pair, None)
+        except Exception:
+            return True
+        if not isinstance(fresh, dict):
+            return True
+        opens_read = bool(fresh.get("opens_read") and fresh.get("opens_done"))
+        if opens_read and any(
+            self._shutdown_text_present(fresh.get("opens"), text) for text in ids
+        ):
+            return True
+        if not self._lists_ready(fresh):
+            return True
+        return False
+
+    async def _reclaim_early_stop_with_a_live_number(self) -> None:
+        """Обрыв после раннего стопа: живой номер возвращает строку в работу."""
+        if not self.db_manager:
+            return
+        from database.repositories.executor_repository import ExecutorRepository
+        from utils.executor_checkpoint import saved_order_ids, parse_checkpoint
+        try:
+            async with self.db_manager.get_session_context() as session:
+                rows = await ExecutorRepository(session).get_early_stop_rows()
+        except Exception:
+            return
+        for row in rows:
+            executor_id = str(row.get("executor_id") or "")
+            if not executor_id or str(row.get("close_type") or "") == "FAILED":
+                continue
+            parsed = parse_checkpoint(row.get("checkpoint"))
+            ids = set(saved_order_ids(parsed))
+            for hold in (parsed or {}).get("holds") or []:
+                if isinstance(hold, dict) and hold.get("order_id"):
+                    ids.add(str(hold["order_id"]))
+            ids.update(self._ids_of((parsed or {}).get("close_holds")))
+            journal_failed = False
+            try:
+                from utils.executor_checkpoint import read_ledger_filtered
+                ids.update(
+                    str(item.get("order_id"))
+                    for item in read_ledger_filtered() or []
+                    if item.get("executor_id") == executor_id and item.get("order_id")
+                )
+            except Exception:
+                journal_failed = True
+            body_not_flat = await self._early_stop_body_not_flat(row)
+            if journal_failed or body_not_flat or await self._early_stop_number_seen_live(row, ids):
+                restored = False
+                for _ in range(5):
+                    try:
+                        restored = await self._restore_running_after_flat(executor_id)
+                    except Exception:
+                        restored = False
+                    if restored:
+                        break
+                if not restored:
+                    self.__dict__.setdefault("_flat_restore_pending", set()).add(executor_id)
+                if executor_id not in self._active_executors:
+                    self.__dict__.setdefault("_stop_mark_ram", {})[executor_id] = True
+                    await self._resume_one(row)
+
+    def _bind_executor_loop_task(self, executor: Any) -> None:
+        """Запомнить task цикла. Sleep потом прячет кадр, task остаётся."""
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if current is not None and not current.done():
+            executor._flat_loop_task = current
+            return
+        try:
+            tasks = asyncio.all_tasks()
+        except RuntimeError:
+            return
+        for task in tasks:
+            if task.done():
+                continue
+            if self._task_is_executor_loop(task, executor):
+                executor._flat_loop_task = task
+                return
+
+    def _close_hold_ids_for(self, executor_id: str, executor: Any = None) -> set:
+        """Номера close_holds: журнал их уже мог вычистить, открытые — нет."""
+        from utils.executor_checkpoint import parse_checkpoint
+        found = set()
+        for row in getattr(self, "_hold_rows", None) or []:
+            key = str(row.get("executor_id") or row.get("row_executor_id") or "")
+            if key != str(executor_id):
+                continue
+            parsed = parse_checkpoint(row.get("checkpoint"))
+            found.update(self._ids_of((parsed or {}).get("close_holds")))
+        target = executor if executor is not None else self._active_executors.get(executor_id)
+        found.update(self._ids_of(getattr(target, "_close_holds", []) or []))
+        return found
+
+    def _checkpoint_ids_for_flat_stop(self, executor_id: str) -> set:
+        """Номера из строки, даже если sweep спрятал executor_id у TERMINATED."""
+        from utils.executor_checkpoint import parse_checkpoint, saved_order_ids
+        found = set()
+        rows = getattr(self, "_hold_rows", None) or []
+        for row in rows:
+            key = str(row.get("executor_id") or row.get("row_executor_id") or "")
+            if key != str(executor_id):
+                continue
+            parsed = parse_checkpoint(row.get("checkpoint"))
+            found.update(str(item) for item in saved_order_ids(parsed))
+            for hold in (parsed or {}).get("holds") or []:
+                if isinstance(hold, dict) and hold.get("order_id"):
+                    found.add(str(hold["order_id"]))
+            found.update(self._ids_of((parsed or {}).get("close_holds")))
+        found.update(self._close_hold_ids_for(executor_id))
+        column = self._column_ids_for_executor(executor_id)
+        if column:
+            found.update(str(item) for item in column)
+        return found
+
+    async def _flat_checkpoint_number_live(self, executor_id: str, executor: Any) -> bool:
+        """Живой номер из чекпоинта, не из ряда, который sweep уже спрятал."""
+        if order_miss_unreadable():
+            return True
+        ids = self._checkpoint_ids_for_flat_stop(executor_id)
+        if not ids:
+            return True
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        inflight = getattr(connector, "in_flight_orders", None)
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None)
+        if not isinstance(inflight, dict) or not isinstance(lost, dict):
+            return True
+        for text in ids:
+            if order_send_unknown(text) or text in inflight or text in lost:
+                return True
+        fresh = None
+        if connector is not None and pair:
+            try:
+                fresh = await self._fresh_raw_lists(connector, pair, None)
+            except Exception:
+                return True
+        if not isinstance(fresh, dict) or not (fresh.get("opens_read") and fresh.get("opens_done")):
+            return True
+        return any(self._shutdown_text_present(fresh.get("opens"), text) for text in ids)
+
+    async def _flat_stop_needs_owner(self, executor_id: str, executor: Any) -> bool:
+        """Живой номер или неплоское тело — исполнителя не снимать.
+
+        Последний await — свежие открытые, не тело: пока тело читалось, номер мог ожить.
+        """
+        if executor_id not in (self.__dict__.get("_flat_stopped") or set()):
+            return False
+        await self._reread_executor_position(executor)
+        if await self._flat_close_live_blocks(executor_id, executor):
+            return True
+        return self._executor_position_flat(executor) is not True
+
+    async def _flat_stop_still_live(self, executor_id: str, executor: Any) -> bool:
+        """После раннего стопа номер ожил — исполнителя не вынимать."""
+        if executor_id not in (self.__dict__.get("_flat_stopped") or set()):
+            return False
+        return await self._flat_close_live_blocks(executor_id, executor)
+
+    def _executor_loop_running(self, executor: Any) -> bool:
+        """Цикл жив, пока его task не done. Пустой cr_frame у sleep — не смерть."""
+        bound = getattr(executor, "_flat_loop_task", None)
+        if bound is not None and not bound.done():
+            return True
+        try:
+            tasks = asyncio.all_tasks()
+        except RuntimeError:
+            return False
+        for task in tasks:
+            if task.done():
+                continue
+            if self._task_is_executor_loop(task, executor):
+                executor._flat_loop_task = task
+                return True
+        return False
+
+    def _task_is_executor_loop(self, task: Any, executor: Any) -> bool:
+        coro = task.get_coro()
+        seen = set()
+        while coro is not None and id(coro) not in seen:
+            seen.add(id(coro))
+            code = getattr(coro, "cr_code", None)
+            if getattr(code, "co_name", "") == "control_loop":
+                frame = getattr(coro, "cr_frame", None)
+                if frame is not None and frame.f_locals.get("self") is executor:
+                    return True
+                if frame is None and getattr(executor, "_flat_loop_task", None) is task:
+                    return True
+            awaited = getattr(coro, "cr_await", None)
+            coro = awaited if hasattr(awaited, "cr_code") else None
+        return False
+
+    def _reopen_closed_executor(self, executor: Any, executor_id: str = "") -> None:
+        """is_closed снимаем статусом RUNNING. terminated не трогаем: спящий цикл выходит.
+
+        Если цикл уже вышел, start() только при метке стопа: она держит постановку и снятие.
+        """
+        from hummingbot.strategy_v2.executors.executor_base import RunnableStatus
+        executor._status = RunnableStatus.RUNNING
+        if "is_closed" in getattr(executor, "__dict__", {}):
+            executor.is_closed = False
+        if self._executor_loop_running(executor):
+            return
+        terminated = getattr(executor, "terminated", None)
+        if (
+            executor_id
+            and terminated is not None
+            and terminated.is_set()
+            and self._stop_mark_now(executor_id)
+        ):
+            executor._status = RunnableStatus.NOT_STARTED
+            start = getattr(executor, "start", None)
+            if callable(start):
+                start()
+
+    def _leave_loop_after_flat_row(self, executor: Any) -> None:
+        """Выход из цикла после перечитки. early_stop и обёрнутый stop не зовём."""
+        from hummingbot.strategy_v2.runnable_base import RunnableBase
+        executor_id = str(getattr(getattr(executor, "config", None), "id", "") or "")
+        if executor_id and self._own_unproven_sends(executor_id):
+            return
+        strategy = getattr(executor, "_strategy", None)
+        executor.close_timestamp = getattr(strategy, "current_timestamp", 0)
+        self._bind_executor_loop_task(executor)
+        RunnableBase.stop(executor)
+        unregister = getattr(executor, "unregister_events", None)
+        if callable(unregister):
+            unregister()
+
     async def _send_shutdown_close(
         self, executor_id: str, executor: Any, connector: Any, pair: str, fresh: Optional[Dict[str, Any]],
     ) -> None:
         """Одна продажа доказанного остатка. Запись не прошла — продажу не звать."""
+        if self._stop_mark_now(executor_id):
+            return
         if connector is None or self._partial_rows() is None or not self._lists_ready(fresh):
             return
         remainder = self._shutdown_remainder(executor_id, fresh)
@@ -6922,6 +8430,12 @@ class ExecutorService:
             )
         self.__dict__.setdefault("_stop_keep_position", {})[str(executor_id)] = bool(keep_position)
 
+        # Свой номер без ответа сажается в пустой слот до штатной отмены.
+        # Чужой id не вытесняем. stop() сами не зовём.
+        self._seat_unanswered_before_close(executor_id, executor)
+        refresh = getattr(executor, "update_grid_levels", None)
+        if callable(refresh):
+            refresh()
         # Trigger early stop
         try:
             executor.early_stop(keep_position=keep_position)
@@ -7068,6 +8582,115 @@ class ExecutorService:
         logger.info(f"Orphaned position for executor {executor_id} marked resolved")
         return {"executor_id": executor_id, "orphan_resolved": True}
 
+    def _phantom_close_ids(self, executor_id: str, executor: Any) -> set:
+        """Номер продажи, которого нет в прочитанных открытых и нет в полёте."""
+        pair = str(getattr(getattr(executor, "config", None), "trading_pair", None) or "")
+        fresh = self._tick_fresh(pair) if pair else None
+        if not isinstance(fresh, dict) or not fresh.get("opens_read") or not fresh.get("opens_done"):
+            return set()
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        if connector is None:
+            return set()
+        open_ids = set()
+        for row in fresh.get("opens") or []:
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("text") or row.get("order_id") or "")
+            if text:
+                open_ids.add(text)
+        inflight = getattr(connector, "in_flight_orders", None) or {}
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
+        flying = {str(item) for item in inflight} | {str(item) for item in lost}
+        close_ids = set()
+        for level in getattr(executor, "grid_levels", None) or []:
+            text = str(getattr(getattr(level, "active_close_order", None), "order_id", "") or "")
+            if text:
+                close_ids.add(text)
+        parsed = self._partial_parsed(executor_id) or {}
+        for level in parsed.get("levels") or []:
+            if not isinstance(level, dict):
+                continue
+            text = str((level.get("close_order") or {}).get("order_id") or "")
+            if text:
+                close_ids.add(text)
+        return {text for text in close_ids if text not in open_ids and text not in flying}
+
+    def _drop_phantom_close_liquidity(self, executor_id: str, executor: Any) -> None:
+        """Ложная стоящая продажа не держит штатное гашение. Слот не стираем."""
+        phantoms = self._phantom_close_ids(executor_id, executor)
+        if not phantoms:
+            return
+        kept = Decimal("0")
+        for level in getattr(executor, "grid_levels", None) or []:
+            tracked = getattr(level, "active_close_order", None)
+            text = str(getattr(tracked, "order_id", "") or "")
+            if not text or text in phantoms:
+                continue
+            try:
+                executed = Decimal(str(getattr(tracked, "executed_amount_base", 0) or 0))
+                quote = Decimal(str(getattr(level, "amount_quote", 0) or 0))
+            except Exception:
+                return
+            if executed == Decimal("0"):
+                kept += quote
+        executor.close_liquidity_placed = kept
+
+    def _unproven_delivery_ids(self, executor_id: str, executor: Any) -> list:
+        """Номера уже существующей доставки отмен, которые ещё не доказаны мёртвыми."""
+        pair = str(getattr(getattr(executor, "config", None), "trading_pair", None) or "")
+        fresh = self._tick_fresh(pair) if pair else None
+        phantoms = self._phantom_close_ids(executor_id, executor)
+        return [
+            text for text in self._stop_unfinished_ids(executor_id, fresh)
+            if text not in phantoms
+        ]
+
+    async def _feed_shutdown_stock_truth(self, executor_id: str, executor: Any) -> None:
+        """Правда о теле перед штатным гашением. Свой stop() не зовём, слот не пишем."""
+        from utils.executor_checkpoint import (
+            _exchange_close_filled,
+            _known_close_id,
+            marked_stop_ready,
+        )
+        ids = self._shutdown_close_ids(executor_id)
+        if not ids:
+            return
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        if connector is None or not pair:
+            return
+        deaths = await self._archive_death_bases(connector, pair, ids)
+        if not deaths:
+            return
+        if await self._reread_executor_position(executor) is not True:
+            return
+        known = str(_known_close_id(executor, executor_id) or "")
+        coin = deaths.get(known)
+        if not known or coin is None or coin <= 0:
+            return
+        previous = getattr(executor, "_tick_blank_fills", None)
+        if not _exchange_close_filled(executor, known):
+            row = {"text": known, "fill_size": str(coin)}
+            executor._tick_blank_fills = list(previous or []) + [row]
+        if not marked_stop_ready(executor, executor_id):
+            executor._tick_blank_fills = previous
+            return
+        return
+
+    
+    def _live_delivery_reads_zero_liquidity(self, executor_id: str, executor: Any) -> bool:
+        """Живой номер доставки, который штатное гашение прочитало бы как нулевую ликвидность."""
+        if not self._unproven_delivery_ids(executor_id, executor):
+            return False
+        try:
+            open_liq = Decimal(str(getattr(executor, "open_liquidity_placed", 0) or 0))
+            close_liq = Decimal(str(getattr(executor, "close_liquidity_placed", 0) or 0))
+        except Exception:
+            return False
+        return open_liq == 0 and close_liq == 0
+
     def _stop_unfinished_ids(self, executor_id: str, fresh: Optional[Dict[str, Any]] = None) -> list:
         """Наши номера без доказательства «снят или мёртв» (план stop-freeze п.3).
 
@@ -7095,7 +8718,11 @@ class ExecutorService:
         for text in sorted(numbers):
             if partial_end_visible(parsed, text):
                 continue
+            if text in (self.__dict__.get("_cancel_51400_ids") or set()):
+                continue
             if self._proven_dead(text, fresh):
+                continue
+            if self._shown_fill_row(fresh, text, "BUY") is not None or self._shown_fill_row(fresh, text, "SELL") is not None:
                 continue
             out.append(text)
         return out
@@ -7117,7 +8744,13 @@ class ExecutorService:
                 cancel = getattr(strategy, "cancel", None)
                 if cancel is None:
                     return False
-                result = cancel(order_id=text)
+                connector_name = getattr(getattr(executor, "config", None), "connector_name", None) or ""
+                trading_pair = pair or getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+                result = cancel(
+                    connector_name=connector_name,
+                    trading_pair=trading_pair,
+                    order_id=text,
+                )
                 if asyncio.iscoroutine(result):
                     result = await result
                 return result is not None
@@ -7133,9 +8766,10 @@ class ExecutorService:
                 result = await result
             return result is True
         except Exception as exc:
-            if self._exchange_says_gone(exc) and not self._cancel_end_blocked(executor, text, pair):
-                if await self._remember_exchange_gone(executor_id, text, pair):
-                    return True
+            if self._exchange_says_gone(exc):
+                # Ответ «уже исполнено» гасит повтор. Конец заявки до продажи не пишем.
+                self.__dict__.setdefault("_cancel_51400_ids", set()).add(str(text))
+                return True
             if not self._exchange_says_gone(exc):
                 logger.exception("stop cancel delivery failed for %s", text)
             return False
@@ -7387,11 +9021,13 @@ class ExecutorService:
 
     async def _handle_executor_completion(self, executor_id: str):
         """Handle cleanup when an executor completes."""
-        # Atomically claim the executor so a concurrent completion (e.g. the
-        # control loop racing with the synchronous call in create_executor)
-        # returns early instead of double-persisting / double-aggregating.
-        if not self._executor_proofs_released(executor_id):
+        executor = self._active_executors.get(executor_id)
+        if executor is not None and await self._flat_stop_needs_owner(executor_id, executor):
+            await self._restore_running_after_flat(executor_id)
+            self._reopen_closed_executor(executor, executor_id)
             return
+        # После штатного конца не спрашиваем, жив ли номер, и не открываем
+        # исполнителя снова (план stop-finished-not-reopened).
         executor = self._active_executors.pop(executor_id, None)
         if executor is None:
             return
@@ -8952,8 +10588,427 @@ class ExecutorService:
             None,
         )
 
+    def _ids_from_saved_lists(self, parsed: Any) -> Optional[set]:
+        """Номера из записи этой сетки. None — запись не разобрана."""
+        if not isinstance(parsed, dict):
+            return None
+        ids = set()
+        ids.update(self._ids_of(parsed.get("holds")))
+        ids.update(self._ids_of(parsed.get("close_holds")))
+        ids.update(self._ids_of(parsed.get("retained_orders")))
+        for ban in parsed.get("close_bans") or []:
+            if isinstance(ban, dict) and ban.get("order_id"):
+                ids.add(str(ban["order_id"]))
+            elif isinstance(ban, str) and ban:
+                ids.add(ban)
+        for level in parsed.get("levels") or []:
+            if not isinstance(level, dict):
+                continue
+            for key in ("open_order", "close_order"):
+                slot = level.get(key) or {}
+                if isinstance(slot, dict) and slot.get("order_id"):
+                    ids.add(str(slot["order_id"]))
+        top = parsed.get("close_order") or {}
+        if isinstance(top, dict) and top.get("order_id"):
+            ids.add(str(top["order_id"]))
+        return ids
+
+    def _empty_grid_ids(
+        self, executor_id: str, executor: Any, connector: Any, fresh: Any, parsed: Any,
+    ) -> Optional[set]:
+        """Свои номера. None — запись не прочитана, это не пустая сетка."""
+        if order_miss_unreadable():
+            return None
+        rows = self._partial_rows()
+        saved = self._ids_from_saved_lists(parsed)
+        if rows is None or saved is None:
+            return None
+        if not self._lists_ready(fresh):
+            return None
+        inflight = getattr(connector, "in_flight_orders", None)
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None)
+        if not isinstance(inflight, dict) or not isinstance(lost, dict):
+            return None
+        if getattr(executor, "grid_levels", None) is None:
+            return None
+        ids = {
+            str(row.get("order_id"))
+            for row in rows
+            if str(row.get("executor_id") or "") == str(executor_id) and row.get("order_id")
+        }
+        ids.update(saved)
+        ids.update(self._ids_of(getattr(executor, "_close_holds", []) or []))
+        close = getattr(executor, "_close_order", None)
+        close_id = str(getattr(close, "order_id", "") or "")
+        if close_id:
+            ids.add(close_id)
+        for ban in getattr(executor, "_close_ban_ids", None) or []:
+            if ban:
+                ids.add(str(ban))
+        for level in executor.grid_levels or []:
+            for slot in (
+                getattr(level, "active_open_order", None),
+                getattr(level, "active_close_order", None),
+            ):
+                order_id = str(getattr(slot, "order_id", "") or "")
+                if order_id:
+                    ids.add(order_id)
+        if any(order_send_unknown(text) for text in ids):
+            return None
+        return ids
+
+    def _empty_ids_live(self, ids: set, fresh: Any, connector: Any) -> bool:
+        inflight = getattr(connector, "in_flight_orders", None) or {}
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None) or {}
+        for text in ids:
+            if text in inflight or text in lost or self._shutdown_text_present((fresh or {}).get("opens"), text):
+                return True
+        return False
+
+    def _standard_stop_finished(self, executor: Any) -> bool:
+        """Штатный stop() уже поставил закончено. Наша запись статуса этим не является."""
+        closed = getattr(executor, "is_closed", False)
+        return bool(closed() if callable(closed) else closed)
+
+    def _dust_rows_below_step(self, executor: Any, connector: Any, pair: str) -> bool:
+        """Каждая своя строка строго меньше шага. Непрочитанное — не крошка."""
+        slot = getattr(executor, "_flat_position_tick", None)
+        if not isinstance(slot, dict):
+            return False
+        body = slot.get("body")
+        symbol = str(slot.get("symbol") or "")
+        if (
+            not symbol
+            or not isinstance(body, dict)
+            or str(body.get("code")) != "0"
+            or not isinstance(body.get("data"), list)
+        ):
+            return False
+        rules = getattr(connector, "trading_rules", None) or {}
+        rule = rules.get(pair) if isinstance(rules, dict) else None
+        try:
+            step = Decimal(str(getattr(rule, "min_base_amount_increment", None)))
+        except Exception:
+            return False
+        if step <= 0:
+            return False
+        saw_own = False
+        for row in body["data"]:
+            if not isinstance(row, dict):
+                return False
+            inst = str(row.get("instId") or "")
+            if inst and inst != symbol:
+                continue
+            if "pos" not in row:
+                return False
+            try:
+                size = abs(Decimal(str(row.get("pos"))))
+            except Exception:
+                return False
+            saw_own = True
+            if size == 0:
+                continue
+            base = self._contract_base(connector, pair, size)
+            if base is None or base >= step:
+                return False
+        return saw_own
+
+    def _dust_metrics_below_min(self, executor: Any) -> bool:
+        """Размер следующего тика, не сырое поле. Вызов кнопки до ожидания не считается."""
+        refresh = getattr(executor, "update_grid_levels", None)
+        metrics = getattr(executor, "update_position_metrics", None)
+        if not callable(refresh) or not callable(metrics):
+            return False
+        try:
+            refresh()
+            metrics()
+            size = Decimal(str(getattr(executor, "position_size_base", None)))
+            minimum = Decimal(str(getattr(getattr(executor, "trading_rules", None), "min_order_size", None)))
+        except Exception:
+            return False
+        if minimum <= 0:
+            return False
+        return size < minimum
+
+    def _dust_number_blocks(
+        self, executor_id: str, executor: Any, connector: Any, pair: str, parsed: Any,
+    ) -> bool:
+        """Те же свои номера, что у пустой сетки. Нет в трёх списках — ещё не смерть."""
+        fresh = self._pair_book(pair)
+        ids = self._empty_grid_ids(executor_id, executor, connector, fresh, parsed)
+        if ids is None:
+            return True
+        ids = set(ids)
+        ids.update(self._close_hold_ids_for(executor_id, executor))
+        if any(order_send_unknown(text) for text in ids):
+            return True
+        if not self._lists_ready(fresh):
+            return True
+        inflight = getattr(connector, "in_flight_orders", None)
+        lost = getattr(getattr(connector, "_order_tracker", None), "lost_orders", None)
+        if not isinstance(inflight, dict) or not isinstance(lost, dict):
+            return True
+        for text in ids:
+            if (
+                text in inflight
+                or text in lost
+                or self._shutdown_text_present((fresh or {}).get("opens"), text)
+                or not self._proven_dead(text, fresh)
+            ):
+                return True
+        return False
+
+    def _dust_gate(
+        self, executor_id: str, executor: Any, connector: Any, pair: str, parsed: Any,
+    ) -> bool:
+        if self._standard_stop_finished(executor):
+            return False
+        if not self._dust_rows_below_step(executor, connector, pair):
+            return False
+        if not self._dust_metrics_below_min(executor):
+            return False
+        return not self._dust_number_blocks(executor_id, executor, connector, pair, parsed)
+
+    async def _dust_force_running(self, executor_id: str, executor: Any) -> bool:
+        """Снять закрыто, пока новая сессия не прочитала работу. Законченный stop() не открываем."""
+        if self._standard_stop_finished(executor):
+            return False
+        from database.repositories.executor_repository import ExecutorRepository
+        while not self._standard_stop_finished(executor):
+            try:
+                async with self.db_manager.get_session_context() as session:
+                    if self._standard_stop_finished(executor):
+                        raise RuntimeError("stop finished before running write")
+                    written = await ExecutorRepository(session).update_executor(
+                        executor_id, status="RUNNING", close_type="",
+                    )
+                    if self._standard_stop_finished(executor):
+                        if written is not None:
+                            written.status = "TERMINATED"
+                            written.close_type = "EARLY_STOP"
+                        raise RuntimeError("stop finished before running commit")
+                async with self.db_manager.get_session_context() as session:
+                    seen = await ExecutorRepository(session).get_executor_by_id(executor_id)
+            except Exception:
+                if self._standard_stop_finished(executor):
+                    return False
+                continue
+            if seen is not None and str(getattr(seen, "status", None) or "") == "RUNNING":
+                if self._standard_stop_finished(executor):
+                    return False
+                return True
+        return False
+
+    async def _commit_dust_below_step(
+        self, executor_id: str, executor: Any, connector: Any, pair: str, parsed: Any,
+    ) -> bool:
+        """Крошка пишет закрыто только после проверки и до коммита. Номер не чеканит."""
+        if self._standard_stop_finished(executor) or not self.db_manager:
+            return False
+        if not self._dust_gate(executor_id, executor, connector, pair, parsed):
+            return False
+        from database.repositories.executor_repository import ExecutorRepository
+        try:
+            async with self.db_manager.get_session_context() as session:
+                repo = ExecutorRepository(session)
+                current = await repo.get_executor_by_id(executor_id)
+                if current is None or str(getattr(current, "close_type", None) or "") == "FAILED":
+                    return False
+                from utils.executor_checkpoint import parse_checkpoint
+                saved = parse_checkpoint(getattr(current, "checkpoint", None))
+                if not self._dust_gate(executor_id, executor, connector, pair, saved):
+                    return False
+                written = await repo.update_executor(
+                    executor_id, status="TERMINATED", close_type="EARLY_STOP",
+                )
+                again = await repo.get_executor_by_id(executor_id)
+                saved = parse_checkpoint(getattr(again, "checkpoint", None))
+                if written is None or not self._dust_gate(executor_id, executor, connector, pair, saved):
+                    if written is not None and not self._standard_stop_finished(executor):
+                        written.status = "RUNNING"
+                        written.close_type = ""
+                    return False
+        except Exception:
+            if not self._standard_stop_finished(executor):
+                await self._dust_force_running(executor_id, executor)
+            return False
+        try:
+            async with self.db_manager.get_session_context() as session:
+                seen = await ExecutorRepository(session).get_executor_by_id(executor_id)
+        except Exception:
+            seen = None
+        from utils.executor_checkpoint import parse_checkpoint
+        saved = parse_checkpoint(getattr(seen, "checkpoint", None)) if seen is not None else None
+        if (
+            seen is None
+            or str(getattr(seen, "status", None) or "") != "TERMINATED"
+            or str(getattr(seen, "close_type", None) or "") == "FAILED"
+            or not self._dust_gate(executor_id, executor, connector, pair, saved)
+        ):
+            if not self._standard_stop_finished(executor):
+                await self._dust_force_running(executor_id, executor)
+            return False
+        return True
+
+    async def _close_empty_grid_if_proven(self, executor_id: str, executor: Any) -> bool:
+        """Пустая сетка пишет закрыто. Непрочитанное и живой номер — нет. stop() не зовём."""
+        pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+        if not self._stop_mark_now(executor_id):
+            self._log_silent_exit(
+                "empty-grid", pair, "stop mark not seen",
+                executor_id, interval=0.0, label="silent stop exit:", key=executor_id,
+            )
+            return False
+        if not self.db_manager:
+            self._log_silent_exit(
+                "empty-grid", pair, "no database",
+                executor_id, interval=0.0, label="silent stop exit:", key=executor_id,
+            )
+            return False
+        connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
+        connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
+        from database.repositories.executor_repository import ExecutorRepository
+        try:
+            async with self.db_manager.get_session_context() as session:
+                repo = ExecutorRepository(session)
+                current = await repo.get_executor_by_id(executor_id)
+                if current is None or str(getattr(current, "close_type", None) or "") == "FAILED":
+                    self._log_silent_exit(
+                        "empty-grid", pair, "row missing or failed",
+                        executor_id, interval=0.0, label="silent stop exit:", key=executor_id,
+                    )
+                    return False
+                parsed = parse_checkpoint(getattr(current, "checkpoint", None))
+                if await self._reread_executor_position(executor) is not True:
+                    if await self._commit_dust_below_step(executor_id, executor, connector, pair, parsed):
+                        return True
+                    self._log_silent_exit(
+                        "empty-grid", pair, "position not flat",
+                        executor_id, interval=0.0, label="silent stop exit:", key=executor_id,
+                    )
+                    return False
+                book = self._pair_book(pair)
+                if not self._lists_ready(book):
+                    self._log_silent_exit(
+                        "empty-grid", pair, "book not read",
+                        executor_id, interval=0.0, label="silent stop exit:", key=executor_id,
+                    )
+                    return False
+                current = await repo.get_executor_by_id(executor_id)
+                parsed = parse_checkpoint(getattr(current, "checkpoint", None))
+                ids = self._empty_grid_ids(executor_id, executor, connector, book, parsed)
+                if ids is None or ids or self._empty_ids_live(ids or set(), book, connector):
+                    self._log_silent_exit(
+                        "empty-grid", pair, "own number or unread lists",
+                        executor_id, interval=0.0, label="silent stop exit:", key=executor_id,
+                    )
+                    return False
+                written = await repo.update_executor(
+                    executor_id, status="TERMINATED", close_type="EARLY_STOP",
+                )
+                if written is None:
+                    self._log_silent_exit(
+                        "empty-grid", pair, "write did not land",
+                        executor_id, interval=0.0, label="silent stop exit:", key=executor_id,
+                    )
+                    return False
+                again_row = await repo.get_executor_by_id(executor_id)
+                again = self._empty_grid_ids(
+                    executor_id, executor, connector, book,
+                    parse_checkpoint(getattr(again_row, "checkpoint", None)),
+                )
+                if again is None or again or self._empty_ids_live(again, book, connector):
+                    if not self._standard_stop_finished(executor):
+                        written.status = "RUNNING"
+                        written.close_type = ""
+                    if self._standard_stop_finished(executor):
+                        written.status = "TERMINATED"
+                        written.close_type = "EARLY_STOP"
+                    self._log_silent_exit(
+                        "empty-grid", pair, "reread not empty",
+                        executor_id, interval=0.0, label="silent stop exit:", key=executor_id,
+                    )
+                    return False
+        except Exception:
+            self._log_silent_exit(
+                "empty-grid", pair, "read failed",
+                executor_id, interval=0.0, label="silent stop exit:", key=executor_id,
+            )
+            if not self._standard_stop_finished(executor):
+                await self._dust_force_running(executor_id, executor)
+            return False
+        try:
+            async with self.db_manager.get_session_context() as session:
+                seen = await ExecutorRepository(session).get_executor_by_id(executor_id)
+        except Exception:
+            self._log_silent_exit(
+                "empty-grid", pair, "confirm read failed",
+                executor_id, interval=0.0, label="silent stop exit:", key=executor_id,
+            )
+            if not self._standard_stop_finished(executor):
+                await self._dust_force_running(executor_id, executor)
+            return False
+        if seen is None or str(getattr(seen, "status", None) or "") != "TERMINATED":
+            self._log_silent_exit(
+                "empty-grid", pair, "confirm not closed",
+                executor_id, interval=0.0, label="silent stop exit:", key=executor_id,
+            )
+            if not self._standard_stop_finished(executor):
+                await self._dust_force_running(executor_id, executor)
+            return False
+        seen_ids = self._empty_grid_ids(
+            executor_id, executor, connector, self._pair_book(pair),
+            parse_checkpoint(getattr(seen, "checkpoint", None)),
+        )
+        if seen_ids is None or seen_ids or self._empty_ids_live(seen_ids or set(), self._pair_book(pair), connector):
+            if not self._standard_stop_finished(executor):
+                await self._dust_force_running(executor_id, executor)
+            return False
+        if str(getattr(seen, "close_type", None) or "") == "FAILED":
+            self._log_silent_exit(
+                "empty-grid", pair, "confirm failed",
+                executor_id, interval=0.0, label="silent stop exit:", key=executor_id,
+            )
+            return False
+        return True
+
+    def _own_unproven_sends(self, executor_id: str) -> list:
+        """Свои отметки отправки без доказательства смерти. Чужой текст не здесь."""
+        rows = self._partial_rows()
+        if not rows:
+            return []
+        found = []
+        for row in rows:
+            if str(row.get("executor_id") or "") != str(executor_id):
+                continue
+            order_id = str(row.get("order_id") or "")
+            if not order_id or order_id in found or not partial_send_marked(rows, order_id):
+                continue
+            if self._proven_dead(order_id, self._tick_fresh(
+                str(row.get("trading_pair") or "")
+            )):
+                continue
+            found.append(order_id)
+        return found
+
+    def _seat_unanswered_before_close(self, executor_id: str, executor: Any) -> None:
+        """Пустой слот получает свой id. Занятый другим id не заменяем."""
+        rows = self._partial_rows() or []
+        for order_id in self._own_unproven_sends(executor_id):
+            level_id = self._own_level_id(executor_id, order_id)
+            if not level_id or self._slot_has_other(executor, level_id, False, order_id):
+                continue
+            if order_id in self._seated_ids(executor):
+                continue
+            self._seat_not_filled(executor, level_id, order_id, False)
+
     def _seat_not_filled(self, executor: Any, level_id: str, order_id: str, close: bool) -> None:
         from hummingbot.strategy_v2.models.executors import TrackedOrder
+        if not close:
+            pair = getattr(getattr(executor, "config", None), "trading_pair", None) or ""
+            side = getattr(getattr(getattr(executor, "config", None), "side", None), "name", "")
+            if side in ("BUY", "SELL") and self._shown_fill_row(self._tick_fresh(pair), order_id, side) is not None:
+                return
         for level in list(getattr(executor, "grid_levels", None) or []):
             if str(getattr(level, "id", "") or "") != str(level_id):
                 continue
@@ -9068,6 +11123,18 @@ class ExecutorService:
                     and service._shutdown_close_proven(executor_id)
                 ):
                     return None
+                if (
+                    name == "evaluate_max_retries"
+                    and service._stop_mark_now(executor_id)
+                    and service._executor_position_flat(executor) is True
+                ):
+                    return None
+                if (
+                    name == "evaluate_max_retries"
+                    and service._stop_mark_now(executor_id)
+                    and recorded_close_holds_retry(executor, executor_id)
+                ):
+                    return None
                 if service._stop_mark_now(executor_id):
                     return original(*args, **kwargs)
                 parsed = service._partial_parsed(executor_id)
@@ -9120,6 +11187,9 @@ class ExecutorService:
                 frozen = await service._refresh_stop_mark(executor_id)
                 # Доставка — только от ОПУБЛИКОВАННОЙ метки (п.1): «непрочитано»
                 # держит отправку, но не запускает отмены без заморозки.
+                fresh_now = service._tick_fresh(pair or "")
+                await service._note_shown_buys(executor_id, fresh_now)
+                service._seat_shown_buys(executor_id, executor, fresh_now)
                 if service._stop_mark_now(executor_id) and connector is not None:
                     # Доставка отмен не за готовностью списков и не за судьбой
                     # номеров (план stop-freeze п.3).
@@ -9127,30 +11197,21 @@ class ExecutorService:
                     await service._refresh_retained_archive(
                         executor_id, executor, connector, pair or "",
                     )
-                    # Продажа остатка берёт книгу пары, не общий номер шага:
-                    # с сетками одной пары `_tick_fresh` голодает и продажа не
-                    # уходила никогда (план stop-sell-pair-book).
-                    fresh_now = service._pair_book(pair or "")
-                    if service._lists_ready(fresh_now):
-                        # Копия: архив старых номеров и монеты вместо контрактов.
-                        # В слот пары не пишется — цена из архива никого не занимает.
-                        book = await service._shutdown_remainder_book(
-                            executor_id, connector, pair or "", fresh_now,
-                        )
-                        if book is not None and service._lists_ready(book):
-                            await service._send_shutdown_close(
-                                executor_id, executor, connector, pair or "", book,
-                            )
-                            executor._shutdown_close_proven = service._shutdown_close_proven(
-                                executor_id, book,
-                            )
-                        else:
-                            executor._shutdown_close_proven = False
-                        if executor._shutdown_close_proven:
-                            service._maybe_enter_shutdown(executor_id, executor)
+                    # Конец, возврат в работу и продажа остатка — не решения
+                    # обёртки шага (план stop-wrapper-three-calls).
                 fresh = service._tick_fresh(pair or "")
-                if not service._lists_ready(fresh):
-                    if service._partial_forbids(executor_id):
+                executor._tick_opens = list((fresh or {}).get("opens") or [])
+                executor._tick_finished = list((fresh or {}).get("finished") or [])
+                executor._tick_blank_fills = list((fresh or {}).get("finished_blank_px") or [])
+                if service._stop_mark_now(executor_id) and (
+                    not service._lists_ready(fresh) or service._partial_rows() is None
+                ):
+                    return await original_task(*args, **kwargs)
+                if service._restart_seat_due(executor_id, executor):
+                    if not service._finish_restart_seat(executor_id, executor, fresh):
+                        return None
+                elif not service._lists_ready(fresh):
+                    if service._partial_forbids(executor_id) and not service._stop_mark_now(executor_id):
                         service._partial_keep_running(executor)
                         service._log_silent_exit(
                             "task-partial-forbids", pair or "",
@@ -9159,7 +11220,7 @@ class ExecutorService:
                         )
                     return None
                 was_forbidden = service._partial_forbids(executor_id)
-                if was_forbidden:
+                if was_forbidden and not service._stop_mark_now(executor_id):
                     service._partial_keep_running(executor)
                     service.__dict__.setdefault("_stock_tick_forbid", {})[executor_id] = True
                     service.__dict__.setdefault("_stock_tick_ids", {})[executor_id] = set(service._partial_close_ids(executor_id))
@@ -9180,7 +11241,7 @@ class ExecutorService:
                 aside.add(str(executor_id))
                 service._log_silent_exit(
                     "stock-step-called", pair or "",
-                    f"close=…{str(witness)[-8:]}" if witness else "close=none", executor_id,
+                    step_close_witness(bool(frozen), str(witness or "")),
                     interval=300.0, label="silent stop exit:", key=executor_id,
                 )
                 try:
@@ -9197,8 +11258,14 @@ class ExecutorService:
         if original_shutdown is not None and not getattr(executor, "_close_brake", False):
 
             async def wrapped_shutdown(*args, **kwargs):
+                service._drop_phantom_close_liquidity(executor_id, executor)
+                marked = service._stop_mark_now(executor_id)
+                if marked:
+                    await service._feed_shutdown_stock_truth(executor_id, executor)
+                    return await original_shutdown(*args, **kwargs)
+                if service._live_delivery_reads_zero_liquidity(executor_id, executor):
+                    return None
                 if service._partial_forbids(executor_id):
-                    service._partial_keep_running(executor)
                     service._log_silent_exit(
                         "stop-partial-forbids", "", "shutdown not called", executor_id,
                         interval=300.0, label="silent stop exit:", key=executor_id,
@@ -9311,25 +11378,28 @@ class ExecutorService:
                     visible_here = service._level_visible_own(executor_id, level, connector, fresh)
                     if visible_here:
                         continue
+                    waiting = service._own_unproven_sends(executor_id)
+                    seated = service._seated_ids(executor)
+                    if any(
+                        service._own_level_id(executor_id, item) == level_id and item not in seated
+                        for item in waiting
+                    ):
+                        service._log_silent_exit(
+                            "wrapper-level-held", pair or "", f"level_id={level_id}", executor_id
+                        )
+                        continue
                     if level_id in held and not pending:
                         service._log_silent_exit(
                             "wrapper-level-held", pair or "", f"level_id={level_id}", executor_id
                         )
                         continue
-                    block_prices = prices
-                    if pending:
-                        block_prices = service._prices_without_own_mark(prices, pending, rows, fresh)
                     if connector is not None and pair and hasattr(connector, "quantize_order_price"):
                         placement = str(connector.quantize_order_price(pair, getattr(level, "price", None)))
                         if pending and tick is None:
                             if service._placement_hold_prices(fresh, connector, placement, pending, rows):
                                 continue
-                        elif recorded_price_blocks(block_prices, placement, tick):
-                            service._log_silent_exit(
-                                "wrapper-price-blocked", pair or "",
-                                f"level_id={getattr(level, 'id', '')} placement={placement}", executor_id,
-                            )
-                            continue
+                        # Одну цену входа нескольким уровням ставит штатная сетка.
+                        # На живом шаге эти уровни не удерживаем.
                     proposed.append(level)
                 return proposed
 
@@ -9339,16 +11409,10 @@ class ExecutorService:
 
             def wrapped_close(level, *args, **kwargs):
                 level_id = str(getattr(level, "id", "") or "")
+                opened = getattr(getattr(level, "active_open_order", None), "order", None)
+                if service._filled_down_open(executor_id, executor, level) or getattr(opened, "is_filled", False):
+                    return original_close(level, *args, **kwargs)
                 if service._filled_pair_ready(executor_id, executor, level_id) is not None:
-                    return None
-                if service._filled_down_open(executor_id, executor, level):
-                    connector_name = getattr(getattr(executor, "config", None), "connector_name", None)
-                    close_connector = (getattr(executor, "connectors", None) or {}).get(connector_name)
-                    task = asyncio.get_event_loop().create_task(
-                        service._one_sell_after_fill_down(executor_id, executor, close_connector, level)
-                    )
-                    service.__dict__.setdefault("_accept_tasks", set()).add(task)
-                    task.add_done_callback(service.__dict__["_accept_tasks"].discard)
                     return None
                 if level_id in partial_held_level_ids(
                     service._partial_rows(), service._partial_parsed(executor_id), executor_id
@@ -9987,11 +12051,7 @@ class ExecutorService:
         ):
             return True
         if not text:
-            text = await self._partial_commit_close(
-                executor_id, executor, connector, pair, str(level.get("id") or level_id), quant, bought,
-            ) or ""
-            if not text:
-                return True
+            return True
         body = (level.get("open_order") or {}).get("order") if isinstance(level, dict) else None
         send_amount = self._amount_from_contracts(connector, pair, body, bought)
         if send_amount is None:

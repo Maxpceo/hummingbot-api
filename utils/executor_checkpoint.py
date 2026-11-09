@@ -72,8 +72,17 @@ def capture_tracked(order: Any) -> Optional[Dict[str, Any]]:
     if live is not None and hasattr(live, "to_json"):
         payload["order"] = live.to_json()
         payload["filled"] = bool(getattr(live, "is_filled", False))
-    else:
-        payload["filled"] = False
+        price = getattr(live, "price", None)
+        if price not in (None, ""):
+            payload["price"] = str(price)
+        return payload
+    saved = getattr(order, "_broken_snapshot", None)
+    if isinstance(saved, dict) and saved:
+        # Захват не должен записать исполненную покупку как неисполненную.
+        payload["order"] = dict(saved)
+        payload["filled"] = True
+        return payload
+    payload["filled"] = False
     return payload
 
 
@@ -923,6 +932,227 @@ def strip_close_holds_from_saved(checkpoint: Dict[str, Any]) -> None:
     # An entry already on a level stays. A close hold is not seated by clearing it.
 
 
+def append_level_place_line(
+    executor_id: str,
+    order_id: str,
+    level_id: str,
+    price: Any,
+    take_profit_price: Any = None,
+ ) -> None:
+    """Дописать строку постановки и сбросить файл, не отдавая цикл событий.
+
+    Повтор сброса не вызывает await. Старые строки не стираются. Сброс папки
+    только если этот вызов создал живое имя, и только после сброса файла.
+    """
+    if not executor_id or not order_id or not level_id:
+        return
+    row = {
+        "executor_id": str(executor_id),
+        "order_id": str(order_id),
+        "level_id": str(level_id),
+        "price": None if price in (None, "") else str(price),
+        "ts": time.time(),
+    }
+    if take_profit_price not in (None, ""):
+        row["take_profit_price"] = str(take_profit_price)
+    payload = (json.dumps(row) + "\n").encode("utf-8")
+    created_name = False
+    path = order_ledger_path()
+    wrote, created_now = _append_level_payload(payload)
+    if not wrote:
+        return
+    if created_now and not _fsync_directory(path):
+        return
+
+
+def _append_level_payload(payload: bytes) -> tuple:
+    """Дописать байты и сбросить файл. Папку не трогает. False — повтор."""
+    _bind_process_to_ledger_path()
+    path = order_ledger_path()
+    directory = os.path.dirname(path) or "."
+    descriptor = None
+    created = False
+    try:
+        os.makedirs(directory, exist_ok=True)
+        created = not os.path.exists(path)
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        size_before = os.lseek(descriptor, 0, os.SEEK_END)
+        if size_before:
+            os.lseek(descriptor, size_before - 1, os.SEEK_SET)
+            last = os.read(descriptor, 1)
+            os.lseek(descriptor, 0, os.SEEK_END)
+            if last != b"\n":
+                os.write(descriptor, b"\n")
+        os.write(descriptor, payload)
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            logger.warning("level place line was not synced: %s", exc)
+            try:
+                os.ftruncate(descriptor, size_before)
+                os.fsync(descriptor)
+            except OSError:
+                pass
+            return False, created
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("level place line was not synced: %s", exc)
+        return False, created
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return True, created
+
+
+def _drop_grown_close_line(path: str, size_before: int) -> bool:
+    """Истина только если хвост этого вызова уже не на диске."""
+    try:
+        if not os.path.exists(path):
+            return True
+        if os.path.getsize(path) <= size_before:
+            return True
+        descriptor = os.open(path, os.O_RDWR)
+        try:
+            os.ftruncate(descriptor, size_before)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return os.path.getsize(path) <= size_before
+    except OSError:
+        return False
+
+
+
+
+def append_published_close(executor_id: str, order_id: str, level_id: str, price: Any = None) -> bool:
+
+    """Строка продажи с уровнем и ролью. Ложь — строка не опубликована."""
+
+    if not executor_id or not order_id or not level_id:
+
+        return False
+
+    row = {
+
+        "executor_id": str(executor_id),
+
+        "order_id": str(order_id),
+
+        "level_id": str(level_id),
+
+        "role": "close",
+
+        "published": True,
+
+        "price": None if price in (None, "") else str(price),
+
+        "ts": time.time(),
+
+    }
+
+    with LEDGER_LOCK:
+        path = order_ledger_path()
+        try:
+            size_before = os.path.getsize(path) if os.path.exists(path) else 0
+        except OSError:
+            size_before = None
+        try:
+            kept = _append_ledger_line(row)
+        except (OSError, TypeError, ValueError):
+            kept = False
+        if kept:
+            return True
+        if size_before is not None:
+            _drop_grown_close_line(path, size_before)
+        return False
+
+
+
+
+
+
+
+
+
+def published_close_rows(executor_id: str) -> list:
+
+    """Опубликованные строки закрытия. Строка входа сюда не входит."""
+
+    found = []
+
+    try:
+
+        rows = read_ledger_filtered()
+
+    except _LedgerReadError:
+        return None
+
+    for row in rows:
+
+        if str(row.get("executor_id") or "") != str(executor_id):
+
+            continue
+
+        if row.get("role") != "close" or row.get("published") is not True:
+
+            continue
+
+        level_id = str(row.get("level_id") or "")
+
+        order_id = str(row.get("order_id") or "")
+
+        if level_id and order_id:
+
+            found.append(row)
+
+    return found
+
+
+
+def seat_recorded_level_opens(executor: Any, executor_id: str) -> bool:
+    """После apply_checkpoint: номер входа на уровень из строки, не по цене.
+
+    False — журнал не прочитан. Это не пустая книга. Закрытие в слот входа
+    не пишется. Если в слоте другой id, сажается записанный номер входа.
+    """
+    from hummingbot.strategy_v2.models.executors import TrackedOrder
+
+    if not executor_id:
+        return True
+    try:
+        rows = read_ledger_filtered()
+    except _LedgerReadError:
+        return False
+    placed: Dict[str, str] = {}
+    noted: Dict[str, str] = {}
+    for row in rows:
+        if str(row.get("executor_id") or "") != str(executor_id):
+            continue
+        if is_proven_close_row(row):
+            continue
+        level_id = str(row.get("level_id") or "")
+        order_id = str(row.get("order_id") or "")
+        if not level_id or not order_id:
+            continue
+        # Пометка тейка — не новая постановка. Она не затирает живой номер.
+        if row.get("take_profit_price") not in (None, ""):
+            noted[level_id] = order_id
+            continue
+        placed[level_id] = order_id
+    for level in list(getattr(executor, "grid_levels", None) or []):
+        level_id = str(getattr(level, "id", "") or "")
+        order_id = placed.get(level_id) or noted.get(level_id)
+        if not order_id:
+            continue
+        current = str(getattr(getattr(level, "active_open_order", None), "order_id", "") or "")
+        if current == order_id:
+            continue
+        level.active_open_order = TrackedOrder(order_id=order_id)
+        update = getattr(level, "update_state", None)
+        if callable(update):
+            update()
+    return True
+
+
 def remember_order_now(executor_id: str, order_id: Optional[str]) -> None:
     """Durably note an order id before the async database write runs.
 
@@ -1446,6 +1676,9 @@ def recent_order_ids(executor_id: str) -> List[str]:
     for row in rows:
         if row.get("executor_id") != executor_id or not row.get("order_id"):
             continue
+        # Строка с id уровня сажается на свой уровень, не как голый номер.
+        if row.get("level_id"):
+            continue
         try:
             ts = float(row.get("ts") or 0)
         except (TypeError, ValueError):
@@ -1624,7 +1857,14 @@ def merge_ledger(body: Dict[str, Any], ledger: Dict[str, Dict[str, Any]]) -> Dic
                     used.add(item["order_id"])
                     fresher = ledger.get(item["order_id"])
                     if fresher and fresher.get("filled"):
-                        level[key] = _saved_order_payload(fresher)
+                        payload = _saved_order_payload(fresher)
+                        if payload.get("price") in (None, ""):
+                            kept_price = item.get("price")
+                            if kept_price in (None, ""):
+                                kept_price = level.get("price")
+                            if kept_price not in (None, ""):
+                                payload["price"] = kept_price
+                        level[key] = payload
         marked = {
             str(item.get("order_id"))
             for item in body.get("holds") or []
@@ -2261,6 +2501,37 @@ def live_order_view(order: Any) -> Dict[str, Any]:
     }
 
 
+class _RecordedFillBody:
+    """Тело для штатного шага, когда полного снимка нет. Новый номер не чеканит."""
+
+    def __init__(self, amount: Decimal, price: Decimal, body: Dict[str, Any]) -> None:
+        self.amount = amount
+        self.price = price
+        self.executed_amount_base = amount
+        self.executed_amount_quote = Decimal("0")
+        self.is_filled = True
+        self.is_done = True
+        self.is_open = False
+        self.base_asset = "BASE"
+        self.quote_asset = "QUOTE"
+        self.order_fills: Dict[str, Any] = {}
+        self._body = body
+
+    def cumulative_fee_paid(self, token: Any = None) -> Decimal:
+        return Decimal("0")
+
+    def to_json(self) -> Dict[str, Any]:
+        return dict(self._body)
+
+
+def _recorded_fill_body(saved: Dict[str, Any], order: Dict[str, Any]) -> Optional[_RecordedFillBody]:
+    amount_raw = order.get("executed_amount_base")
+    price_raw = saved.get("price")
+    if amount_raw in (None, "") or price_raw in (None, ""):
+        return None
+    return _RecordedFillBody(Decimal(str(amount_raw)), Decimal(str(price_raw)), dict(order))
+
+
 def _attach(saved: Optional[Dict[str, Any]], live_by_id: Dict[str, Any]) -> Any:
     """A TrackedOrder bound to the live in-flight order, or to the saved fill."""
     from hummingbot.core.data_type.in_flight_order import InFlightOrder
@@ -2278,8 +2549,20 @@ def _attach(saved: Optional[Dict[str, Any]], live_by_id: Dict[str, Any]) -> Any:
         tracked.order = live
         return tracked
     if resolved and resolved["source"] == "snapshot" and resolved.get("order"):
-        tracked = TrackedOrder(order_id=saved["order_id"])
-        tracked.order = InFlightOrder.from_json(resolved["order"])
+        order = resolved["order"]
+        tracked = TrackedOrder(order_id=str(saved["order_id"]))
+        # Дырявый снимок не роняет подъём. Номер берём из записи, не из тела.
+        if isinstance(order, dict):
+            tracked._broken_snapshot = dict(order)
+        if not isinstance(order, dict) or not order.get("client_order_id"):
+            tracked.order = _recorded_fill_body(saved, order if isinstance(order, dict) else {})
+            return tracked
+        try:
+            tracked.order = InFlightOrder.from_json(order)
+        except Exception:
+            tracked.order = None
+            return tracked
+        tracked._broken_snapshot = None
         return tracked
     return None
 
@@ -2335,7 +2618,11 @@ def apply_checkpoint(executor: Any, checkpoint: Dict[str, Any], live_orders: Lis
                 open_order_type=OrderType[raw["open_order_type"]],
                 take_profit_order_type=OrderType[raw["take_profit_order_type"]],
             )
-            level.active_open_order = _attach(raw.get("open_order"), live_by_id)
+            open_raw = raw.get("open_order")
+            if isinstance(open_raw, dict) and open_raw.get("price") in (None, "") and raw.get("price") not in (None, ""):
+                open_raw = dict(open_raw)
+                open_raw["price"] = raw.get("price")
+            level.active_open_order = _attach(open_raw, live_by_id)
             close_raw = raw.get("close_order") or {}
             partial_close = (
                 close_raw.get("order_id")
@@ -3610,6 +3897,37 @@ def parse_okx_closed_page(body: Any, begin_ms: int, end_ms: int) -> Dict[str, An
     return _page(orders, done=True, cursor=None)
 
 
+def okx_blank_px_fills(body: Any) -> list:
+    """Рыночная строка OKX с пустой ценой и исполненным объёмом. Общий разбор страницы не трогаем."""
+    if not isinstance(body, dict) or str(body.get("code")) != "0" or not isinstance(body.get("data"), list):
+        return []
+    found = []
+    for row in body["data"]:
+        if not isinstance(row, dict):
+            continue
+        if row.get("px") not in (None, ""):
+            continue
+        client_id = str(row.get("clOrdId") or "")
+        if not client_id:
+            continue
+        try:
+            filled = float(str(row.get("accFillSz") or "0")) > 0
+        except (TypeError, ValueError):
+            filled = False
+        if not filled:
+            continue
+        found.append({
+            "order_id": client_id,
+            "text": client_id,
+            "state": "filled",
+            "side": str(row.get("side") or ""),
+            "fill_size": str(row.get("accFillSz")),
+            "px": "",
+            "avgPx": str(row.get("avgPx") or ""),
+        })
+    return found
+
+
 def gate_delete_request(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """DELETE by the exchange id on the row whose text is the client id."""
     exchange_id = raw.get("id")
@@ -4079,6 +4397,178 @@ def line_for_send(
     return row
 
 
+def role_close_row(executor_id: str, order_id: str) -> Optional[Dict[str, Any]]:
+
+    """Строка с ролью и числовым временем. Короткая запись без роли — не это."""
+
+    if not executor_id or not order_id:
+
+        return None
+
+    try:
+
+        rows = read_ledger_filtered()
+
+    except _LedgerReadError:
+
+        return None
+
+    for row in reversed(rows):
+
+        if str(row.get("executor_id") or "") != str(executor_id):
+
+            continue
+
+        if str(row.get("order_id") or "") != str(order_id):
+
+            continue
+
+        if row.get("role") not in ("close", "market_close"):
+
+            continue
+
+        if numeric_ts(row.get("ts")) is None:
+
+            continue
+
+        return row
+
+    return None
+
+
+
+def record_returned_close(executor_id: str, order_id: str) -> bool:
+
+    """Записать номер, который штатная постановка уже вернула. Ложь — не «постановки не было»."""
+
+    if not executor_id or not order_id:
+
+        return False
+
+    existing = role_close_row(executor_id, order_id)
+
+    if existing is not None and existing.get("sent") is True:
+
+        return True
+
+    row = line_for_send(str(executor_id), str(order_id), "market_close", sent=True)
+
+    if not append_durable_row(row):
+
+        return False
+
+    return role_close_row(executor_id, order_id) is not None
+
+
+
+def seat_live_returned_close(executor: Any, order_id: str) -> None:
+
+    """Пока процесс жив, уже возвращённый номер сидит в ячейке. Чужой не затираем."""
+
+    if not order_id:
+
+        return
+
+    current = str(getattr(getattr(executor, "_close_order", None), "order_id", "") or "")
+
+    if current and current != str(order_id):
+
+        return
+
+    if current == str(order_id):
+
+        return
+
+    from hummingbot.strategy_v2.models.executors import TrackedOrder
+
+    executor._close_order = TrackedOrder(order_id=str(order_id))
+
+
+
+def seat_role_close_before_next(executor: Any, executor_id: str) -> Optional[str]:
+
+    """После падения сажаем только строку с ролью, до следующего закрытия."""
+
+    current = str(getattr(getattr(executor, "_close_order", None), "order_id", "") or "")
+
+    if current:
+
+        return current
+
+    try:
+
+        rows = read_ledger_filtered()
+
+    except _LedgerReadError:
+
+        return None
+
+    for row in reversed(rows):
+
+        if str(row.get("executor_id") or "") != str(executor_id):
+
+            continue
+
+        if row.get("role") not in ("close", "market_close"):
+
+            continue
+
+        if numeric_ts(row.get("ts")) is None:
+
+            continue
+
+        order_id = str(row.get("order_id") or "")
+
+        if not order_id:
+
+            continue
+
+        seat_live_returned_close(executor, order_id)
+
+        return order_id
+
+    return None
+
+
+
+def close_id_marked_open(executor_id: str, order_id: str) -> bool:
+    """Номер продажи не становится покупкой, даже из короткой записи."""
+    return order_id in recent_ids_kept_as_open(executor_id)
+
+
+def recent_ids_kept_as_open(executor_id: str) -> List[str]:
+    """Короткая запись и строка продажи в покупки не идут."""
+    kept = []
+    for order_id in recent_order_ids(executor_id):
+        if role_close_row(executor_id, order_id):
+            continue
+        if _bare_only(executor_id, order_id):
+            continue
+        kept.append(order_id)
+    return kept
+
+
+def _bare_only(executor_id: str, order_id: str) -> bool:
+    try:
+        rows = read_ledger_filtered()
+    except _LedgerReadError:
+        return False
+    seen = False
+    for row in rows:
+        if str(row.get("executor_id") or "") != str(executor_id):
+            continue
+        if str(row.get("order_id") or "") != str(order_id):
+            continue
+        seen = True
+        if row.get("role") or row.get("level_id"):
+            return False
+    return seen
+
+    """Номер продажи не становится покупкой, даже из короткой записи."""
+
+    return False
+
+
 def install_connector_close_channel(connector: Any) -> None:
     """One wrapper per connector for the process. An empty channel still mints."""
     if connector is None or id(connector) in _WRAPPED_CONNECTORS:
@@ -4269,6 +4759,28 @@ def _mint_close_id(executor: Any, is_buy: bool) -> Optional[str]:
         return None
 
 
+def _known_close_id(executor: Any, executor_id: str) -> Optional[str]:
+    """Свой номер продажи из слота или строки close/market_close. Не по цене."""
+    slot = str(getattr(getattr(executor, "_close_order", None), "order_id", "") or "")
+    if slot:
+        return slot
+    try:
+        rows = read_ledger_filtered()
+    except _LedgerReadError:
+        return None
+    for row in reversed(rows):
+        if str(row.get("executor_id") or "") != str(executor_id):
+            continue
+        if row.get("role") not in ("close", "market_close"):
+            continue
+        if numeric_ts(row.get("ts")) is None:
+            continue
+        order_id = str(row.get("order_id") or "")
+        if order_id:
+            return order_id
+    return None
+
+
 def place_market_close(executor: Any, executor_id: str) -> Optional[str]:
     """One market flatten. Original place_order is not called."""
     seated = getattr(executor, "_shutdown_close_id", None)
@@ -4291,8 +4803,6 @@ def place_market_close(executor: Any, executor_id: str) -> Optional[str]:
     quiet = line_for_send(executor_id, order_id, "market_close", sent=False)
     if not append_durable_row(quiet):
         return None
-    if not append_durable_row(line_for_send(executor_id, order_id, "market_close", sent=True)):
-        return None
     token = _RESERVED_CLOSE_ID.set(order_id)
     frozen_token = _CLOSE_FROZEN_CHECK.set(getattr(executor, "_refuse_frozen_close", None))
     try:
@@ -4303,6 +4813,8 @@ def place_market_close(executor: Any, executor_id: str) -> Optional[str]:
     finally:
         _RESERVED_CLOSE_ID.reset(token)
         _CLOSE_FROZEN_CHECK.reset(frozen_token)
+    if not append_durable_row(line_for_send(executor_id, order_id, "market_close", sent=True)):
+        return None
     remember_hold(executor, order_id, role="market_close")
     try:
         from hummingbot.strategy_v2.models.executors import TrackedOrder
@@ -4345,6 +4857,217 @@ def _brake_held(executor_id: str, place: str, reason: str, interval: float = 300
         return
 
 
+def _journal_readable() -> bool:
+    """Непрочитанный журнал — не «номера нет»."""
+    try:
+        read_ledger_filtered()
+    except _LedgerReadError:
+        return False
+    return True
+
+
+def _sell_is_live(executor: Any, order_id: str) -> bool:
+    """Живая продажа. Пустой слот без полёта отправкой не считается."""
+    market = _executor_connector(executor)
+    inflight = getattr(market, "in_flight_orders", None) or {}
+    if order_id in inflight:
+        return True
+    tracked = getattr(executor, "_close_order", None)
+    if str(getattr(tracked, "order_id", "") or "") != order_id:
+        return False
+    if getattr(tracked, "order", None) is None:
+        return False
+    return not bool(getattr(tracked, "is_done", False))
+
+
+def _live_delivery_blocks(executor: Any, close_id: str) -> bool:
+    """Живой номер доставки без ответа 51400. Запись подъёма не стираем."""
+    gone = set(getattr(executor, "_ids_51400", None) or [])
+    market = _executor_connector(executor)
+    inflight = getattr(market, "in_flight_orders", None) or {}
+    for text in inflight:
+        if str(text) != close_id and str(text) not in gone:
+            return True
+    return False
+
+
+def _level_close_id(executor: Any) -> str:
+    """Номер в ячейке продажи уровня. Чужой по цене сюда не сажаем."""
+    for level in getattr(executor, "grid_levels", []) or []:
+        seated = getattr(level, "active_close_order", None)
+        text = str(getattr(seated, "order_id", "") or "")
+        if text:
+            return text
+    return ""
+
+
+def _close_sent(executor_id: str, order_id: str) -> Optional[bool]:
+    """None — журнал не прочитан. False — строки sent=true ещё нет."""
+    try:
+        rows = read_ledger_filtered()
+    except _LedgerReadError:
+        return None
+    sent = False
+    for row in rows:
+        if str(row.get("executor_id") or "") != str(executor_id):
+            continue
+        if str(row.get("order_id") or "") != order_id:
+            continue
+        if row.get("role") not in ("close", "market_close"):
+            continue
+        if row.get("sent") is True or row.get("sent") == "true":
+            sent = True
+    return sent
+
+
+def _occupied_foreign(executor: Any, own_id: str) -> bool:
+    """In-flight уже держит номер, который не наш. Новый id не чеканим."""
+    market = _executor_connector(executor)
+    inflight = getattr(market, "in_flight_orders", None) or {}
+    level_id = _level_close_id(executor)
+    for text in inflight:
+        if str(text) not in {own_id, level_id} and str(text):
+            return True
+    return False
+
+
+def _send_landed(executor: Any, order_id: str) -> bool:
+    """Строка sent=true до sell/create отправкой не считается."""
+    if _sell_is_live(executor, order_id):
+        return True
+    tracked = getattr(executor, "_close_order", None)
+    if str(getattr(tracked, "order_id", "") or "") == order_id and bool(getattr(tracked, "is_done", False)):
+        return True
+    if str(getattr(tracked, "order_id", "") or "") == order_id and getattr(tracked, "order", None) is not None:
+        return True
+    return False
+
+
+
+
+def _own_order_ids(executor: Any, executor_id: str) -> set:
+    found = set()
+    slot = str(getattr(getattr(executor, "_close_order", None), "order_id", "") or "")
+    if slot:
+        found.add(slot)
+    for level in getattr(executor, "grid_levels", []) or []:
+        for seated in (getattr(level, "active_open_order", None), getattr(level, "active_close_order", None)):
+            text = str(getattr(seated, "order_id", "") or "")
+            if text:
+                found.add(text)
+    try:
+        rows = read_ledger_filtered()
+    except _LedgerReadError:
+        return found
+    for row in rows:
+        if str(row.get("executor_id") or "") != str(executor_id):
+            continue
+        text = str(row.get("order_id") or "")
+        if text:
+            found.add(text)
+    return found
+
+
+def _book_ids(executor: Any) -> set:
+    found = set()
+    market = _executor_connector(executor)
+    for text in getattr(market, "in_flight_orders", None) or {}:
+        if str(text):
+            found.add(str(text))
+    lost = getattr(getattr(market, "_order_tracker", None), "lost_orders", None) or {}
+    if isinstance(lost, dict):
+        for text, order in lost.items():
+            oid = str(getattr(order, "client_order_id", None) or text or "")
+            if oid:
+                found.add(oid)
+    for item in getattr(executor, "_tick_opens", None) or []:
+        if isinstance(item, dict):
+            oid = str(item.get("text") or item.get("order_id") or "")
+        else:
+            oid = str(getattr(item, "client_order_id", None) or item or "")
+        if oid:
+            found.add(oid)
+    return found
+
+
+def other_grid_order_unproven(executor: Any, close_id: str, executor_id: str = "") -> bool:
+    """Другая заявка этой сетки ещё в открытых, в полёте или в потерянных. Чужая пара не держит."""
+    books = _book_ids(executor)
+    own = _own_order_ids(executor, executor_id)
+    for oid in own:
+        if oid != str(close_id) and oid in books:
+            return True
+    return False
+
+def step_close_witness(frozen: bool, witness: str) -> str:
+    """Непрочитанный замороженный шаг — не «продажи нет»."""
+    if frozen:
+        return "frozen-unread"
+    return f"close=…{str(witness)[-8:]}" if witness else "close=none"
+
+def _exchange_close_filled(executor: Any, close_id: str) -> bool:
+    """Исполнение с биржи. Пустая ячейка с is_done этим не считается."""
+    tracked = getattr(executor, "_close_order", None)
+    order = getattr(tracked, "order", None)
+    if (
+        str(getattr(tracked, "order_id", "") or "") == str(close_id)
+        and order is not None
+        and getattr(order, "is_filled", False)
+    ):
+        return True
+    for row in getattr(executor, "_tick_finished", None) or []:
+        if not isinstance(row, dict):
+            continue
+        text = str(row.get("text") or row.get("order_id") or "")
+        if text != str(close_id):
+            continue
+        try:
+            filled = float(row.get("fill_size") or 0) > 0
+        except (TypeError, ValueError):
+            filled = False
+        if row.get("is_filled") or filled:
+            return True
+    for row in getattr(executor, "_tick_blank_fills", None) or []:
+        if not isinstance(row, dict):
+            continue
+        text = str(row.get("text") or row.get("order_id") or "")
+        if text != str(close_id):
+            continue
+        try:
+            if float(row.get("fill_size") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def recorded_close_holds_retry(executor: Any, executor_id: str) -> bool:
+    """Записанная продажа жива или биржа уже показала исполнение. Чужой номер не считается."""
+    close_id = _known_close_id(executor, executor_id) or ""
+    if not close_id:
+        return False
+    if str(close_id) in _book_ids(executor):
+        return True
+    return _exchange_close_filled(executor, close_id)
+
+def marked_stop_ready(executor: Any, executor_id: str) -> bool:
+    """Финал только после отправленной и уже не живой продажи. 51400 сам не отпускает."""
+    if not _journal_readable():
+        return False
+    close_id = _known_close_id(executor, executor_id) or ""
+    if not close_id or not _exchange_close_filled(executor, close_id):
+        return False
+    if str(close_id) in _book_ids(executor):
+        return False
+    level_id = _level_close_id(executor)
+    if level_id and level_id != close_id and level_id in _book_ids(executor):
+        return False
+    if other_grid_order_unproven(executor, close_id, executor_id):
+        return False
+    if _sell_is_live(executor, close_id):
+        return False
+    return True
+
 def install_close_without_level(executor: Any, executor_id: str, frozen: Any = None) -> bool:
     """Fail-closed brake. False means start must not run.
 
@@ -4382,12 +5105,23 @@ def install_close_without_level(executor: Any, executor_id: str, frozen: Any = N
         return False
 
     def hold(place: str) -> bool:
-        """Заморозка держит путь гашения всегда; тормоз — как прежде."""
-        if place in ("control_shutdown", "stop") and getattr(executor, "_shutdown_close_proven", False):
+        """Кнопка отпускает get_close. stop() без доказательства не отпускает."""
+        proven = bool(getattr(executor, "_shutdown_close_proven", False))
+        if place in ("control_shutdown", "stop") and proven:
             return False
         marked = False
         if frozen is not None:
-            marked = frozen()
+            try:
+                marked = bool(frozen())
+            except Exception:
+                marked = False
+        if not marked and place in ("get_close", "control_close", "control_shutdown", "stop"):
+            return False
+        if marked and place in ("get_close", "control_shutdown"):
+            return False
+        if place == "stop":
+            _brake_held(executor_id, place, "blocked" if blocked() else "unproven")
+            return True
         if marked:
             _brake_held(executor_id, place, "frozen: awaiting stage 2")
             return True
@@ -4396,12 +5130,55 @@ def install_close_without_level(executor: Any, executor_id: str, frozen: Any = N
             return True
         return False
 
+    def place_unready() -> bool:
+        return (
+            not getattr(executor, "_close_seat_ready", False)
+            or not getattr(executor, "_close_list_ready", False)
+        )
+
+    def blocked_besides_place() -> bool:
+        if hold_ids_of(executor) or getattr(executor, "_close_ban_ids", None):
+            return True
+        if getattr(executor, "_column_close_ids", None):
+            return True
+        close = getattr(executor, "_close_order", None)
+        if getattr(close, "order_id", None):
+            return True
+        for level in getattr(executor, "grid_levels", []) or []:
+            seated = getattr(level, "active_close_order", None)
+            if getattr(seated, "order_id", None):
+                return True
+        return False
+
+    def _shown_open(level: Any) -> bool:
+        order = getattr(getattr(level, "active_open_order", None), "order", None)
+        return bool(getattr(order, "is_filled", False))
+
     def get_close(*args, **kwargs):
-        if hold("get_close"):
+        if frozen is not None:
+            try:
+                if not bool(frozen()):
+                    return original_get(*args, **kwargs)
+            except Exception:
+                return original_get(*args, **kwargs)
+        if any(_shown_open(level) for level in getattr(executor, "grid_levels", []) or []):
+            return original_get(*args, **kwargs)
+        if blocked_besides_place() and hold("get_close"):
+            return []
+        if hold("get_close") and not place_unready():
             return []
         return original_get(*args, **kwargs)
 
     async def control_close(*args, **kwargs):
+        marked = False
+        if frozen is not None:
+            try:
+                marked = bool(frozen())
+            except Exception:
+                marked = False
+        # Занятую ячейку читает штатное закрытие. Свой номер не чеканим.
+        if marked:
+            return await original_control(*args, **kwargs)
         if hold("control_close"):
             return None
         return await original_control(*args, **kwargs)
@@ -4411,7 +5188,23 @@ def install_close_without_level(executor: Any, executor_id: str, frozen: Any = N
             return None
         return await original_shutdown(*args, **kwargs)
 
+    def marked_now() -> bool:
+        if frozen is None:
+            return False
+        try:
+            return bool(frozen())
+        except Exception:
+            return False
+
     def adjust(level, *args, **kwargs):
+        if frozen is not None:
+            try:
+                if not bool(frozen()):
+                    return original_adjust(level, *args, **kwargs)
+            except Exception:
+                return original_adjust(level, *args, **kwargs)
+        if _shown_open(level) and not marked_now():
+            return original_adjust(level, *args, **kwargs)
         if hold("adjust"):
             return None
         owns = getattr(executor, "_partial_owns_level", None)
@@ -4435,9 +5228,9 @@ def install_close_without_level(executor: Any, executor_id: str, frozen: Any = N
     executor.control_close_order = control_close
     executor.control_shutdown_process = control_shutdown
     def market(*args, **kwargs):
-        if hold("market"):
+        if original_market is None:
             return None
-        return place_market_close(executor, executor_id)
+        return original_market(*args, **kwargs)
 
     if original_adjust is not None:
         executor.adjust_and_place_close_order = adjust
@@ -4446,6 +5239,17 @@ def install_close_without_level(executor: Any, executor_id: str, frozen: Any = N
     original_stop = getattr(executor, "stop", None)
 
     def stop(*args, **kwargs):
+        marked = False
+        if frozen is not None:
+            try:
+                marked = bool(frozen())
+            except Exception:
+                marked = False
+        if marked:
+            author = getattr(executor, "_author_stop", None) or original_stop
+            if author is None:
+                return None
+            return author(*args, **kwargs)
         if hold("stop"):
             return None
         if original_stop is None:
