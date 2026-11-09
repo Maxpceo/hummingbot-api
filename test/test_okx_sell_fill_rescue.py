@@ -7,6 +7,7 @@
 
 import asyncio
 import json
+from decimal import Decimal
 
 from types import SimpleNamespace
 
@@ -20,9 +21,9 @@ EARLY = "sell-early"
 LATE = "sell-late"
 
 
-def _level(open_id="buy-1", close=None):
+def _level(open_id="buy-1", close=None, level_id="L1"):
     return {
-        "id": "L1",
+        "id": level_id,
         "price": "100",
         "take_profit": "0.01",
         "side": "BUY",
@@ -287,3 +288,147 @@ def test_foreign_executor_close_is_not_seated(tmp_path, monkeypatch):
     assert service._rescue_close_blocked(EXECUTOR, "L1", fresh, executor) is False
     parsed = service._partial_parsed(EXECUTOR)
     assert (parsed["levels"][0].get("close_order") or {}).get("order_id") is None
+
+
+def _real_grid(mid=Decimal("100")):
+    from decimal import Decimal as D
+    from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
+    from hummingbot.strategy_v2.executors.grid_executor.data_types import GridExecutorConfig, GridLevelStates
+    from hummingbot.strategy_v2.executors.position_executor.data_types import TripleBarrierConfig
+    from hummingbot.core.data_type.common import TradeType
+
+    connector = SimpleNamespace(
+        trading_rules={PAIR: SimpleNamespace(min_notional_size=D("0.1"),
+                                              min_price_increment=D("0.01"),
+                                              min_base_amount_increment=D("0.001"))},
+        in_flight_orders={},
+        _order_tracker=SimpleNamespace(lost_orders={}),
+        remove_listener=lambda *a, **k: None,
+    )
+
+    def get_price_by_type(trading_pair, price_type):
+        return mid
+
+    connector.get_price_by_type = get_price_by_type
+
+    async def quiet_sleep(_seconds):
+        return None
+
+    strategy = SimpleNamespace(
+        connectors={"gate_io": connector},
+        current_timestamp=1,
+        buy=lambda *a, **k: "new-buy",
+        sell=lambda *a, **k: "new-sell",
+        cancel=lambda *a, **k: None,
+    )
+    config = GridExecutorConfig(
+        timestamp=1, connector_name="gate_io", trading_pair=PAIR,
+        start_price=D("99"), end_price=D("101"), limit_price=D("0"),
+        side=TradeType.BUY, total_amount_quote=D("12"),
+        triple_barrier_config=TripleBarrierConfig(take_profit=D("0.01")), leverage=1,
+    )
+    executor = GridExecutor(strategy=strategy, config=config)
+    executor._sleep = quiet_sleep
+    executor.control_close_order = _no_close_order(executor)
+    return executor, connector
+
+
+def _no_close_order(executor):
+    calls = []
+
+    async def close_order():
+        calls.append("close-order")
+        return None
+
+    executor._close_order_calls = calls
+    return close_order
+
+
+def _stock_open_body(service):
+    body = service._stock_filled_order(
+        client_id="buy-1", trading_pair=PAIR, trade_name="BUY",
+        position_name="OPEN", amount=Decimal("1"), price=Decimal("100"), leverage=1,
+    )
+    return body
+
+
+def test_stock_task_resets_level_without_crash(tmp_path, monkeypatch):
+    """Посадка кругом + штатный control_task: уровень COMPLETE сбрасывается в
+    NOT_ACTIVE, AttributeError на completely_filled_event нет."""
+    from hummingbot.strategy_v2.executors.grid_executor.data_types import GridLevelStates
+    from hummingbot.strategy_v2.models.executors import TrackedOrder as T
+
+    fresh = _fresh(blank=[_blank(EARLY)])
+    lines = [_row("buy-1", ts=10, level_id="L0"), _row(EARLY, ts=11, level_id="L0", role="market_close", sent=True)]
+    service, _repo, connector_stub = _base(tmp_path, monkeypatch, fresh, [_level(level_id="L0")], lines)
+    executor, _conn = _real_grid()
+    level = executor.grid_levels[0]
+    open_body = _stock_open_body(service)
+    level.active_open_order = T(order_id="buy-1")
+    level.active_open_order.order = open_body
+    executor.connectors["gate_io"] = _conn
+
+    assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, _conn, PAIR)) is True
+    assert level.active_close_order is not None
+
+    asyncio.run(executor.control_task())
+    assert level.state == GridLevelStates.NOT_ACTIVE
+    assert level.active_close_order is None
+
+
+def test_stock_shutdown_finishes_with_seated_close(tmp_path, monkeypatch):
+    """Такт 1: RUNNING, середина за end_price — только SHUTTING_DOWN. Такт 2 после
+    посадки кругом: штатный stop(), TERMINATED, control_close_order не вызван."""
+    from hummingbot.strategy_v2.executors.grid_executor.data_types import GridLevelStates
+    from hummingbot.strategy_v2.models.executors import TrackedOrder as T
+    from hummingbot.strategy_v2.executors.executor_base import RunnableStatus
+
+    fresh = _fresh(blank=[_blank(EARLY)])
+    lines = [_row("buy-1", ts=10, level_id="L0"), _row(EARLY, ts=11, level_id="L0", role="market_close", sent=True)]
+    service, _repo, connector_stub = _base(tmp_path, monkeypatch, fresh, [_level(level_id="L0")], lines)
+    executor, _conn = _real_grid(mid=Decimal("102"))
+    executor._status = RunnableStatus.RUNNING
+    level = executor.grid_levels[0]
+    level.active_open_order = T(order_id="buy-1")
+    level.active_open_order.order = _stock_open_body(service)
+    executor.connectors["gate_io"] = _conn
+
+    asyncio.run(executor.control_task())
+    assert executor._status == RunnableStatus.SHUTTING_DOWN
+    assert executor._close_order_calls == []
+
+    assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, _conn, PAIR)) is True
+    asyncio.run(executor.control_task())
+    assert executor._close_order_calls == []
+    assert executor.is_closed is True
+    assert executor.status.name == "TERMINATED"
+
+
+def test_restart_body_from_checkpoint_carries_the_event(tmp_path, monkeypatch):
+    """Полный order JSON из круга поднимается from_json с completely_filled_event —
+    первый штатный шаг после подъёма не падает и сбрасывает уровень."""
+    from hummingbot.core.data_type.in_flight_order import InFlightOrder
+    from hummingbot.strategy_v2.executors.grid_executor.data_types import GridLevelStates
+    from hummingbot.strategy_v2.models.executors import TrackedOrder as T
+
+    fresh = _fresh(blank=[_blank(EARLY)])
+    lines = [_row("buy-1", ts=10, level_id="L0"), _row(EARLY, ts=11, level_id="L0", role="market_close", sent=True)]
+    service, _repo, connector_stub = _base(tmp_path, monkeypatch, fresh, [_level(level_id="L0")], lines)
+    executor, _conn = _real_grid()
+    level = executor.grid_levels[0]
+    level.active_open_order = T(order_id="buy-1")
+    level.active_open_order.order = _stock_open_body(service)
+    executor.connectors["gate_io"] = _conn
+    asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, _conn, PAIR))
+
+    parsed = service._partial_parsed(EXECUTOR)
+    order_json = parsed["levels"][0]["close_order"]["order"]
+    assert order_json.get("client_order_id") == EARLY
+
+    lifted = T(order_id=EARLY)
+    lifted.order = InFlightOrder.from_json(order_json)
+    assert lifted.order.completely_filled_event.is_set()
+
+    level.active_close_order = lifted
+    asyncio.run(executor.control_task())
+    assert level.state == GridLevelStates.NOT_ACTIVE

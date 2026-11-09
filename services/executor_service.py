@@ -12121,15 +12121,30 @@ class ExecutorService:
             price = self._rescue_close_price(level_body, found)
             if price is None or price <= 0:
                 continue
-            if getattr(target, "active_close_order", None) is None:
+            seated_slot = getattr(target, "active_close_order", None)
+            seated_id = str(getattr(seated_slot, "order_id", "") or "")
+            seated_event = getattr(getattr(seated_slot, "order", None), "completely_filled_event", None)
+            seat_needed = (
+                seated_slot is None
+                or (seated_id == text and (seated_event is None or not seated_event.is_set()))
+            )
+            if seat_needed:
                 closed = self._stock_filled_order(
                     client_id=text, trading_pair=pair, trade_name="SELL",
                     position_name="CLOSE", amount=size, price=price, leverage=1,
                 )
                 if closed is None:
                     continue
-                target.active_close_order = TrackedOrder(order_id=text)
+                if seated_slot is None:
+                    target.active_close_order = TrackedOrder(order_id=text)
                 target.active_close_order.order = closed
+                body_json = None
+                try:
+                    body_json = closed.to_json()
+                except Exception:
+                    body_json = None
+                if isinstance(body_json, dict):
+                    self.__dict__.setdefault("_rescue_close_bodies", {})[text] = body_json
 
             def mutate(column: Dict[str, Any], text=text, size=size, price=price, level_id=str(level_body.get("id") or "")) -> None:
                 for item in column.get("levels") or []:
@@ -12141,7 +12156,9 @@ class ExecutorService:
                         "order_id": text,
                         "filled": True,
                         "price": str(price),
-                        "order": {"executed_amount_base": str(size)},
+                        "order": (self.__dict__.get("_rescue_close_bodies") or {}).get(text)
+                                 or {"client_order_id": text, "executed_amount_base": str(size),
+                                     "price": str(price), "amount": str(size)},
                     }
 
             def visible(parsed_body: Optional[Dict[str, Any]], text=text, level_id=str(level_body.get("id") or "")) -> bool:
@@ -12150,8 +12167,11 @@ class ExecutorService:
                         return str((item.get("close_order") or {}).get("order_id") or "") == text
                 return False
 
+
+
             if await self._partial_cas(executor_id, mutate, visible, str(level_body.get("id") or "")):
                 seated = True
+            (self.__dict__.get("_rescue_close_bodies") or {}).pop(text, None)
         return seated
 
     async def _partial_note_filled_price(
