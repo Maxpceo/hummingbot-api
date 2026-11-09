@@ -56,7 +56,11 @@ def _store_fresh(service, fresh):
 
 def _live_executor(connector, filled_open=True, open_id="buy-1", offer=None):
     open_slot = TrackedOrder(order_id=open_id)
-    open_slot.order = SimpleNamespace(is_filled=filled_open, completely_filled_event=SimpleNamespace(is_set=lambda: filled_open))
+    open_slot.order = SimpleNamespace(
+        is_filled=filled_open,
+        completely_filled_event=SimpleNamespace(is_set=lambda: filled_open),
+        executed_amount_base=Decimal("1"),
+    )
     stub = SimpleNamespace(
         config=SimpleNamespace(trading_pair=PAIR, connector_name="gate_io"),
         connectors={"gate_io": connector},
@@ -446,3 +450,42 @@ def test_partial_fill_size_is_not_a_full_close(tmp_path, monkeypatch):
     assert service._rescue_close_blocked(EXECUTOR, "L1", fresh, executor) is False
     parsed = service._partial_parsed(EXECUTOR)
     assert (parsed["levels"][0].get("close_order") or {}).get("order_id") is None
+
+
+def test_failed_record_leaves_no_filled_slot(tmp_path, monkeypatch):
+    """CAS не лёг — исполненный close не остаётся в живом слоте: штатный шаг не
+    видит завершения, которого нет на диске."""
+    fresh = _fresh(blank=[_blank(EARLY)])
+    lines = [_row("buy-1", ts=10), _row(EARLY, ts=11, role="market_close", sent=True)]
+    service, repo, connector = _base(tmp_path, monkeypatch, fresh, [_level()], lines)
+    async def refuse(*args, **kwargs):
+        return False
+    repo.replace_checkpoint_if_unchanged = refuse
+    executor = _live_executor(connector)
+    assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, connector, PAIR)) is False
+    assert executor.grid_levels[0].active_close_order is None
+    # Фильтр живёт доказательством страницы, не записью: повторная продажа не нужна.
+    assert service._rescue_close_blocked(EXECUTOR, "L1", fresh, executor) is True
+
+
+def test_page_fill_covers_smaller_live_base(tmp_path, monkeypatch):
+    """Размер страницы не меньше исполненной базы живого открытия — сажается."""
+    fresh = _fresh(blank=[_blank(EARLY, size="1")])
+    lines = [_row("buy-1", ts=10), _row(EARLY, ts=11, role="market_close", sent=True)]
+    service, _repo, connector = _base(tmp_path, monkeypatch, fresh, [_level()], lines)
+    executor = _live_executor(connector)
+    executor.grid_levels[0].active_open_order.order.executed_amount_base = Decimal("0.5")
+    assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, connector, PAIR)) is True
+    assert executor.grid_levels[0].active_close_order.order_id == EARLY
+
+
+def test_live_base_missing_blocks_seating(tmp_path, monkeypatch):
+    """Исполненной базы живого открытия нет — не сажаем и не режем."""
+    fresh = _fresh(blank=[_blank(EARLY)])
+    lines = [_row("buy-1", ts=10), _row(EARLY, ts=11, role="market_close", sent=True)]
+    service, _repo, connector = _base(tmp_path, monkeypatch, fresh, [_level()], lines)
+    executor = _live_executor(connector)
+    del executor.grid_levels[0].active_open_order.order.executed_amount_base
+    assert asyncio.run(service._rescue_seat_filled_close(EXECUTOR, executor, connector, PAIR)) is False
+    assert executor.grid_levels[0].active_close_order is None
+    assert service._rescue_close_blocked(EXECUTOR, "L1", fresh, executor) is False

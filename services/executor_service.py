@@ -12081,7 +12081,13 @@ class ExecutorService:
         live_open_id = str(getattr(open_slot, "order_id", "") or "") if open_slot is not None else None
         if not live_open_id or not getattr(open_slot, "is_filled", False):
             return False
-        return self._rescue_proved_close(executor_id, level_body, fresh, live_open_id) is not None
+        proof = self._rescue_proved_close(executor_id, level_body, fresh, live_open_id)
+        if proof is None:
+            return False
+        open_base = partial_decimal(str(getattr(getattr(open_slot, "order", None), "executed_amount_base", "") or ""))
+        if open_base is None or open_base <= 0 or proof[1] < open_base:
+            return False
+        return True
 
 
     def _rescue_close_price(self, level_body: Dict[str, Any], found: Dict[str, Any]) -> Optional[Decimal]:
@@ -12125,30 +12131,24 @@ class ExecutorService:
             price = self._rescue_close_price(level_body, found)
             if price is None or price <= 0:
                 continue
-            seated_slot = getattr(target, "active_close_order", None)
-            seated_id = str(getattr(seated_slot, "order_id", "") or "")
-            seated_event = getattr(getattr(seated_slot, "order", None), "completely_filled_event", None)
-            seat_needed = (
-                seated_slot is None
-                or (seated_id == text and (seated_event is None or not seated_event.is_set()))
+            open_base = partial_decimal(str(getattr(getattr(open_slot, "order", None), "executed_amount_base", "") or ""))
+            if open_base is None or open_base <= 0:
+                continue
+            if size < open_base:
+                continue
+            closed = self._stock_filled_order(
+                client_id=text, trading_pair=pair, trade_name="SELL",
+                position_name="CLOSE", amount=size, price=price, leverage=1,
             )
-            if seat_needed:
-                closed = self._stock_filled_order(
-                    client_id=text, trading_pair=pair, trade_name="SELL",
-                    position_name="CLOSE", amount=size, price=price, leverage=1,
-                )
-                if closed is None:
-                    continue
-                if seated_slot is None:
-                    target.active_close_order = TrackedOrder(order_id=text)
-                target.active_close_order.order = closed
+            if closed is None:
+                continue
+            body_json = None
+            try:
+                body_json = closed.to_json()
+            except Exception:
                 body_json = None
-                try:
-                    body_json = closed.to_json()
-                except Exception:
-                    body_json = None
-                if isinstance(body_json, dict):
-                    self.__dict__.setdefault("_rescue_close_bodies", {})[text] = body_json
+            if isinstance(body_json, dict):
+                self.__dict__.setdefault("_rescue_close_bodies", {})[text] = body_json
 
             def mutate(column: Dict[str, Any], text=text, size=size, price=price, level_id=str(level_body.get("id") or "")) -> None:
                 for item in column.get("levels") or []:
@@ -12173,9 +12173,20 @@ class ExecutorService:
 
 
 
-            if await self._partial_cas(executor_id, mutate, visible, str(level_body.get("id") or "")):
-                seated = True
+            if not await self._partial_cas(executor_id, mutate, visible, str(level_body.get("id") or "")):
+                (self.__dict__.get("_rescue_close_bodies") or {}).pop(text, None)
+                continue
+            seated = True
             (self.__dict__.get("_rescue_close_bodies") or {}).pop(text, None)
+            # Слот — только после севшей записи: штатный шаг не видит завершения,
+            # которого нет на диске. Чужой стоящий номер не затирается.
+            seated_slot = getattr(target, "active_close_order", None)
+            seated_id = str(getattr(seated_slot, "order_id", "") or "")
+            seated_event = getattr(getattr(seated_slot, "order", None), "completely_filled_event", None)
+            if seated_slot is None or (seated_id == text and (seated_event is None or not seated_event.is_set())):
+                if seated_slot is None:
+                    target.active_close_order = TrackedOrder(order_id=text)
+                target.active_close_order.order = closed
         return seated
 
     async def _partial_note_filled_price(
