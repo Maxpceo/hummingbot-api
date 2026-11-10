@@ -306,7 +306,7 @@ def test_seed_ledger_skips_finished_cycle_ids():
 
 
 def test_stop_mark_visible_level(tmp_path, monkeypatch):
-    """Проба 7 (метка стопа): подъёмный CAS конца не пишет, оформляет только память."""
+    """Проба 7 (метка стопа): CAS конца не пишет, уровни — в ожидание замка."""
     from utils.executor_checkpoint import STOP_MARK_KEY, stop_mark_visible
 
     checkpoint = _hyj_checkpoint()
@@ -323,7 +323,8 @@ def test_stop_mark_visible_level(tmp_path, monkeypatch):
     service._partial_cas = _no_cas
     import asyncio
 
-    assert asyncio.run(service._mark_completed_cycles(EXECUTOR, checkpoint)) is True
+    pending = asyncio.run(service._mark_completed_cycles(EXECUTOR, checkpoint))
+    assert pending == {"L0"}
     assert calls == []
 
 
@@ -417,10 +418,21 @@ def test_resume_sets_the_column_hold_before_any_await(tmp_path, monkeypatch):
 
 
 def test_checkpoint_executor_respects_the_column_hold(tmp_path, monkeypatch):
-    """Проба 6(а): при замке контрольный цикл не подменяет геометрию уровня."""
+    """Проба 6(а) и стоп-путь: замок держит запись до apply или до метки уровня."""
     import asyncio
+    from test.test_executor_checkpoint import _Repo, _running_row, _service
 
-    service, repo, _connector = _service_with(monkeypatch, None, tmp_path=tmp_path)
+    plain = json.dumps(_hyj_checkpoint())
+    marked = json.loads(json.dumps(_hyj_checkpoint()))
+    resume_complete_mutate("L0", OPEN_ID, CLOSE_ID)(marked)
+    repo = _Repo([_running_row(executor_id=EXECUTOR, pair=PAIR, checkpoint=plain)])
+
+    async def _replace(executor_id, seen=None, new_text=None, **kwargs):
+        repo.holds.append((executor_id, new_text))
+        return 1
+
+    repo.replace_checkpoint_if_unchanged = _replace
+    service = _service(monkeypatch, repo, SimpleNamespace())
     executor = _executor()
     from hummingbot.core.data_type.common import OrderType, TradeType
     from hummingbot.strategy_v2.executors.grid_executor.data_types import GridLevel
@@ -436,18 +448,18 @@ def test_checkpoint_executor_respects_the_column_hold(tmp_path, monkeypatch):
         "account_name": "main", "connector_name": "gate_io",
         "trading_pair": PAIR, "executor_type": "grid_executor",
     }
-    service._resume_column_hold = {EXECUTOR}
-
-    async def _replace(executor_id, seen=None, new_text=None, **kwargs):
-        repo.holds.append((executor_id, new_text))
-        return 1
-
-    repo.replace_checkpoint_if_unchanged = _replace
+    service._resume_column_hold = {EXECUTOR: set()}
     asyncio.run(service._checkpoint_executor(EXECUTOR))
     assert repo.holds == []
-    service._resume_column_hold = set()
+    # Стоп-путь: замок ждёт метки уровня, колонка ещё с обоими filled — запись закрыта.
+    service._resume_column_hold = {EXECUTOR: {"L0"}}
     asyncio.run(service._checkpoint_executor(EXECUTOR))
-    assert repo.holds, "после снятия замка запись возобновляется"
+    assert repo.holds == []
+    # Путь стопа отпустил уровень своей меткой — запись возобновляется, замок снят.
+    repo.rows[0]["checkpoint"] = json.dumps(marked)
+    asyncio.run(service._checkpoint_executor(EXECUTOR))
+    assert repo.holds, "после метки уровня запись возобновляется"
+    assert EXECUTOR not in (service.__dict__.get("_resume_column_hold") or {})
 
 
 def test_first_tick_reseats_the_finished_sale_accepted_residue(tmp_path, monkeypatch):

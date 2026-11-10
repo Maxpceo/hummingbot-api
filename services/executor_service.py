@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Set, Type
 
 from fastapi import HTTPException
 from hummingbot.strategy_v2.executors.arbitrage_executor.arbitrage_executor import ArbitrageExecutor
@@ -5508,7 +5508,8 @@ class ExecutorService:
             return
         if self._partial_column_pending(executor_id) and not getattr(executor, "_partial_seated", False):
             return
-        if executor_id in (getattr(self, "_resume_column_hold", None) or set()):
+        hold = getattr(self, "_resume_column_hold", None) or {}
+        if executor_id in hold and not hold.get(executor_id):
             # Подъём держит колонку: метка конца могла уже погасить
             # _partial_column_pending, а посадка ещё не прошла (план
             # okx-resume-complete-level, мина 3).
@@ -5522,6 +5523,15 @@ class ExecutorService:
             async with self.db_manager.get_session_context() as session:
                 row = await ExecutorRepository(session).get_executor_by_id(executor_id)
                 seen = row.checkpoint if row is not None else None
+                wait_levels = (getattr(self, "_resume_column_hold", None) or {}).get(executor_id)
+                if wait_levels:
+                    # Метка стопа: запись закрыта, пока путь стопа не отпустит
+                    # уровни этого круга своей меткой — иначе склейка вернёт
+                    # rich-продажу без входа (код-ревью 20261110-062315).
+                    parsed_seen = parse_checkpoint(seen)
+                    if not all(partial_level_released(parsed_seen, level_id) for level_id in wait_levels):
+                        return
+                    (getattr(self, "_resume_column_hold", None) or {}).pop(executor_id, None)
                 body = checkpoint_keeping_holds(seen, captured)
                 body = self._drop_dead_close_records(body)
                 if body is None:
@@ -6313,20 +6323,22 @@ class ExecutorService:
         return True
 
 
-    async def _mark_completed_cycles(self, executor_id: str, checkpoint: Dict[str, Any]) -> bool:
+    async def _mark_completed_cycles(self, executor_id: str, checkpoint: Dict[str, Any]) -> Optional[Set[str]]:
         """Долговечная метка конца завершённых кругов ДО посадки (план
         okx-resume-complete-level).
 
         Один подъёмный CAS на круг: метка той же формы, что у живого пути продаж,
         плюс запись тел исполнения (номер, цена, размер) и чистые слоты — одной
         записью, без второй. Живой _partial_release не зовётся и не меняется.
-        При видимой метке стопа конца не пишем: оформление в памяти защитит
-        подъём, запись конца сделает свой штатный путь стопа. Отказ записи —
-        ложь: посадку не звать, колонка остаётся под замком подъёма.
+        None — отказ записи: посадку не звать, колонка остаётся под замком.
+        При видимой метке стопа конца не пишем (запись конца — путь стопа),
+        но возвращаем номера уровней, чьё оформление живёт только в памяти:
+        замок записи с них снимается, когда путь стопа отпустит уровень.
         """
+        cycles = completed_cycle_levels(checkpoint)
         if stop_mark_visible(checkpoint):
-            return True
-        for cycle in completed_cycle_levels(checkpoint):
+            return {cycle["level_id"] for cycle in cycles}
+        for cycle in cycles:
             seated = await self._partial_cas(
                 executor_id,
                 resume_complete_mutate(cycle["level_id"], cycle["open_id"], cycle["close_id"]),
@@ -6334,15 +6346,16 @@ class ExecutorService:
                 cycle["level_id"],
             )
             if not seated:
-                return False
-        return True
+                return None
+        return set()
     async def _resume_one(self, row: Dict[str, Any], owned_by: Optional[Dict[str, str]] = None) -> Optional[str]:
         """None on success. A string is why this row was left for cleanup."""
         # Замок записи колонки на весь подъём строки (план okx-resume-complete-level):
         # ставится до любого await и до регистрации исполнителя, снимается только
         # после успешного apply_checkpoint. На отказных путях остаётся — колонка
         # заморожена, как сегодня при «close seating failed».
-        self.__dict__.setdefault("_resume_column_hold", set()).add(str(row.get("executor_id") or ""))
+        hold = self.__dict__.setdefault("_resume_column_hold", {})
+        hold[str(row.get("executor_id") or "")] = set()
         checkpoint = parse_checkpoint_cached(row.get("checkpoint"))
         gate = await self._marked_resume_gate(row)
         if gate == "seat":
@@ -6479,11 +6492,14 @@ class ExecutorService:
             refreshed = parse_checkpoint_cached(column_text or row.get("checkpoint"))
             if refreshed:
                 checkpoint = refreshed
+            pending_release: Set[str] = set()
             if checkpoint and row["executor_type"] == "grid_executor":
                 # Долговечная метка конца ДО посадки (план okx-resume-complete-level).
-                if not await self._mark_completed_cycles(row["executor_id"], checkpoint):
+                pending = await self._mark_completed_cycles(row["executor_id"], checkpoint)
+                if pending is None:
                     self.__dict__.setdefault("_kept_ids", set()).add(row["executor_id"])
                     return "complete level end mark was not committed"
+                pending_release = pending
             original_bans = [
                 str(item) for item in ((checkpoint or {}).get(CLOSE_BAN_KEY) or []) if item
             ]
@@ -6495,7 +6511,14 @@ class ExecutorService:
                     )
                     kept_bans = set(getattr(executor, "_close_ban_ids", set()) or set())
                 apply_checkpoint(executor, checkpoint, live_orders)
-                (getattr(self, "_resume_column_hold", None) or set()).discard(str(row["executor_id"]))
+                hold = self.__dict__.setdefault("_resume_column_hold", {})
+                if pending_release:
+                    # Метка стопа: оформление круга живёт только в памяти — запись
+                    # держим, пока путь стопа не отпустит уровень своей меткой
+                    # (код-ревью 20261110-062315: иначе склейка возвращает продажу).
+                    hold[str(row["executor_id"])] = set(pending_release)
+                else:
+                    hold.pop(str(row["executor_id"]), None)
                 executor._notebook_resumed = True
                 seat_role_close_before_next(executor, row["executor_id"])
                 if not seat_recorded_level_opens(executor, row["executor_id"]):
