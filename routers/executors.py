@@ -19,6 +19,7 @@ from models.executors import (
     ExecutorLogsResponse,
     ExecutorsSummaryResponse,
     OrphanedPositionsResponse,
+    UnattendedCexResponse,
     PerformanceReportResponse,
     PositionHoldResponse,
     PositionsSummaryResponse,
@@ -29,6 +30,7 @@ from models.pagination import PaginatedResponse
 from services.executor_service import ExecutorService
 from services.market_data_service import MarketDataService
 from utils.trading_pair import InvalidTradingPair, split_trading_pair
+from utils.unattended_cex import UNATTENDED_WARNING
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +213,31 @@ async def get_performance_report(
     except Exception as e:
         logger.error(f"Error generating performance report: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error generating performance report: {str(e)}")
+
+
+@router.get("/unattended", response_model=UnattendedCexResponse)
+async def get_unattended_cex(
+    executor_service: ExecutorService = Depends(get_executor_service)
+):
+    """
+    CEX executors marked SYSTEM_CLEANUP after an API restart.
+
+    The exchange may still hold a position or an open order. This route does not
+    close either, and it does not resume the executor. On-chain LP leftovers stay
+    on GET /executors/positions/orphaned - do not look for them here.
+
+    Registered above /{executor_id} so "unattended" is not parsed as an id.
+    """
+    try:
+        executors = await executor_service.get_unattended_cex()
+        return UnattendedCexResponse(
+            count=len(executors),
+            warning=UNATTENDED_WARNING,
+            executors=executors,
+        )
+    except Exception as e:
+        logger.error(f"Error listing unattended CEX executors: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error listing unattended CEX executors: {str(e)}")
 
 
 @router.get("/{executor_id}/logs", response_model=ExecutorLogsResponse)

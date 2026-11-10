@@ -198,6 +198,7 @@ from utils.executor_checkpoint import (
     remove_sent_order,
 )
 from utils.executor_log_capture import ExecutorLogCapture, current_executor_id
+from utils.unattended_cex import CEX_UNATTENDED_TYPES, UNATTENDED_WARNING, unattended_view
 from utils.trading_pair import InvalidTradingPair, split_trading_pair
 
 logger = logging.getLogger(__name__)
@@ -464,10 +465,12 @@ class ExecutorService:
             return
         if ledger_executor_ids() is None or buy_blocked():
             logger.warning("order ledger was not read; not marking SYSTEM_CLEANUP")
+            await self._warn_unattended_cex()
             return
         fresh = await self._fresh_pair_reads()
         if fresh is None:
             logger.warning("open and finished lists were not read; not marking SYSTEM_CLEANUP")
+            await self._warn_unattended_cex()
             return
 
         try:
@@ -477,6 +480,7 @@ class ExecutorService:
             active_executor_ids.extend(self.__dict__.get("_kept_ids", set()))
             rows = await self._running_rows()
             if rows is None:
+                await self._warn_unattended_cex()
                 return
             for row in rows:
                 key = (row.get("account_name"), row.get("connector_name"), row.get("trading_pair"))
@@ -501,8 +505,60 @@ class ExecutorService:
                 else:
                     logger.debug("No orphaned executors found in database")
 
+            # Outside the session context: the marks above are committed now, and
+            # the listing reads through its own fresh session.
+            await self._warn_unattended_cex()
+
         except Exception as e:
             logger.error(f"Error cleaning up orphaned executors: {e}", exc_info=True)
+            # The session above rolled back on the way here; rows marked dead by
+            # earlier restarts are still listed.
+            await self._warn_unattended_cex()
+
+    async def get_unattended_cex(self) -> List[Dict[str, Any]]:
+        """CEX executors marked SYSTEM_CLEANUP that may still have exchange state.
+
+        Read-only. Does not cancel orders, flatten positions, or resume executors.
+        ``lp_executor`` is not included; use get_orphaned_positions() for those.
+        The repository takes one executor type per call, so the service walks the
+        CEX types and merges by executor_id. Views are built inside the session:
+        reading the ORM row after close raises DetachedInstanceError and the
+        startup warning would vanish on the exact restart this listing is for.
+        """
+        if not self.db_manager:
+            raise RuntimeError("Unattended listing unavailable: no database configured")
+
+        merged: Dict[str, Dict[str, Any]] = {}
+        async with self.db_manager.get_session_context() as session:
+            repo = ExecutorRepository(session)
+            for executor_type in sorted(CEX_UNATTENDED_TYPES):
+                records = await repo.get_executors_by_close_types(
+                    ["SYSTEM_CLEANUP"],
+                    executor_type=executor_type,
+                )
+                for record in records:
+                    view = unattended_view(record)
+                    if view:
+                        merged.setdefault(str(view["executor_id"]), view)
+        return list(merged.values())
+
+    async def _warn_unattended_cex(self) -> None:
+        """Log the restart leftover. Must not raise into startup cleanup."""
+        try:
+            unattended = await self.get_unattended_cex()
+        except Exception as e:
+            logger.error(f"Error listing unattended CEX executors: {e}", exc_info=True)
+            return
+        if not unattended:
+            return
+        names = ", ".join(
+            f"{row['executor_id']} ({row['executor_type']} {row['connector_name']} {row['trading_pair']})"
+            for row in unattended
+        )
+        logger.warning(
+            f"Unattended CEX executors after restart: {len(unattended)}. "
+            f"{UNATTENDED_WARNING} {names}"
+        )
 
     async def stop(self):
         """Stop the executor service and all active executors."""

@@ -498,6 +498,26 @@ class OrphanedPositionsResponse(BaseModel):
     orphans: List[OrphanedPositionRecord] = Field(description="Orphan candidate records")
 
 
+class UnattendedCexRecord(BaseModel):
+    """A CEX executor the API marked dead on restart. The exchange was not closed."""
+    executor_id: str = Field(description="Executor identifier")
+    executor_type: str = Field(description="One of the CEX executor types, never lp_executor")
+    account_name: Optional[str] = Field(default=None, description="Account name")
+    connector_name: Optional[str] = Field(default=None, description="Connector name")
+    trading_pair: Optional[str] = Field(default=None, description="Trading pair")
+    controller_id: str = Field(default="main", description="Controller/agent grouping label")
+    close_type: Optional[str] = Field(default=None, description="SYSTEM_CLEANUP")
+    closed_at: Optional[str] = Field(default=None, description="When the API marked the row dead (ISO format)")
+    warning: str = Field(description="What may still be open on the exchange. Not a close instruction.")
+
+
+class UnattendedCexResponse(BaseModel):
+    """CEX restart leftovers. Listing them does not move money."""
+    count: int = Field(description="Number of unattended CEX executors")
+    warning: str = Field(description="Same warning on every row, repeated here so an empty list still states the rule")
+    executors: List[UnattendedCexRecord] = Field(description="Unattended CEX executor records")
+
+
 class ExecutorsSummaryResponse(BaseModel):
     """Summary of active executors."""
     model_config = ConfigDict(
