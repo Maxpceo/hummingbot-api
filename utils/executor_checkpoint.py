@@ -1138,10 +1138,18 @@ def seat_recorded_level_opens(executor: Any, executor_id: str) -> bool:
             noted[level_id] = order_id
             continue
         placed[level_id] = order_id
+    finished = {
+        str(item)
+        for item in (getattr(executor, "_notebook_completed_cycle_opens", None) or ())
+    }
     for level in list(getattr(executor, "grid_levels", None) or []):
         level_id = str(getattr(level, "id", "") or "")
         order_id = placed.get(level_id) or noted.get(level_id)
         if not order_id:
+            continue
+        # Номер завершённого круга не возвращается в слот: уровень должен
+        # остаться пустым для штатного цикла (план okx-resume-complete-level).
+        if str(order_id) in finished:
             continue
         current = str(getattr(getattr(level, "active_open_order", None), "order_id", "") or "")
         if current == order_id:
@@ -2570,11 +2578,23 @@ def _attach(saved: Optional[Dict[str, Any]], live_by_id: Dict[str, Any]) -> Any:
 
 
 def seed_ledger(executor: Any, checkpoint: Dict[str, Any]) -> None:
-    """The resumed executor keeps the same ids, so the next cancel can drop them."""
+    """The resumed executor keeps the same ids, so the next cancel can drop them.
+
+    Номера завершённого круга не сеются: иначе merge_ledger вписал бы их обратно
+    в пустые слоты, а читатели посадки взяли бы мёртвый вход (план
+    okx-resume-complete-level).
+    """
     ledger = order_ledger(executor)
+    finished = {
+        str(item)
+        for item in (getattr(executor, "_notebook_completed_cycle_opens", None) or ())
+    }
+    finished.update(str(item) for item in partial_released_ids(checkpoint))
     for item in _saved_orders(checkpoint):
         order_id = item.get("order_id")
         if not order_id:
+            continue
+        if str(order_id) in finished:
             continue
         ledger[order_id] = {
             "order_id": order_id,
@@ -2584,6 +2604,106 @@ def seed_ledger(executor: Any, checkpoint: Dict[str, Any]) -> None:
             "level_id": item.get("level_id"),
             "role": item.get("role"),
         }
+
+
+def _completed_pair_entries(raw: Dict[str, Any], opened: Dict[str, Any], close: Dict[str, Any], pair: Any, leverage: Any) -> Optional[List[Dict[str, Any]]]:
+    """Обе записи _filled_orders круга из записанной правды, или None."""
+    side = str(raw.get("side") or "")
+    if side not in ("BUY", "SELL"):
+        return None
+    open_entry = completed_side_entry(
+        opened,
+        trade_type=side,
+        position_name="OPEN" if side == "BUY" else "CLOSE",
+        order_type_name=raw.get("open_order_type"),
+        trading_pair=pair,
+        leverage=leverage,
+    )
+    close_side = "SELL" if side == "BUY" else "BUY"
+    close_entry = completed_side_entry(
+        close,
+        trade_type=close_side,
+        position_name="CLOSE",
+        order_type_name=raw.get("take_profit_order_type"),
+        trading_pair=pair,
+        leverage=leverage,
+    )
+    if open_entry is None or close_entry is None:
+        return None
+    return [open_entry, close_entry]
+
+
+def _tracked_filled(tracked: Any) -> bool:
+    """Слот исполнен. Чужая заглушка без is_filled — не исполнение."""
+    if tracked is None:
+        return False
+    try:
+        return bool(tracked.is_filled)
+    except Exception:
+        return False
+
+
+def _format_completed_levels(executor: Any, checkpoint: Dict[str, Any]) -> None:
+    """Оформить завершённые круги до штатного COMPLETE-пути (план
+    okx-resume-complete-level).
+
+    Обе стороны кладутся в _filled_orders, уровень сбрасывается в NOT_ACTIVE —
+    та же уборка, какую штатный тик делает живьём. Повторный подъём при пустых
+    слотах оформляет круг из записи в колонке. Номера круга остаются в списке
+    пропуска: журнал исполнителя их не сеет, пересадка их не сажает.
+    """
+    raw_levels = checkpoint.get("levels") or []
+    grid_levels = list(getattr(executor, "grid_levels", None) or [])
+    completed_opens = set(str(item) for item in partial_released_ids(checkpoint))
+    filled_orders = list(getattr(executor, "_filled_orders", None) or [])
+    pair = ""
+    leverage = 1
+    config = getattr(executor, "config", None)
+    if config is not None:
+        pair = getattr(config, "trading_pair", "") or ""
+        leverage = getattr(config, "leverage", 1) or 1
+    for level, raw in zip(grid_levels, raw_levels):
+        if not isinstance(raw, dict):
+            continue
+        # Обе стороны filled — условие завершённого круга (план), не штатный
+        # update_state: тот ставит COMPLETE и по одной исполненной продаже,
+        # а живой неисполненный вход сбрасывать нельзя.
+        if not (_tracked_filled(getattr(level, "active_open_order", None))
+                and _tracked_filled(getattr(level, "active_close_order", None))):
+            continue
+        entries = _completed_pair_entries(
+            raw, raw.get("open_order") or {}, raw.get("close_order") or {}, pair, leverage,
+        )
+        if entries is None:
+            # Недоказанное не вычёркиваем: поведение этого уровня как сегодня.
+            continue
+        filled_orders.extend(entries)
+        completed_opens.update(str(entry.get("client_order_id") or "") for entry in entries)
+        reset = getattr(level, "reset_level", None)
+        if callable(reset):
+            reset()
+    for raw in raw_levels:
+        if not isinstance(raw, dict):
+            continue
+        opened = raw.get("open_order") or {}
+        close = raw.get("close_order") or {}
+        if opened.get("order_id") or close.get("order_id"):
+            continue
+        record = (checkpoint.get(COMPLETED_CYCLE_KEY) or {}).get(str(raw.get("id") or ""))
+        if not isinstance(record, dict):
+            continue
+        meta = record.get("level") if isinstance(record.get("level"), dict) else {}
+        merged_raw = dict(raw)
+        merged_raw.update({key: meta[key] for key in ("side", "open_order_type", "take_profit_order_type") if meta.get(key) is not None})
+        entries = _completed_pair_entries(
+            merged_raw, record.get("open") or {}, record.get("close") or {}, pair, leverage,
+        )
+        if entries is None:
+            continue
+        filled_orders.extend(entries)
+        completed_opens.update(str(entry.get("client_order_id") or "") for entry in entries)
+    executor._filled_orders = filled_orders
+    executor._notebook_completed_cycle_opens = frozenset(completed_opens)
 
 
 def apply_checkpoint(executor: Any, checkpoint: Dict[str, Any], live_orders: List[Any]) -> None:
@@ -2650,6 +2770,11 @@ def apply_checkpoint(executor: Any, checkpoint: Dict[str, Any], live_orders: Lis
                     break
         executor._close_holds = list(checkpoint.get(CLOSE_HOLD_KEY) or [])
         executor._partial_seated = True
+        # Завершённый круг оформляем сами, до штатного update_grid_levels:
+        # его COMPLETE-путь читает completely_filled_event, которого нет у заглушки
+        # компактного тела, и кладёт компактное тело в _filled_orders (план
+        # okx-resume-complete-level). Уборка — та же, что у живого тика.
+        _format_completed_levels(executor, checkpoint)
         if hasattr(executor, "update_grid_levels"):
             executor.update_grid_levels()
         seed_ledger(executor, checkpoint)
@@ -5547,6 +5672,160 @@ def partial_level_released(parsed: Optional[Dict[str, Any]], level_id: str) -> b
     return "level:" + str(level_id) in partial_released_ids(parsed)
 
 
+RESUME_COMPLETE_KIND = "resume_complete"
+COMPLETED_CYCLE_KEY = "partial_completed"
+
+
+def completed_cycle_levels(parsed: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Levels whose cycle is proven finished: both sides filled with ids and prices."""
+    found: List[Dict[str, Any]] = []
+    for level in (parsed or {}).get("levels") or []:
+        if not isinstance(level, dict):
+            continue
+        opened = level.get("open_order") or {}
+        close = level.get("close_order") or {}
+        if opened.get("filled") is not True or close.get("filled") is not True:
+            continue
+        if not opened.get("order_id") or not close.get("order_id"):
+            continue
+        if opened.get("price") in (None, "") or close.get("price") in (None, ""):
+            continue
+        if not isinstance(opened.get("order"), dict) or not isinstance(close.get("order"), dict):
+            continue
+        level_id = str(level.get("id") or "")
+        if not level_id:
+            continue
+        found.append({
+            "level_id": level_id,
+            "open_id": str(opened["order_id"]),
+            "close_id": str(close["order_id"]),
+        })
+    return found
+
+
+def resume_complete_mutate(level_id: str, open_id: str, close_id: str):
+    """Один подъёмный CAS: метка конца, запись круга и чистые слоты одной записью.
+
+    Живой путь продаж (_partial_release) не зовётся и не меняется: у его mutate
+    нет места для записи тел исполнения, а вторая запись следом стирала бы
+    единственную копию размеров при обрыве между записями.
+    """
+
+    def mutate(body: Dict[str, Any]) -> None:
+        if stop_mark_visible(body):
+            raise RuntimeError("stop mark")
+        level = None
+        for item in body.get("levels") or []:
+            if str(item.get("id") or "") == str(level_id):
+                level = item
+                break
+        if not isinstance(level, dict):
+            raise RuntimeError("level missing")
+        opened = level.get("open_order") or {}
+        close = level.get("close_order") or {}
+        if str(opened.get("order_id") or "") != str(open_id) or str(close.get("order_id") or "") != str(close_id):
+            raise RuntimeError("cycle changed")
+        record = {
+            "open": json.loads(json.dumps(opened)),
+            "close": json.loads(json.dumps(close)),
+            "level": {key: level.get(key) for key in (
+                "side", "open_order_type", "take_profit_order_type", "price", "amount_quote", "take_profit",
+            )},
+        }
+        ends = dict(body.get("partial_ends") or {})
+        ends[str(open_id)] = {
+            "kind": RESUME_COMPLETE_KIND,
+            "level_id": str(level_id),
+            "order_ids": [str(open_id), str(close_id)],
+        }
+        body["partial_ends"] = ends
+        completed = dict(body.get(COMPLETED_CYCLE_KEY) or {})
+        completed[str(level_id)] = record
+        body[COMPLETED_CYCLE_KEY] = completed
+        level.pop("take_profit_price", None)
+        level["close_order"] = None
+        level["partial_closes"] = []
+        slot = level.get("open_order") or {}
+        if slot.get("filled"):
+            level["open_order"] = None
+
+    return mutate
+
+
+def resume_complete_visible(level_id: str, open_id: str):
+    """Метка и запись круга видны в перечитанном теле, цена внутрь метки не легла."""
+
+    def visible(parsed: Optional[Dict[str, Any]]) -> bool:
+        ends = (parsed or {}).get("partial_ends") or {}
+        mark = ends.get(str(open_id))
+        if not (isinstance(mark, dict) and mark.get("kind") == RESUME_COMPLETE_KIND):
+            return False
+        if str(mark.get("level_id") or "") != str(level_id):
+            return False
+        if "price" in mark:
+            return False
+        record = ((parsed or {}).get(COMPLETED_CYCLE_KEY) or {}).get(str(level_id))
+        return isinstance(record, dict) and isinstance(record.get("open"), dict) and isinstance(record.get("close"), dict)
+
+    return visible
+
+
+def completed_side_entry(
+    slot: Dict[str, Any],
+    *,
+    trade_type: str,
+    position_name: str,
+    order_type_name: Any,
+    trading_pair: Any,
+    leverage: Any,
+) -> Optional[Dict[str, Any]]:
+    """Запись для _filled_orders из записанной правды. Новый номер не чеканится.
+
+    Полное тело идёт как есть; компактному достраивается форма штатного to_json
+    по номеру и цене слота, размеру тела исполнения и записи уровня.
+    """
+    body = slot.get("order") if isinstance(slot.get("order"), dict) else {}
+    if body.get("client_order_id"):
+        entry = dict(body)
+        entry.setdefault("cumulative_fee_paid_base", 0.0)
+        entry.setdefault("cumulative_fee_paid_quote", 0.0)
+        entry.setdefault("creation_timestamp", 0)
+        entry.setdefault("last_update_timestamp", 0)
+        entry.setdefault("order_fills", {})
+        return entry
+    base_raw = body.get("executed_amount_base")
+    price_raw = slot.get("price")
+    if not slot.get("order_id") or price_raw in (None, "") or base_raw in (None, ""):
+        return None
+    try:
+        base = Decimal(str(base_raw))
+        price = Decimal(str(price_raw))
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+    if base <= 0 or price <= 0:
+        return None
+    return {
+        "client_order_id": str(slot["order_id"]),
+        "trading_pair": trading_pair,
+        "order_type": str(order_type_name or "LIMIT"),
+        "trade_type": trade_type,
+        "amount": str(base),
+        "price": str(price),
+        "executed_amount_base": str(base),
+        "executed_amount_quote": str(base * price),
+        "last_state": "5",
+        "leverage": str(leverage or 1),
+        "position": position_name,
+        "creation_timestamp": 0,
+        "last_update_timestamp": 0,
+        "order_fills": {},
+        "exchange_order_id": None,
+        "cumulative_fee_paid_base": 0.0,
+        "cumulative_fee_paid_quote": 0.0,
+    }
+    return "level:" + str(level_id) in partial_released_ids(parsed)
+
+
 def _level_by_id(parsed: Optional[Dict[str, Any]], level_id: str) -> Optional[Dict[str, Any]]:
     for level in (parsed or {}).get("levels") or []:
         if isinstance(level, dict) and str(level.get("id")) == str(level_id):
@@ -5925,6 +6204,11 @@ def apply_partial_keep(body: Dict[str, Any], previous: Dict[str, Any]) -> None:
     ends = previous.get("partial_ends") or {}
     if ends:
         body["partial_ends"] = json.loads(json.dumps(ends))
+    # Запись завершённого круга переживает захват и переносится вперёд, как
+    # partial_ends: обрыв между меткой и оформлением не должен терять размеры.
+    prev_completed = previous.get(COMPLETED_CYCLE_KEY) or {}
+    if prev_completed:
+        body[COMPLETED_CYCLE_KEY] = json.loads(json.dumps(prev_completed))
     released = partial_released_ids(previous)
     holds = []
     for item in body.get("holds") or []:
