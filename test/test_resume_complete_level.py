@@ -324,7 +324,7 @@ def test_stop_mark_visible_level(tmp_path, monkeypatch):
     import asyncio
 
     pending = asyncio.run(service._mark_completed_cycles(EXECUTOR, checkpoint))
-    assert pending == {"L0"}
+    assert pending == {("L0", OPEN_ID, CLOSE_ID)}
     assert calls == []
 
 
@@ -451,15 +451,66 @@ def test_checkpoint_executor_respects_the_column_hold(tmp_path, monkeypatch):
     service._resume_column_hold = {EXECUTOR: set()}
     asyncio.run(service._checkpoint_executor(EXECUTOR))
     assert repo.holds == []
-    # Стоп-путь: замок ждёт метки уровня, колонка ещё с обоими filled — запись закрыта.
-    service._resume_column_hold = {EXECUTOR: {"L0"}}
+    # Стоп-путь: замок ждёт конца номеров этого круга, колонка ещё с обоими
+    # filled — запись закрыта.
+    service._resume_column_hold = {EXECUTOR: {("L0", OPEN_ID, CLOSE_ID)}}
     asyncio.run(service._checkpoint_executor(EXECUTOR))
     assert repo.holds == []
-    # Путь стопа отпустил уровень своей меткой — запись возобновляется, замок снят.
+    # Старая метка того же уровня (другой круг) замок не снимает.
+    old_mark = json.loads(json.dumps(_hyj_checkpoint()))
+    old_mark["partial_ends"] = {
+        "old-open-9": {"kind": "stock_flat", "level_id": "L0", "order_ids": ["old-open-9", "old-close-9"]},
+    }
+    repo.rows[0]["checkpoint"] = json.dumps(old_mark)
+    asyncio.run(service._checkpoint_executor(EXECUTOR))
+    assert repo.holds == []
+    assert EXECUTOR in service._resume_column_hold
+    # Конец номеров этого круга виден — запись возобновляется, замок снят.
     repo.rows[0]["checkpoint"] = json.dumps(marked)
     asyncio.run(service._checkpoint_executor(EXECUTOR))
-    assert repo.holds, "после метки уровня запись возобновляется"
+    assert repo.holds, "после конца номеров круга запись возобновляется"
     assert EXECUTOR not in (service.__dict__.get("_resume_column_hold") or {})
+
+
+def test_first_tick_reseat_survives_the_next_capture_and_resume(tmp_path, monkeypatch):
+    """Проба 12 (код-ревью 20261110-072441): посадка остатка не убивает следующий подъём."""
+    marked = json.loads(json.dumps(_hyj_checkpoint()))
+    resume_complete_mutate("L0", OPEN_ID, CLOSE_ID)(marked)
+    # Первый такт посадил исполненную продажу в пустой слот (принятый остаток):
+    executor = _executor()
+    apply_checkpoint(executor, marked, [])
+    from hummingbot.strategy_v2.models.executors import TrackedOrder
+
+    level = executor.grid_levels[0]
+    level.active_close_order = TrackedOrder(order_id=CLOSE_ID)
+    level.active_close_order.order = _stock_close()
+    level.update_state()
+    # Следующий снимок и склейка: close круга не остаётся в колонке без входа.
+    captured = capture_executor(executor, "grid_executor")
+    merged = json.loads(checkpoint_keeping_holds(json.dumps(marked), captured))
+    merged_level = merged["levels"][0]
+    assert (merged_level.get("open_order") or {}).get("order_id") in (None, "")
+    assert (merged_level.get("close_order") or {}) in (None, {})
+    assert merged[COMPLETED_CYCLE_KEY]["L0"]["close"]["order_id"] == CLOSE_ID
+    # Повторный подъём на такой колонке не падает и лечит уровень из записи.
+    healed = _executor()
+    apply_checkpoint(healed, merged, [])
+    assert _level_state(healed.grid_levels[0]) == "NOT_ACTIVE"
+    assert healed.grid_levels[0].active_close_order is None
+    entries = healed._filled_orders
+    assert len(entries) == 2
+    assert {entry["client_order_id"] for entry in entries} == {OPEN_ID, CLOSE_ID}
+    _grid_reads(healed)
+
+
+def _stock_close():
+    from hummingbot.core.data_type.in_flight_order import InFlightOrder
+
+    return InFlightOrder.from_json(dict(marked_close_body()))
+
+
+def marked_close_body():
+    return _hyj_checkpoint()["levels"][0]["close_order"]["order"]
 
 
 def test_first_tick_reseats_the_finished_sale_accepted_residue(tmp_path, monkeypatch):

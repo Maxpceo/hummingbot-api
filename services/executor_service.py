@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Set, Type
+from typing import Any, Dict, List, Optional, Set, Tuple, Type
 
 from fastapi import HTTPException
 from hummingbot.strategy_v2.executors.arbitrage_executor.arbitrage_executor import ArbitrageExecutor
@@ -5523,13 +5523,17 @@ class ExecutorService:
             async with self.db_manager.get_session_context() as session:
                 row = await ExecutorRepository(session).get_executor_by_id(executor_id)
                 seen = row.checkpoint if row is not None else None
-                wait_levels = (getattr(self, "_resume_column_hold", None) or {}).get(executor_id)
-                if wait_levels:
-                    # Метка стопа: запись закрыта, пока путь стопа не отпустит
-                    # уровни этого круга своей меткой — иначе склейка вернёт
-                    # rich-продажу без входа (код-ревью 20261110-062315).
+                wait_cycles = (getattr(self, "_resume_column_hold", None) or {}).get(executor_id)
+                if wait_cycles:
+                    # Метка стопа: запись закрыта, пока в колонке не виден конец
+                    # именно номеров этого круга — старая метка уровня не годится
+                    # (код-ревью 20261110-072441).
                     parsed_seen = parse_checkpoint(seen)
-                    if not all(partial_level_released(parsed_seen, level_id) for level_id in wait_levels):
+                    released_ids = partial_released_ids(parsed_seen)
+                    if not all(
+                        open_id in released_ids and close_id in released_ids
+                        for (_level_id, open_id, close_id) in wait_cycles
+                    ):
                         return
                     (getattr(self, "_resume_column_hold", None) or {}).pop(executor_id, None)
                 body = checkpoint_keeping_holds(seen, captured)
@@ -6323,7 +6327,7 @@ class ExecutorService:
         return True
 
 
-    async def _mark_completed_cycles(self, executor_id: str, checkpoint: Dict[str, Any]) -> Optional[Set[str]]:
+    async def _mark_completed_cycles(self, executor_id: str, checkpoint: Dict[str, Any]) -> Optional[Set[Tuple[str, str, str]]]:
         """Долговечная метка конца завершённых кругов ДО посадки (план
         okx-resume-complete-level).
 
@@ -6332,12 +6336,16 @@ class ExecutorService:
         записью, без второй. Живой _partial_release не зовётся и не меняется.
         None — отказ записи: посадку не звать, колонка остаётся под замком.
         При видимой метке стопа конца не пишем (запись конца — путь стопа),
-        но возвращаем номера уровней, чьё оформление живёт только в памяти:
-        замок записи с них снимается, когда путь стопа отпустит уровень.
+        но возвращаем круги (level_id, вход, продажа), чьё оформление живёт
+        только в памяти: замок записи снимается, когда в колонке виден конец
+        именно номеров этого круга — не любая старая метка уровня.
         """
         cycles = completed_cycle_levels(checkpoint)
         if stop_mark_visible(checkpoint):
-            return {cycle["level_id"] for cycle in cycles}
+            return {
+                (cycle["level_id"], cycle["open_id"], cycle["close_id"])
+                for cycle in cycles
+            }
         for cycle in cycles:
             seated = await self._partial_cas(
                 executor_id,
@@ -6492,7 +6500,7 @@ class ExecutorService:
             refreshed = parse_checkpoint_cached(column_text or row.get("checkpoint"))
             if refreshed:
                 checkpoint = refreshed
-            pending_release: Set[str] = set()
+            pending_release: Set[Tuple[str, str, str]] = set()
             if checkpoint and row["executor_type"] == "grid_executor":
                 # Долговечная метка конца ДО посадки (план okx-resume-complete-level).
                 pending = await self._mark_completed_cycles(row["executor_id"], checkpoint)

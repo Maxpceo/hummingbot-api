@@ -2682,15 +2682,26 @@ def _format_completed_levels(executor: Any, checkpoint: Dict[str, Any]) -> None:
         reset = getattr(level, "reset_level", None)
         if callable(reset):
             reset()
+    released_ids = partial_released_ids(checkpoint)
     for raw in raw_levels:
         if not isinstance(raw, dict):
             continue
         opened = raw.get("open_order") or {}
         close = raw.get("close_order") or {}
-        if opened.get("order_id") or close.get("order_id"):
+        open_slot_id = str(opened.get("order_id") or "")
+        close_slot_id = str(close.get("order_id") or "")
+        if open_slot_id:
+            # Живой вход — не завершённый круг, не трогаем.
             continue
         record = (checkpoint.get(COMPLETED_CYCLE_KEY) or {}).get(str(raw.get("id") or ""))
         if not isinstance(record, dict):
+            continue
+        record_close = str((record.get("close") or {}).get("order_id") or "")
+        # Код-ревью 20261110-072441: слот может держать номер продажи этого круга
+        # (посадка первого такта уехала в колонку) — оформляем из записи и лечим
+        # уровень до штатного COMPLETE-пути, иначе следующий снимок мёртв.
+        if close_slot_id and close_slot_id != record_close and close_slot_id not in released_ids:
+            # Чужая незавершённая продажа — не наш случай.
             continue
         meta = record.get("level") if isinstance(record.get("level"), dict) else {}
         merged_raw = dict(raw)
@@ -2702,6 +2713,15 @@ def _format_completed_levels(executor: Any, checkpoint: Dict[str, Any]) -> None:
             continue
         filled_orders.extend(entries)
         completed_opens.update(str(entry.get("client_order_id") or "") for entry in entries)
+        level = next(
+            (item for item in grid_levels if str(getattr(item, "id", "") or "") == str(raw.get("id") or "")),
+            None,
+        )
+        if level is not None and (getattr(level, "active_close_order", None) is not None
+                                   or getattr(level, "active_open_order", None) is not None):
+            reset = getattr(level, "reset_level", None)
+            if callable(reset):
+                reset()
     executor._filled_orders = filled_orders
     executor._notebook_completed_cycle_opens = frozenset(completed_opens)
 
@@ -6231,7 +6251,21 @@ def apply_partial_keep(body: Dict[str, Any], previous: Dict[str, Any]) -> None:
         if partial_level_released(previous, str(level.get("id"))):
             level.pop("take_profit_price", None)
             level.pop("partial_closes", None)
-            if not (level.get("close_order") or {}).get("price"):
+            # Код-ревью 20261110-072441: close, чей номер уже в метке конца или в
+            # записи круга, на отпущенном уровне без входа не оставляем — иначе
+            # колонка держит «filled-продажу без входа» и следующий подъём мёртв.
+            released_ids = partial_released_ids(previous)
+            completed = (previous.get(COMPLETED_CYCLE_KEY) or {}).get(str(level.get("id"))) or {}
+            record_ids = set()
+            if isinstance(completed, dict):
+                for side in ("open", "close"):
+                    record_ids.add(str((completed.get(side) or {}).get("order_id") or ""))
+            close = level.get("close_order") or {}
+            close_id = str(close.get("order_id") or "")
+            open_id = str((level.get("open_order") or {}).get("order_id") or "")
+            if close_id and not open_id and (close_id in released_ids or close_id in record_ids):
+                level["close_order"] = None
+            elif not close.get("price"):
                 level["close_order"] = None
             continue
         slot = level.get("open_order") or {}
