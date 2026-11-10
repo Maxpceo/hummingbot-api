@@ -304,6 +304,30 @@ class ExecutorRepository:
             for record in records
         ]
 
+    async def get_early_stop_rows(self) -> List[Dict[str, Any]]:
+        """Ранний стоп, который подъём иначе не видит. Не сбой."""
+        stmt = select(ExecutorRecord).where(
+            ExecutorRecord.status == "TERMINATED",
+            ExecutorRecord.close_type == "EARLY_STOP",
+        )
+        records = (await self.session.execute(stmt)).scalars().all()
+        return [
+            {
+                "executor_id": record.executor_id,
+                "executor_type": record.executor_type,
+                "account_name": record.account_name,
+                "connector_name": record.connector_name,
+                "trading_pair": record.trading_pair,
+                "controller_id": record.controller_id or "main",
+                "created_at": record.created_at,
+                "config": record.config,
+                "checkpoint": record.checkpoint,
+                "status": record.status,
+                "close_type": record.close_type,
+            }
+            for record in records
+        ]
+
     async def get_checkpoint_rows(self) -> List[Dict[str, Any]]:
         """Every executor row, copied out of the session. Not only the live ones.
 
